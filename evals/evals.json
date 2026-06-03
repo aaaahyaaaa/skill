@@ -1,0 +1,17 @@
+{
+  "skill_name": "findreason-rag-attribution",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "把这段 workflow input_params 适配成 FindReason case，并在离线模式跑归因。",
+      "expected_output": "Uses adapt-input and run, returns a structured attribution result without starting the original repo.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "诊断一个 expected_knowledge_ids 在线召回未命中的 RAG badcase，说明是不是 retrieval_miss。",
+      "expected_output": "Distinguishes online replay, wide recall, and knowledge detail evidence before naming retrieval_miss.",
+      "files": []
+    }
+  ]
+}

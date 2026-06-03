@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FindReason v3 Orchestrate Output",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "log_id",
+    "workspace_id",
+    "oracle_status",
+    "case_assessment",
+    "primary_cause",
+    "failure_patterns",
+    "needs_human_review",
+    "human_review_reasons",
+    "evidence_bundle",
+    "evidence_chain",
+    "next_actions",
+    "telemetry",
+    "deprecations",
+    "raw_artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": "v3"},
+    "log_id": {"type": ["string", "null"]},
+    "workspace_id": {"type": ["string", "null"]},
+    "oracle_status": {
+      "type": "object",
+      "required": ["source", "inferred_doc_count", "inferred_doc_ids", "confidence"],
+      "properties": {
+        "source": {"enum": ["provided", "self_inferred", "mixed", "insufficient"]},
+        "signals_used": {"type": "array", "items": {"type": "string"}},
+        "signals_attempted": {"type": "array", "items": {"type": "string"}},
+        "signals_failed": {"type": "object"},
+        "inferred_doc_count": {"type": "integer"},
+        "inferred_doc_ids": {"type": "array", "items": {"type": "string"}},
+        "provided_doc_ids": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number"},
+        "conflict_detected": {"type": "boolean"},
+        "provided_conflict_detected": {"type": "boolean"},
+        "expected_knowledge_points": {"type": "array"},
+        "point_coverage": {"type": "array"},
+        "missing_expected_points_from_origin": {"type": "array"},
+        "missing_expected_points_from_rerank": {"type": "array"},
+        "missing_expected_points_from_prompt": {"type": "array"}
+      }
+    },
+    "case_assessment": {
+      "type": "object",
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {
+          "enum": [
+            "confirmed_badcase",
+            "badcase_needs_review",
+            "not_badcase",
+            "not_badcase_candidate",
+            "indeterminate"
+          ]
+        },
+        "reason": {"type": "string"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "primary_cause": {
+      "type": ["object", "null"],
+      "properties": {
+        "stage": {"type": "string"},
+        "cause_code": {"type": "string"},
+        "confidence": {"type": "number"},
+        "owner": {"type": "string"},
+        "selection_rationale": {"type": "string"}
+      }
+    },
+    "failure_patterns": {"type": "array", "items": {"type": "string"}},
+    "needs_human_review": {"type": "boolean"},
+    "human_review_reasons": {"type": "array", "items": {"type": "string"}},
+    "evidence_bundle": {"type": "array"},
+    "evidence_chain": {"type": "array"},
+    "next_actions": {"type": "array"},
+    "telemetry": {"type": "object"},
+    "deprecations": {"type": "array"},
+    "raw_artifacts": {"type": "object"}
+  }
+}

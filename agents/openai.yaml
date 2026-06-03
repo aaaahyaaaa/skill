@@ -1,0 +1,4 @@
+interface:
+  display_name: "FindReason RAG Attribution"
+  short_description: "Run FindReason badcase attribution from pasted cases or Fornax traces"
+  default_prompt: "Use $findreason-rag-attribution to adapt a pasted RAG badcase or ingest a fornax-cli trace export, run the bundled attribution CLI, and explain the primary cause with prompt_docs and workflow evidence."
