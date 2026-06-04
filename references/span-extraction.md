@@ -1,21 +1,21 @@
-# Span Extraction
+# Span 抽取说明
 
-`ingest-fornax-trace` parses OpenPlat trace detail responses shaped as:
+`ingest-fornax-trace` 解析如下 OpenPlat trace detail 返回：
 
 ```json
 {"code": 0, "msg": "...", "data": {"spans": [], "TracesAdvanceInfo": {}, "has_more": false, "next_page_token": ""}}
 ```
 
-Important span evidence:
+重要 span 证据：
 
-| Span | Extracted evidence |
+| Span | 抽取证据 |
 |-|-|
-| root span with `parent_id=""` | `custom_tags.zhishang.app_id` fallback |
-| `workflow` | full workflow input/output, stored in `raw_artifacts.workflow_span_ios` |
-| `Start` | start input and workflow parameter mapping |
-| `ZhiShangRAGPreprocess` | `rewrite_query`, keywords, route/model signals |
-| `ZhiShangRAGRecall` | `origin_doc_list`, `origin_faq_list` |
-| `ZhiShangRAGRerank` | `rerank_docs`, rerank input/request traces |
-| `ZhiShangRAGQA` / `End` | `prompt_docs`, final answer |
+| `parent_id=""` 的 root span | `custom_tags.zhishang.app_id` 兜底 |
+| `workflow` | 完整 workflow 输入/输出，存入 `raw_artifacts.workflow_span_ios` |
+| `Start` | 起始输入与 workflow 参数映射 |
+| `ZhiShangRAGPreprocess` | `rewrite_query`、关键词、route/model 信号 |
+| `ZhiShangRAGRecall` | `origin_doc_list`、`origin_faq_list` |
+| `ZhiShangRAGRerank` | `rerank_docs`、rerank 输入/请求轨迹 |
+| `ZhiShangRAGQA` / `End` | `prompt_docs`、最终 answer |
 
-The trace evidence is historical ground truth. Workflow replay can supplement missing evidence but must not replace middle-node trace evidence.
+Trace 证据是历史现场事实。Workflow replay 可以补充缺失证据，但不能替代 trace 中已有的中间节点证据。

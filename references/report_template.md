@@ -1,6 +1,6 @@
-# FindReason v3 Case Summary Template
+# FindReason v3 单 case 摘要模板
 
-Use this template after `orchestrate` finishes. Codex or any other host Agent should render this human-readable report from the v3 JSON output. The CLI also writes `case_report.md` whenever `orchestrate --output-dir` is provided, and includes the same text in `human_report_markdown`.
+在 `orchestrate` 完成后使用此模板。Codex 或其他宿主 Agent 应从 v3 JSON 输出渲染人类可读报告。CLI 在提供 `orchestrate --output-dir` 时也会写入 `case_report.md`，并在 `human_report_markdown` 中包含同一份文本。
 
 ## 1. 结论
 
@@ -9,64 +9,64 @@ Use this template after `orchestrate` finishes. Codex or any other host Agent sh
 - confidence
 - owner
 - `needs_human_review`
-- one-sentence root-cause summary
+- 一句话根因摘要
 
-## 2. Case 信息
+## 2. case 信息
 
 - `log_id`
 - `workspace_id`
 - `app_id`
 - query
-- judgement / evaluation signal if available
-- whether trace evidence or replay evidence was used
+- 可用的 judgement / evaluation signal
+- 使用的是 trace 证据还是 replay 证据
 
-## 3. 原始 Workflow 输入输出
+## 3. 原始 workflow 输入输出
 
 - workflow span id / node id
-- original workflow input as JSON
-- original workflow output as JSON
+- 原始 workflow input（JSON）
+- 原始 workflow output（JSON）
 
 ## 4. 证据概览
 
-- trace status and whether middle-node spans are authoritative
-- `origin_doc_list` / `origin_faq_list` / `rerank_docs` / `prompt_docs` counts
-- expected doc IDs and where they appeared
-- assertion coverage matrix for online stages only: initial recall, rerank, and prompt; include assertion role and source
-- theoretical upper-bound recall to assertion relationship: for each required assertion, list the supporting upper-bound doc IDs/titles plus matched terms and scores when available
-- theoretical upper-bound recall status, topK, and query variants
-- exact doc IDs/titles that were initially recalled but dropped by rerank when the primary cause is `rerank_drop`
-- required assertions with no supporting upper-bound or initial-recall doc; recommend adding or rewriting corresponding KB content
-- unsupported claims as answer-stage observations, not as KB补充项
-- workflow span input/output availability
+- trace 状态，以及中间节点 spans 是否为权威证据
+- `origin_doc_list` / `origin_faq_list` / `rerank_docs` / `prompt_docs` 数量
+- expected doc IDs 以及它们出现的位置
+- 仅针对线上阶段的断言覆盖矩阵：初召回、rerank、prompt；包含断言 role 和 source
+- 理论召回上界与断言关系：对每个必要断言列出支撑的上界文档 ID / title，以及可用的 matched terms 和 scores
+- 理论召回上界状态、topK 和 query variants
+- 当主因是 `rerank_drop` 时，列出初召回已命中但被 rerank 丢弃的准确 doc IDs / titles
+- 没有上界支撑或初召回支撑的必要断言；建议补充或改写对应 KB 内容
+- unsupported claims 只能作为 answer 阶段观察项，不能写成 KB 补充项
+- workflow span input/output 是否可用
 
 ## 5. 归因链路
 
 | 阶段 | 结论 | 关键依据 |
 |---|---|---|
-| preprocess | pass/fail/indeterminate | rewrite, route, keyword evidence |
+| preprocess | pass/fail/indeterminate | rewrite、route、keyword evidence |
 | knowledge | pass/fail/indeterminate | knowledge exists yes/no/unknown |
-| retrieval | pass/fail/indeterminate | online recall, wide recall, permission evidence |
+| retrieval | pass/fail/indeterminate | online recall、wide recall、permission evidence |
 | rerank | pass/fail/indeterminate | recall -> rerank survival |
-| context | pass/fail/indeterminate | rerank -> prompt survival, truncation/noise |
-| answer | pass/fail/indeterminate | prompt support, unsupported claims, citations |
+| context | pass/fail/indeterminate | rerank -> prompt survival、truncation/noise |
+| answer | pass/fail/indeterminate | prompt support、unsupported claims、citations |
 | evaluation | observation-only | judgement/rubric notes |
 
 ## 6. 主因解释
 
-- Why the primary stage failed.
-- Why earlier stages are not primary.
-- Which later stages are blocked downstream symptoms.
-- Counterfactual: what would change if the primary stage were fixed.
+- 主因阶段为什么失败。
+- 为什么更上游阶段不是主因。
+- 哪些下游阶段只是被阻塞后的症状。
+- Counterfactual：如果修复主因阶段，下游会发生什么变化。
 
 ## 7. 修改建议
 
 - owner
 - P0 action
-- optional P1/P2 follow-up checks
+- 可选 P1/P2 follow-up checks
 
 ## 8. 附件
 
-Link local artifacts:
+链接本地 artifacts：
 
 - `ingest.json`
 - `probes/*.json`

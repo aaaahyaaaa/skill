@@ -3,57 +3,68 @@ name: findreason-rag-attribution
 description: FindReason RAG 归因 skill。对 RAG 答错、答漏、答非所问的 badcase 做证据采集和规则归因，输出 primary_cause、evidence_chain、failure_patterns、next_actions。触发词包括 RAG 归因、findreason、fornax trace、为什么答错了、case 复盘、归因报告、知识缺失、召回缺失、rerank 误杀、unsupported claim、wrong citation、partial answer。
 ---
 
-# FindReason RAG Attribution v3
+# FindReason RAG 归因 v3
 
-This skill is an Evidence-first Attribution Engine. The host Agent orchestrates the case; the bundled CLI gathers trace/probe evidence and emits stable JSON. The skill does not call an LLM, does not write the final natural-language report, and does not fan out batch work.
+这是一个“证据优先”的归因引擎。宿主 Agent 负责理解 case、编排步骤和撰写最终自然语言报告；随 skill 提供的 CLI 负责采集 trace / probe 证据，并输出稳定 JSON。skill 本身不调用 LLM，不负责最终用户报告，也不负责批量 fan-out。
 
-## Security and Authentication
+## 安全与鉴权
 
-Never print raw tokens, API keys, or Authorization headers. Configure OpenPlat tokens through exported environment variables or a host-local env file, without `Bearer`; the CLI builds `Authorization: Bearer <token>`. Keep committed defaults free of real secrets.
+不要打印原始 token、API key 或 Authorization header。OpenPlat token 通过进程环境变量或宿主本地 env 文件配置，值不带 `Bearer`；CLI 会自动拼接 `Authorization: Bearer <token>`。提交到仓库的默认配置不得包含真实密钥。
 
-# Skills CLI
-Get authentications via SSO for internal API authentication when live workflow or RDS access is needed.
-# Set the npm registry to BNPM
-`export npm_config_registry=https://bnpm.byted.org/`
-# Get JWT
-`npx -y skills get-jwt`
-`npx -y skills -h`
-# Options
-`--region` optional, valid values: `cn`, `i18n`, `boe`, `sandbox`
+## Skill 命令行
 
-## Global Rules
+需要访问内部 API、线上 workflow 或 RDS 时，先通过 SSO 获取认证。
 
-1. Any attribution case must run `ingest-fornax-trace` first and `orchestrate` last. `ingest-fornax-trace --raw` is only for raw trace inspection and is not attribution.
-2. Candidate causes are limited to the 13-value v3 enum in `references/cause-codes.md`.
-3. Every stage verdict must include `counterfactual`.
-4. If an upstream stage blocks downstream judgment, downstream verdicts must set `upstream_blocked_by`.
-5. Primary cause selection walks `preprocess -> knowledge -> retrieval -> rerank -> context -> answer -> evaluation` and chooses the first fail whose counterfactual says downstream would change.
-6. If upstream counterfactuals are unavailable, do not sink to downstream answer failures. Emit `primary_cause=null`, `needs_human_review=true`.
-7. `judgement_evidence.signals` must be <= 2KB. The CLI returns `E_EVIDENCE_TOO_LARGE` and does not truncate.
-8. Fornax trace middle-node evidence is authoritative. Use workflow replay only when trace lookup fails or lacks middle-node evidence.
-9. Probe commands are independent and can run in parallel. `ingest` and `orchestrate` are serial. `replay-workflow` is exclusive and must not run in parallel with probes.
-10. Output contract is JSON with `schema_version: "v3"`.
-11. Host Agent handles language tasks: input extraction, judgement compression, unsupported claim extraction, citation extraction, answer span alignment, and the final user-facing report.
-12. Batch fan-out belongs to the host Agent; this skill handles one case at a time.
-13. Evidence binding is validated: candidate causes need evidence IDs, and counterfactual evidence IDs must reference `evidence_bundle`.
-14. Knowledge existence is tri-state: `yes / no / unknown`. Unknown after retry becomes `indeterminate` + human review, not `suspected_knowledge_missing`.
-15. `needs_human_review=true` must be shown explicitly in user reports.
-16. Scope is RAG answer attribution only.
-17. `expected_knowledge_ids` is optional. If it is missing, the host must run `probe-self-oracle`; the skill must not treat "no expected knowledge provided" as proof that retrieval/rerank/context passed.
-18. Self-oracle inferred knowledge must carry `oracle_source` and `confidence`; verdict confidence is folded by oracle confidence when oracle evidence drives a cause.
-19. If both provided expected knowledge and self-oracle inference exist and do not overlap, set `needs_human_review=true` with reason `provided expected knowledge contradicts self-oracle inference`.
-20. `host_agent.answer_claim` is the only host Agent assertion input. Use nested JSON shape `{"host_agent": {"answer_claim": [...]}}`. Each item should be an object with `text`, `role`, optional `source`, and optional `confidence`; valid roles are `expected_required`, `missing_expected`, `answer_claim`, and `unsupported_claim`. The CLI normalizes `source` to `host_agent.answer_claim`.
-21. The CLI must not create expected assertions from query text, evaluator labels, empty-answer diagnostics, or arbitrary rubric/judgement fragments. If no `expected_required` / `missing_expected` assertion is available, emit `oracle_status.source=insufficient_assertions`, keep `primary_cause=null` unless answer-stage evidence is independently sufficient, and ask the host Agent to supply assertions.
-22. Only `expected_required` and `missing_expected` drive knowledge, retrieval, rerank, and context attribution. `unsupported_claim` is answer-stage evidence only and must not trigger `suspected_knowledge_missing`.
-23. Human reports must list assertion coverage and stage gaps. The assertion coverage matrix should focus on online stages (`origin -> rerank -> prompt`); theoretical recall upper bound must not appear as a standalone "hit doc" column unless it explicitly binds each upper-bound document to the required assertion it supports. Reports should include a separate theoretical-upper-bound/assertion relationship section with supporting doc IDs, titles, matched terms, and scores when available. `probe-wide-recall` must build the theoretical recall upper bound from the trace Sirius recall request template, run original query + rewrite query with topK >= 50, and use `upper_bound_scope=open_label` by clearing `recallLabels/level` while preserving the trace recall strategy. If the upper bound only partially supports required assertions, classify unsupported required assertions as partial knowledge missing and recommend adding or rewriting the corresponding KB content. If the upper bound supports a required assertion but online origin recall misses it, classify retrieval. Only classify `rerank_drop` when the required assertion's support is present in online origin recall but lost before/inside rerank.
+设置 npm registry：
 
-## Host Agent Flow
+```bash
+export npm_config_registry=https://bnpm.byted.org/
+```
 
-1. Normalize pasted text, table rows, curl/body, or user description into `query`, `judgement`, `workspace_id`, `app_id`, `log_id`, optional `expected_knowledge_ids`, nested `host_agent.answer_claim`, optional `qa` answer-state fields, and structured `judgement_evidence.signals`.
-   The host Agent should summarize deterministic assertions into `host_agent.answer_claim` only. Do not put assertions into `case_input.expected_knowledge_points`, `qa.answer_claims`, `qa.missing_expected_points`, `qa.unsupported_claims`, `qa.claim_alignments`, or `judgement_evidence.signals[].assertions/fact_points/missing_expected_points`.
-   `source` may be omitted; the CLI normalizes it to `host_agent.answer_claim`. `role` carries the semantic difference between required facts, missing facts, ordinary answer claims, and unsupported claims.
+获取 JWT：
 
-Assertion input example:
+```bash
+npx -y skills get-jwt
+npx -y skills -h
+```
+
+可选参数：
+
+- `--region`：可选值为 `cn`、`i18n`、`boe`、`sandbox`
+
+## 全局规则
+
+1. 任何归因 case 都必须先运行 `ingest-fornax-trace`，最后运行 `orchestrate`。`ingest-fornax-trace --raw` 只用于查看原始 trace，不属于归因流程。
+2. 候选原因只能使用 `references/cause-codes.md` 中的 v3 枚举。
+3. 每个阶段 verdict 必须包含 `counterfactual`。
+4. 如果上游阶段阻塞了下游判断，下游 verdict 必须设置 `upstream_blocked_by`。
+5. 主因选择按 `preprocess -> knowledge -> retrieval -> rerank -> context -> answer -> evaluation` 顺序遍历，选择第一个失败且 `counterfactual.downstream_would_change=true` 的阶段。
+6. 如果上游 counterfactual 不可用，不要下沉到下游答案问题。输出 `primary_cause=null`、`needs_human_review=true`。
+7. `judgement_evidence.signals` 必须小于等于 2KB。超限时 CLI 返回 `E_EVIDENCE_TOO_LARGE`，不会截断内容。
+8. Fornax trace 的中间节点证据是权威证据。只有 trace 查询失败或缺少中间节点证据时，才使用 workflow replay。
+9. probe 命令彼此独立，可以并行运行；`ingest` 和 `orchestrate` 必须串行；`replay-workflow` 是独占 fallback，不能与 probes 并行。
+10. 所有输出契约都是带 `schema_version: "v3"` 的 JSON。
+11. 宿主 Agent 负责语言理解任务：输入抽取、judgement 压缩、unsupported claim 抽取、引用抽取、answer span 对齐，以及最终面向用户的报告。
+12. 批量 fan-out 属于宿主 Agent；本 skill 每次只处理一个 case。
+13. 证据绑定会被校验：candidate cause 必须绑定 evidence ID，counterfactual 的 evidence ID 必须能回指 `evidence_bundle`。
+14. 知识存在性是三态：`yes / no / unknown`。重试后仍为 unknown 时输出 `indeterminate` + 人工复核，不判 `suspected_knowledge_missing`。
+15. 用户报告中必须显式展示 `needs_human_review=true`。
+16. 归因范围只覆盖 RAG 答案问题。
+17. `expected_knowledge_ids` 是可选字段。缺失时，宿主必须运行 `probe-self-oracle`；skill 不得把“没有提供期望知识”当成 retrieval / rerank / context 通过的证据。
+18. self-oracle 推断出的知识必须携带 `oracle_source` 和 `confidence`；当 oracle 证据驱动 cause 时，verdict 置信度需要折算 oracle 置信度。
+19. 如果人工提供的 expected knowledge 与 self-oracle 推断结果都存在但没有交集，设置 `needs_human_review=true`，原因写“人工提供的 expected knowledge 与 self-oracle 推断结果冲突”。
+20. `host_agent.answer_claim` 是宿主 Agent 唯一的断言输入。使用嵌套 JSON 结构 `{"host_agent": {"answer_claim": [...]}}`。每项应为对象，包含 `text`、`role`，可选 `source` 和 `confidence`；合法 role 包括 `expected_required`、`missing_expected`、`answer_claim`、`unsupported_claim`、`constraint_check`、`citation_check`、`consistency_check`。`*_check` role 用于 `probe-v1` 计划（范围、引用、一致性探针）。CLI 会把 `source` 归一化为 `host_agent.answer_claim`。
+21. CLI 不得从 query 文本、评估器标签、空回复诊断、rubric / judgement 长文本片段中生成期望断言。如果没有 `expected_required` / `missing_expected` 断言，输出 `oracle_status.source=insufficient_assertions`；除非答案阶段证据本身足够，否则保持 `primary_cause=null`，并要求宿主 Agent 补充断言。
+22. 只有 `expected_required` 和 `missing_expected` 驱动 knowledge、retrieval、rerank、context 归因。`unsupported_claim` 只作为 answer 阶段证据，不能触发 `suspected_knowledge_missing`。
+23. 人类报告必须列出断言覆盖和阶段断点。断言覆盖矩阵应聚焦线上阶段（`origin -> rerank -> prompt`）；理论召回上界不应作为孤立的“命中文档”列，除非明确绑定了每个上界文档支持的必要断言。报告应单独展示“理论召回上界与断言关系”，包含支撑文档 ID、标题、命中词、支撑状态、支撑片段和分数。只有文档正文包含 `full_support` 或 `partial_support` 片段时，召回文档才算覆盖断言；标题命中或纯词面命中不得进入 `upper_bound_docs/origin_docs/rerank_docs/prompt_docs`。`probe-wide-recall` 必须从 trace 的 Sirius recall 请求模板构建理论召回上界，用原 query + rewrite query 运行 topK >= 50，并通过清空 `recallLabels/level`、保留 trace 召回策略的方式设置 `upper_bound_scope=open_label`。如果上界只能部分支持必要断言，则将未被支持的必要断言归为部分知识缺失，并建议补充或改写对应 KB 内容。如果上界支持必要断言但线上 origin recall 未命中，则归因到 retrieval。只有必要断言的支撑证据在线上 origin recall 出现、但在 rerank 前后丢失时，才判 `rerank_drop`。
+
+## 宿主 Agent 执行流程
+
+1. 将粘贴文本、表格行、curl/body 或用户描述标准化为 `query`、`judgement`、`workspace_id`、`app_id`、`log_id`，可选 `expected_knowledge_ids`，嵌套 `host_agent.answer_claim`，可选 `qa` 答案状态字段，以及结构化 `judgement_evidence.signals`。
+   宿主 Agent 只能把确定性断言汇总到 `host_agent.answer_claim`。不要把断言放进 `case_input.expected_knowledge_points`、`qa.answer_claims`、`qa.missing_expected_points`、`qa.unsupported_claims`、`qa.claim_alignments` 或 `judgement_evidence.signals[].assertions/fact_points/missing_expected_points`。
+   `source` 可省略；CLI 会归一化为 `host_agent.answer_claim`。`role` 表示事实必须覆盖、答案遗漏、普通答案 claim、未支持 claim 等语义差异。
+
+断言输入示例：
 
 ```json
 {
@@ -72,7 +83,8 @@ Assertion input example:
   }
 }
 ```
-2. Run ingest:
+
+2. 运行 ingest：
 
 ```bash
 python -m findreason ingest-fornax-trace \
@@ -83,9 +95,17 @@ python -m findreason ingest-fornax-trace \
   --output-dir /tmp/findreason-case
 ```
 
-3. Read `ingest_summary.suggested_probe_set` and `host_action_required`. Run only the recommended probes, unless the user explicitly asks for a focused branch. `probe-self-oracle` is recommended first by default.
-   `probe-wide-recall --topk 50` is recommended with self-oracle and should use the trace Sirius recall body as an open-label theoretical recall upper bound.
-4. Run final arbitration:
+3. 读取 `ingest_summary.suggested_probe_set` 和 `host_action_required`。除非用户明确要求某个分支，否则只运行推荐 probes。默认优先运行 `probe-self-oracle`。
+   `probe-wide-recall --topk 50` 建议与 self-oracle 一起运行，并使用 trace 中的 Sirius recall body 作为 open-label 理论召回上界。
+   如果 `host_action_required` 包含 `generate-probe-plan`，宿主 Agent 必须用 probe-v1 提示词从用户问题和答案中反向构造探针查询。把代表必要答案断言的每个 `expected_required` / `missing_expected` probe 复制到 `host_agent.answer_claim`，重新运行 `ingest-fornax-trace --case-file`，然后执行：
+
+```bash
+python -m findreason run-probe-plan --ingest-file /tmp/findreason-case/ingest.json --plan @plan.json --output-dir /tmp/findreason-case/probes
+```
+
+   如果没有这一步宿主抽取，CLI 会有意保持断言覆盖矩阵为空，因为它不能自行从 query 文本中发明必要断言。
+
+4. 运行最终仲裁：
 
 ```bash
 python -m findreason orchestrate \
@@ -96,18 +116,18 @@ python -m findreason orchestrate \
   --output-dir /tmp/findreason-case/final
 ```
 
-5. Write the human report from the JSON output. Include `span_type=workflow` input/output from `raw_artifacts.workflow_span_ios` when available.
+5. 从 JSON 输出撰写人类报告。若存在 `raw_artifacts.workflow_span_ios`，报告中必须包含 `span_type=workflow` 的输入/输出。
 
-## Commands
+## 命令
 
-Skeleton commands:
+基础命令：
 
 ```bash
 python -m findreason ingest-fornax-trace --workspace-id 89 --log-id 20260601191946A85794168A7D7BF20EB0 --limit 1000
 python -m findreason orchestrate --ingest-file /tmp/findreason-case/ingest.json --probe-dir /tmp/findreason-case/probes
 ```
 
-Probe commands:
+Probe 命令：
 
 ```bash
 python -m findreason probe-self-oracle --ingest-file /tmp/findreason-case/ingest.json --signals judgement_back_recall,claim_back_recall,query_wide_recall --topk 50 --output-dir /tmp/findreason-case/probes
@@ -122,41 +142,49 @@ python -m findreason probe-by-claim --ingest-file /tmp/findreason-case/ingest.js
 python -m findreason probe-by-doc-title --ingest-file /tmp/findreason-case/ingest.json --titles @titles.json --output-dir /tmp/findreason-case/probes
 ```
 
-Workflow commands:
+Probe-plan 执行器（`probe-v1`）：
+
+宿主 Agent 把探针查询反向构造成 `probe-v1` 计划（方向包括 `relevance_gap`、`coverage_gap`、`scope_violation`、`citation_missing`、`internal_contradiction`）。`run-probe-plan` 会针对请求的 `target_artifact`（`kb_wide_recall`、`online_origin_recall`、`rerank_output`、`prompt_context`、`answer_span`）执行每个查询，记录确定性的 hit/miss 事实，并输出供 `orchestrate` 消费的 `stage_signals`。执行器绝不决定主因。把它的 JSON 输出放入 `--probe-dir`。
+
+```bash
+python -m findreason run-probe-plan --ingest-file /tmp/findreason-case/ingest.json --plan @plan.json --output-dir /tmp/findreason-case/probes
+```
+
+Workflow 命令：
 
 ```bash
 python -m findreason fetch-workflow-nodes --workspace-id <workspace_id> --app-id <app_id>
 python -m findreason replay-workflow --ingest-file /tmp/findreason-case/ingest.json --override @override.json
 ```
 
-Raw trace only:
+只查看原始 trace：
 
 ```bash
 python -m findreason ingest-fornax-trace --workspace-id <workspace_id> --log-id <log_id> --raw
 ```
 
-Schema discovery:
+查看 schema：
 
 ```bash
 python -m findreason schema
 ```
 
-## Output Contract
+## 输出契约
 
-`ingest-fornax-trace` emits `schema_version`, `log_id`, `workspace_id`, `app_id`, `case`, `ingest_summary`, and `raw_artifacts`. `ingest_summary` includes `trace_completeness`, `suggested_probe_set`, `skip_reason`, and `host_action_required`.
+`ingest-fornax-trace` 输出 `schema_version`、`log_id`、`workspace_id`、`app_id`、`case`、`ingest_summary` 和 `raw_artifacts`。`ingest_summary` 包含 `trace_completeness`、`suggested_probe_set`、`skip_reason` 和 `host_action_required`。
 
-`orchestrate` emits `schema_version`, `oracle_status`, `case_assessment`, `primary_cause` object or `null`, `failure_patterns`, `needs_human_review`, `human_review_reasons`, `evidence_bundle`, `evidence_chain`, `next_actions`, `telemetry`, `deprecations`, and `raw_artifacts`. `oracle_status` may include `expected_knowledge_points`, `point_coverage`, `missing_expected_points_from_origin`, `missing_expected_points_from_rerank`, and `missing_expected_points_from_prompt`.
+`orchestrate` 输出 `schema_version`、`oracle_status`、`case_assessment`、`primary_cause` 对象或 `null`、`failure_patterns`、`needs_human_review`、`human_review_reasons`、`evidence_bundle`、`evidence_chain`、`next_actions`、`telemetry`、`deprecations` 和 `raw_artifacts`。`oracle_status` 可包含 `expected_knowledge_points`、`point_coverage`、`missing_expected_points_from_origin`、`missing_expected_points_from_rerank` 和 `missing_expected_points_from_prompt`。
 
-The CLI writes one case-local record: `attribution_record.json` plus `short_summary.json` when orchestrate uses `--output-dir`. It does not generate batch `summary.md`, `summary.csv`, or `summary.json`.
+当 `orchestrate` 使用 `--output-dir` 时，CLI 会为单个 case 写入 `attribution_record.json` 和 `short_summary.json`。不会生成批量 `summary.md`、`summary.csv` 或 `summary.json`。
 
-## References
+## 参考文档
 
-- `references/cause-codes.md`: v3 cause enum, owners, trigger conditions, and boundaries.
-- `references/probe-spec.md`: probe inputs, outputs, cache, and failure semantics.
-- `references/orchestrator-rules.md`: counterfactual and primary-cause selection rules.
-- `references/workflow-ops.md`: workflow node fetch and replay behavior.
-- `references/span-extraction.md`: Fornax span extraction mapping.
-- `references/evidence-spec.md`: evidence bundle schema and validation.
-- `references/output-schema.json`: v3 output schema for host-side validation.
-- `references/host_agent_playbook.md`: host Agent responsibilities and report composition guidance.
-- `references/capabilities.json`: v3 capability manifest.
+- `references/cause-codes.md`：v3 cause 枚举、owner、触发条件和边界。
+- `references/probe-spec.md`：probe 输入、输出、缓存和失败语义。
+- `references/orchestrator-rules.md`：counterfactual 和主因选择规则。
+- `references/workflow-ops.md`：workflow 节点获取和 replay 行为。
+- `references/span-extraction.md`：Fornax span 抽取映射。
+- `references/evidence-spec.md`：evidence bundle schema 和校验规则。
+- `references/output-schema.json`：供宿主侧校验使用的 v3 输出 schema。
+- `references/host_agent_playbook.md`：宿主 Agent 职责和报告组织指南。
+- `references/capabilities.json`：v3 capability manifest。

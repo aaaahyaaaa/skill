@@ -1,6 +1,6 @@
-# AIME / Agent Host Transfer v3
+# AIME / 宿主 Agent 迁移说明 v3
 
-Ship the whole skill directory, including:
+迁移时需要带上完整 skill 目录，包括：
 
 - `SKILL.md`
 - `findreason/`
@@ -10,9 +10,9 @@ Ship the whole skill directory, including:
 - `requirements.txt`
 - `config/runtime_defaults.json`
 
-The host should call `python -m findreason`.
+宿主应通过 `python -m findreason` 调用。
 
-## Required Sequence
+## 必须执行的顺序
 
 ```bash
 python -m findreason ingest-fornax-trace \
@@ -23,7 +23,7 @@ python -m findreason ingest-fornax-trace \
   --output-dir <case_dir>
 ```
 
-Run the recommended probes from `ingest_summary.suggested_probe_set`, writing results to `<case_dir>/probes/`.
+读取 `ingest_summary.suggested_probe_set`，运行推荐 probes，并将结果写入 `<case_dir>/probes/`。
 
 ```bash
 python -m findreason orchestrate \
@@ -34,12 +34,12 @@ python -m findreason orchestrate \
   --output-dir <case_dir>/final
 ```
 
-## Host-Owned Work
+## 宿主负责的工作
 
-The target host Agent owns input extraction, judgement compression, unsupported-claim extraction, wrong-citation extraction, answer alignment, batch fan-out, and final report rendering.
+目标宿主 Agent 负责输入抽取、judgement 压缩、unsupported claim 抽取、wrong citation 抽取、answer alignment、批量 fan-out 和最终报告渲染。
 
-## Configuration
+## 配置
 
-`config/runtime_defaults.json` should not include real tokens. Provide `OPEN_PLAT_TRACE_TOKEN` through exported environment variables or a host-local env file, without the `Bearer` prefix.
+`config/runtime_defaults.json` 不应包含真实 token。通过导出的环境变量或宿主本地 env 文件提供 `OPEN_PLAT_TRACE_TOKEN`，值不带 `Bearer` 前缀。
 
-Exported environment variables still override project defaults when a host needs a different token or endpoint.
+当宿主需要使用不同 token 或 endpoint 时，导出的环境变量仍然优先于项目默认配置。

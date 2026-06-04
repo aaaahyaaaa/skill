@@ -872,7 +872,15 @@ def _suggest_probes(request_dict: dict[str, Any], completeness: dict[str, str], 
     if _host_answer_claim_items(request_dict) or qa.get("wrong_citation") or qa.get("partial_answer"):
         add("probe-by-claim")
     elif qa.get("answer"):
-        host_actions.append({"action": "extract_host_agent_answer_claim", "reason": "answer exists but host did not supply host_agent.answer_claim", "priority": "P0"})
+        host_actions.append(
+            {
+                "action": "generate-probe-plan",
+                "reason": "answer exists but host did not supply probe-v1 plan or host_agent.answer_claim; use the host Agent prompt to extract question points, answer facts, and probe queries",
+                "priority": "P0",
+            }
+        )
+        host_actions.append({"action": "extract_host_agent_answer_claim", "reason": "copy expected_required/missing_expected probes from the host probe-v1 plan into host_agent.answer_claim before orchestrate", "priority": "P0"})
+        add("run-probe-plan")
     if request_dict.get("judgement_evidence", {}).get("signals") or case_input.get("judgement"):
         add("probe-by-judgement")
     if case_input.get("expected_knowledge_ids") and not counts["prompt_docs"]:
@@ -889,6 +897,7 @@ def _suggest_probes(request_dict: dict[str, Any], completeness: dict[str, str], 
         "probe-by-judgement",
         "probe-by-claim",
         "probe-by-doc-title",
+        "run-probe-plan",
         "fetch-workflow-nodes",
         "replay-workflow",
     }
@@ -1488,6 +1497,22 @@ def _oracle_adjusted_confidence(base: float, probe_state: dict[str, Any]) -> flo
         return base
 
 
+def _required_assertions_all_covered(request_dict: dict[str, Any], probe_state: dict[str, Any]) -> bool:
+    raw_oracle = request_dict.get("raw_oracle_fields") if isinstance(request_dict.get("raw_oracle_fields"), dict) else {}
+    rows = raw_oracle.get("point_coverage")
+    if not isinstance(rows, list):
+        oracle_state = probe_state.get("oracle_status") if isinstance(probe_state.get("oracle_status"), dict) else {}
+        rows = oracle_state.get("point_coverage")
+    if not isinstance(rows, list):
+        return False
+    required_rows = [
+        row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("role") or "expected_required") in REQUIRED_ASSERTION_ROLES
+    ]
+    return bool(required_rows) and all(row.get("missing_stage") == "covered" for row in required_rows)
+
+
 def _infer_verdicts(
     request_dict: dict[str, Any],
     ingest: dict[str, Any],
@@ -1509,6 +1534,7 @@ def _infer_verdicts(
     recall_count = counts["origin_doc_list"] + counts["origin_faq_list"]
     oracle_state = probe_state.get("oracle_status") if isinstance(probe_state.get("oracle_status"), dict) else {}
     assertion_insufficient = oracle_state.get("source") == "insufficient_assertions"
+    required_assertions_all_covered = _required_assertions_all_covered(request_dict, probe_state)
     verdicts: list[dict[str, Any]] = []
 
     def join_short(values: list[str], limit: int = 3) -> str:
@@ -1645,6 +1671,8 @@ def _infer_verdicts(
                 ),
             )
         )
+    elif required_assertions_all_covered:
+        verdicts.append(_verdict(stage="retrieval", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "required assertions are covered in the online evidence chain; doc-id-only retrieval mismatch ignored")))
     elif retrieval.get("oracle_missing_from_origin_ids"):
         missing_ids = _string_list(retrieval.get("oracle_missing_from_origin_ids"))
         verdicts.append(_verdict(stage="retrieval", status="fail", candidate_cause="retrieval_miss", confidence=_oracle_adjusted_confidence(0.84, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"self-oracle expected docs missed online retrieval: {', '.join(missing_ids[:10])}", "fix query/index/filter/topK so inferred expected docs enter recall", True, ev)))
@@ -1687,6 +1715,8 @@ def _infer_verdicts(
     elif _string_list(rerank.get("missing_expected_points_from_rerank")):
         detail = join_short(_string_list(rerank.get("missing_expected_points_from_rerank")))
         verdicts.append(_verdict(stage="rerank", status="fail", candidate_cause="rerank_drop", confidence=_oracle_adjusted_confidence(0.86, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"required assertions were covered by origin recall but dropped by rerank: {detail}", f"fix rerank scoring/dedup/topK for: {detail}", True, ev)))
+    elif required_assertions_all_covered:
+        verdicts.append(_verdict(stage="rerank", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "required assertions survived into prompt; doc-id-only rerank drop ignored")))
     elif rerank.get("oracle_missing_from_rerank_ids"):
         missing_ids = _string_list(rerank.get("oracle_missing_from_rerank_ids"))
         verdicts.append(_verdict(stage="rerank", status="fail", candidate_cause="rerank_drop", confidence=_oracle_adjusted_confidence(0.86, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"self-oracle expected docs were recalled but dropped by rerank: {', '.join(missing_ids[:10])}", "fix rerank scoring/dedup/topK so inferred expected docs survive", True, ev)))
@@ -1727,6 +1757,8 @@ def _infer_verdicts(
     elif _string_list(rerank.get("missing_expected_points_from_prompt")):
         detail = join_short(_string_list(rerank.get("missing_expected_points_from_prompt")))
         verdicts.append(_verdict(stage="context", status="fail", candidate_cause="context_assembly_error", confidence=_oracle_adjusted_confidence(0.82, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"required assertions survived rerank but did not enter prompt: {detail}", f"fix prompt_docs assembly/truncation/noise budget for: {detail}", True, ev)))
+    elif required_assertions_all_covered:
+        verdicts.append(_verdict(stage="context", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "required assertions reached prompt; doc-id-only prompt mismatch ignored")))
     elif rerank.get("oracle_missing_from_prompt_ids"):
         missing_ids = _string_list(rerank.get("oracle_missing_from_prompt_ids"))
         verdicts.append(_verdict(stage="context", status="fail", candidate_cause="context_assembly_error", confidence=_oracle_adjusted_confidence(0.82, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"self-oracle expected docs survived upstream but did not enter prompt: {', '.join(missing_ids[:10])}", "fix prompt_docs assembly, truncation, and noise budget", True, ev)))
@@ -1902,7 +1934,10 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
     case_input = request_dict.get("case_input") if isinstance(request_dict.get("case_input"), dict) else {}
     provided_ids = _string_list(case_input.get("expected_knowledge_ids"))
     inferred_ids = _string_list(case_input.get("inferred_expected_knowledge_ids"))
-    expected_points = _expected_knowledge_points(request_dict)
+    raw_oracle = request_dict.get("raw_oracle_fields") if isinstance(request_dict.get("raw_oracle_fields"), dict) else {}
+    raw_points = _canonicalize_assertion_records(raw_oracle.get("expected_knowledge_points"))
+    raw_coverage = _canonicalize_assertion_records(raw_oracle.get("point_coverage"))
+    expected_points = raw_points or _expected_knowledge_points(request_dict)
     required_points = _required_assertion_points(expected_points)
     status = probe_state.get("oracle_status")
     if isinstance(status, dict):
@@ -1925,6 +1960,8 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
             "confidence": 1.0,
             "conflict_detected": False,
             "provided_conflict_detected": False,
+            "expected_knowledge_points": expected_points,
+            "point_coverage": raw_coverage,
         }
     if inferred_ids:
         return {
@@ -1938,6 +1975,8 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
             "confidence": probe_state.get("oracle_confidence", 0.0),
             "conflict_detected": False,
             "provided_conflict_detected": False,
+            "expected_knowledge_points": expected_points,
+            "point_coverage": raw_coverage,
         }
     if not required_points:
         return {
@@ -1955,6 +1994,22 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
             "point_coverage": [],
             "assertion_status": "insufficient_required_assertions",
         }
+    if raw_coverage:
+        return {
+            "source": "host_assertions",
+            "signals_used": ["host_agent.answer_claim"],
+            "signals_attempted": [],
+            "signals_failed": {},
+            "inferred_doc_count": 0,
+            "inferred_doc_ids": [],
+            "provided_doc_ids": provided_ids,
+            "confidence": max([float(point.get("confidence") or 0.0) for point in required_points] or [0.0]),
+            "conflict_detected": False,
+            "provided_conflict_detected": False,
+            "expected_knowledge_points": expected_points,
+            "point_coverage": raw_coverage,
+            "assertion_status": "coverage_computed_from_host_assertions",
+        }
     return {
         "source": "insufficient",
         "signals_used": [],
@@ -1967,6 +2022,7 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
         "conflict_detected": False,
         "provided_conflict_detected": False,
         "expected_knowledge_points": expected_points,
+        "point_coverage": raw_coverage,
         "assertion_status": "required_assertions_without_oracle_docs" if required_points else "no_required_assertions",
     }
 
@@ -2323,7 +2379,9 @@ def _point_stage_text(row: dict[str, Any], key: str) -> str:
     if not docs:
         return "未找到"
     first = docs[0]
-    return f"命中 `{first.get('id')}` {first.get('title') or ''}".strip()
+    status = str(first.get("support_status") or "").strip()
+    status_text = f"（{status}）" if status else ""
+    return f"命中 `{first.get('id')}` {first.get('title') or ''}{status_text}".strip()
 
 
 def _format_upper_bound_support_doc(doc: dict[str, Any]) -> str:
@@ -2336,10 +2394,20 @@ def _format_upper_bound_support_doc(doc: dict[str, Any]) -> str:
     matched_terms = [str(term) for term in doc.get("matched_terms") or [] if term]
     if matched_terms:
         details.append(f"匹配词：{'、'.join(matched_terms[:5])}")
+    support_status = str(doc.get("support_status") or "").strip()
+    if support_status:
+        details.append(f"支撑={support_status}")
+    if doc.get("support_score") not in (None, ""):
+        details.append(f"support_score={doc.get('support_score')}")
     if doc.get("score") not in (None, ""):
         details.append(f"score={doc.get('score')}")
     suffix = f"（{'；'.join(details)}）" if details else ""
-    return " ".join(parts) + suffix
+    support_spans = [re.sub(r"\s+", " ", str(span or "")).strip() for span in doc.get("support_spans") or []]
+    span_text = ""
+    if support_spans:
+        span = support_spans[0]
+        span_text = f"；片段：{span[:120]}{'...' if len(span) > 120 else ''}"
+    return " ".join(parts) + suffix + span_text
 
 
 def _format_upper_bound_assertion_relations(rows: list[dict[str, Any]], *, limit: int = 8, doc_limit: int = 3) -> list[str]:
@@ -2374,7 +2442,10 @@ ASSERTION_ROLE_DISPLAY = {
 
 def _format_point_coverage_table(rows: list[dict[str, Any]], *, limit: int = 8) -> list[str]:
     if not rows:
-        return ["未抽取到可用于链路归因的必要断言。"]
+        return [
+            "- 未提供 `host_agent.answer_claim` 中的 `expected_required/missing_expected` 断言，无法生成链路归因用的断言覆盖矩阵。",
+            "- 先用 probe-v1 提示词生成探针计划，将必要断言同步写入 `host_agent.answer_claim`，再执行 `run-probe-plan` 后重新 `orchestrate`。",
+        ]
     lines = [
         "| 断言 | 角色 | 来源 | 线上初召回 | 重排 | Prompt | 阶段判断 |",
         "|---|---|---|---|---|---|---|",
@@ -2789,9 +2860,31 @@ def _answer_span_hit(query: str, expected_pattern: str, answer_text: str) -> tup
         return False, []
     terms = _point_required_terms(expected_pattern) or _point_required_terms(query)
     if not terms:
+        terms = _probe_literal_terms(expected_pattern) or _probe_literal_terms(query)
+    if not terms:
         return False, []
     matched = [term for term in terms if term and term in answer_text]
     return bool(matched), matched
+
+
+def _probe_literal_terms(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    terms: list[str] = []
+
+    def add(term: str) -> None:
+        cleaned = re.sub(r"^[：:，,、。；;\"'“”‘’「」【】《》\\s]+|[：:，,、。；;\"'“”‘’「」【】《》\\s]+$", "", term.strip())
+        if 2 <= len(cleaned) <= 24 and cleaned not in terms:
+            terms.append(cleaned)
+
+    for match in re.findall(r"(?:包含|含有|含|出现|命中|关键词|应包含|应含)([\u4e00-\u9fffA-Za-z0-9_\-]{2,24})", raw):
+        add(match)
+    for match in re.findall(r"[\"'“”‘’「」【】《》]([^\"'“”‘’「」【】《》]{2,24})[\"'“”‘’「」【】《》]", raw):
+        add(match)
+    if re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9_\-]{2,24}", raw):
+        add(raw)
+    return terms[:6]
 
 
 def run_probe_plan(
@@ -2816,6 +2909,20 @@ def run_probe_plan(
     raw_probes = plan.get("probes")
     if not isinstance(raw_probes, list):
         raise V3Error("E_PROBE_PLAN_INVALID", "probe plan 'probes' must be a list.", status_code=2)
+    for index, probe in enumerate(raw_probes):
+        if not isinstance(probe, dict):
+            raise V3Error("E_PROBE_PLAN_INVALID", f"probe at index {index} must be a JSON object.", status_code=2)
+        probe_id = str(probe.get("probe_id") or f"P-{index + 1}")
+        direction = str(probe.get("direction") or "")
+        if not direction:
+            raise V3Error("E_PROBE_PLAN_INVALID", f"probe {probe_id} must include direction.", status_code=2)
+        if direction not in PROBE_PLAN_DIRECTIONS:
+            raise V3Error("E_PROBE_DIRECTION_INVALID", f"probe {probe_id} direction={direction} is not supported.", status_code=2)
+        target_artifact = str(probe.get("target_artifact") or "")
+        if not target_artifact:
+            raise V3Error("E_PROBE_PLAN_INVALID", f"probe {probe_id} must include target_artifact.", status_code=2)
+        if target_artifact not in PROBE_TARGET_ARTIFACTS:
+            raise V3Error("E_PROBE_TARGET_INVALID", f"probe {probe_id} target_artifact={target_artifact} is not supported.", status_code=2)
 
     workspace_id = str(ingest.get("workspace_id") or "")
     log_id = str(ingest.get("log_id") or "")
@@ -2845,27 +2952,31 @@ def run_probe_plan(
 
     executed_probes: list[dict[str, Any]] = []
     for index, probe in enumerate(raw_probes):
-        if not isinstance(probe, dict):
-            continue
         probe_id = str(probe.get("probe_id") or f"P-{index + 1}")
         direction = str(probe.get("direction") or "")
-        if direction and direction not in PROBE_PLAN_DIRECTIONS:
-            raise V3Error("E_PROBE_DIRECTION_INVALID", f"probe {probe_id} direction={direction} is not supported.", status_code=2)
         role = _normalize_assertion_role(probe.get("role"), "expected_required")
         target_artifact = str(probe.get("target_artifact") or "")
-        if target_artifact and target_artifact not in PROBE_TARGET_ARTIFACTS:
-            raise V3Error("E_PROBE_TARGET_INVALID", f"probe {probe_id} target_artifact={target_artifact} is not supported.", status_code=2)
         query = str(probe.get("query") or "")
         expected_pattern = str(probe.get("expected_hit_pattern") or "")
         if target_artifact == "answer_span":
             hit, matched_terms = _answer_span_hit(query, expected_pattern, answer_text)
             matched_docs: list[dict[str, Any]] = []
+            executed = True
+            skip_reason = ""
+        elif target_artifact == "kb_wide_recall" and theoretical_status != "ok":
+            hit = None
+            matched_terms = []
+            matched_docs = []
+            executed = False
+            skip_reason = "kb_wide_recall_unavailable"
         else:
             target_docs = _probe_target_docs(request_dict, target_artifact, wide_docs)
             matched_docs = _point_doc_matches(query or expected_pattern, target_docs)
             hit = bool(matched_docs)
             matched_terms = []
-        converged = str(probe.get("if_hit") if hit else probe.get("if_miss") or "")
+            executed = True
+            skip_reason = ""
+        converged = "" if hit is None else str(probe.get("if_hit") if hit else probe.get("if_miss") or "")
         executed_probes.append(
             {
                 "probe_id": probe_id,
@@ -2874,12 +2985,13 @@ def run_probe_plan(
                 "query": query,
                 "target_artifact": target_artifact,
                 "expected_hit_pattern": expected_pattern,
-                "executed": True,
+                "executed": executed,
                 "hit": hit,
                 "matched_docs": matched_docs,
                 "matched_terms": matched_terms,
                 "converged_direction": converged,
                 "evidence_id": f"run-probe-plan:{probe_id}",
+                **({"skip_reason": skip_reason} if skip_reason else {}),
             }
         )
 
@@ -2953,8 +3065,10 @@ def _probe_plan_stage_signals(
     for probe in executed_probes:
         direction = probe["direction"]
         hit = probe["hit"]
-        if direction == "scope_violation" and probe["target_artifact"] != "answer_span" and not hit:
-            # KB does not support the answer fact under the question constraint -> answer overreached.
+        if hit is None:
+            continue
+        if direction == "scope_violation" and not hit:
+            # The scoped fact is unsupported in KB/prompt or absent from the answer text -> answer overreached or shifted objects.
             answer_signal["scope_violation"] = True
         elif direction == "citation_missing":
             if hit:
@@ -3072,6 +3186,19 @@ def _doc_text(doc: dict[str, Any]) -> str:
     fields = [
         doc.get("title"),
         doc.get("name"),
+        doc.get("content"),
+        doc.get("text"),
+        doc.get("summary"),
+        doc.get("chunk"),
+        doc.get("snippet"),
+        doc.get("answer"),
+        doc.get("source"),
+    ]
+    return " ".join(str(item) for item in fields if item not in (None, ""))
+
+
+def _doc_body_text(doc: dict[str, Any]) -> str:
+    fields = [
         doc.get("content"),
         doc.get("text"),
         doc.get("summary"),
@@ -3525,7 +3652,13 @@ def _point_required_terms(text: str) -> list[str]:
     return terms[:6]
 
 
-def _doc_brief(doc: dict[str, Any], *, score: float | None = None, matched_terms: list[str] | None = None) -> dict[str, Any]:
+def _doc_brief(
+    doc: dict[str, Any],
+    *,
+    score: float | None = None,
+    matched_terms: list[str] | None = None,
+    support: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": _doc_id(doc),
         "title": _doc_title(doc),
@@ -3536,23 +3669,112 @@ def _doc_brief(doc: dict[str, Any], *, score: float | None = None, matched_terms
         item["score"] = round(float(score), 4)
     if matched_terms:
         item["matched_terms"] = matched_terms[:5]
+    if support:
+        for key in ("support_status", "support_score", "support_spans", "missing_constraints"):
+            value = support.get(key)
+            if value not in (None, "", []):
+                item[key] = value
     return item
 
 
+SUPPORT_FULL_THRESHOLD = 0.42
+SUPPORT_PARTIAL_THRESHOLD = 0.3
+SUPPORT_ACCEPTED_STATUSES = {"full_support", "partial_support"}
+
+
+def _support_span_candidates(text: Any, *, limit: int = 80) -> list[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return []
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(span: str) -> None:
+        cleaned = re.sub(r"\s+", " ", span).strip(" ，,、:：；;。")
+        if len(cleaned) < 4 or cleaned in seen:
+            return
+        seen.add(cleaned)
+        candidates.append(cleaned)
+
+    if len(normalized) <= 240:
+        add(normalized)
+    parts = [
+        part.strip(" ，,、:：；;。")
+        for part in re.split(r"[。！？!?；;\n\r]+", normalized)
+        if part.strip(" ，,、:：；;。")
+    ]
+    for part in parts:
+        if len(part) <= 240:
+            add(part)
+            continue
+        for start in range(0, len(part), 160):
+            add(part[start : start + 240])
+            if len(candidates) >= limit:
+                return candidates[:limit]
+    for index in range(len(parts) - 1):
+        combined = f"{parts[index]}。{parts[index + 1]}".strip(" ，,、:：；;。")
+        if len(combined) <= 240:
+            add(combined)
+        if len(candidates) >= limit:
+            break
+    if not candidates:
+        add(normalized[:240])
+    return candidates[:limit]
+
+
+def _doc_support_evidence(point_text: str, doc: dict[str, Any], *, terms: list[str]) -> dict[str, Any]:
+    body_text = _doc_body_text(doc)
+    doc_text = _doc_text(doc)
+    lexical_terms = [term for term in terms if term and term in doc_text]
+    doc_score = _oracle_score(point_text, doc)
+    scored_spans: list[tuple[float, int, str, list[str]]] = []
+    for span in _support_span_candidates(body_text):
+        span_score = _oracle_score(point_text, {"content": span})
+        span_terms = [term for term in terms if term and term in span]
+        if span_score <= 0:
+            continue
+        scored_spans.append((span_score, len(span_terms), span, span_terms))
+    scored_spans.sort(key=lambda item: (item[0], item[1], len(item[2])), reverse=True)
+    best_score = scored_spans[0][0] if scored_spans else 0.0
+    best_terms = scored_spans[0][3] if scored_spans else []
+    support_spans = [span for score, _, span, _ in scored_spans[:2] if score >= SUPPORT_PARTIAL_THRESHOLD]
+    missing_constraints = [term for term in terms if term and term not in (support_spans[0] if support_spans else body_text)]
+
+    if best_score >= SUPPORT_FULL_THRESHOLD:
+        status = "full_support"
+    elif best_score >= SUPPORT_PARTIAL_THRESHOLD:
+        status = "partial_support"
+    elif (lexical_terms and doc_score >= 0.035) or doc_score >= 0.48:
+        status = "lexical_match_only"
+    else:
+        status = "no_support"
+    return {
+        "support_status": status,
+        "support_score": round(best_score, 4),
+        "support_spans": support_spans[:2],
+        "matched_terms": (best_terms or lexical_terms)[:5],
+        "missing_constraints": missing_constraints[:5],
+        "score": doc_score,
+    }
+
+
 def _point_doc_matches(point_text: str, docs: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
-    terms = _point_required_terms(point_text)
     matches: list[dict[str, Any]] = []
+    terms = _point_required_terms(point_text) or _probe_literal_terms(point_text)
     for doc in _unique_docs(docs):
-        doc_text = _doc_text(doc)
-        score = _oracle_score(point_text, doc)
-        matched_terms = [term for term in terms if term and term in doc_text]
-        if terms:
-            supported = (bool(matched_terms) and score >= 0.035) or score >= 0.48
-        else:
-            supported = score >= 0.16
-        if supported:
-            matches.append(_doc_brief(doc, score=score, matched_terms=matched_terms))
-    matches.sort(key=lambda item: (float(item.get("score") or 0.0), len(item.get("matched_terms") or [])), reverse=True)
+        support = _doc_support_evidence(point_text, doc, terms=terms)
+        if support["support_status"] in SUPPORT_ACCEPTED_STATUSES:
+            matches.append(_doc_brief(doc, score=support["score"], matched_terms=support["matched_terms"], support=support))
+    status_rank = {"full_support": 2, "partial_support": 1}
+    matches.sort(
+        key=lambda item: (
+            status_rank.get(str(item.get("support_status") or ""), 0),
+            float(item.get("support_score") or 0.0),
+            float(item.get("score") or 0.0),
+            len(item.get("matched_terms") or []),
+        ),
+        reverse=True,
+    )
     return matches[:limit]
 
 

@@ -350,6 +350,145 @@ def test_ingest_fetches_openplat_trace_and_emits_v3_summary(tmp_path: Path) -> N
     assert (tmp_path / "case-out" / "attribution_record.json").exists()
 
 
+def test_ingest_without_host_assertions_requests_probe_plan(tmp_path: Path) -> None:
+    with TraceServer(trace_payload()) as server:
+        result = run_cli(
+            "ingest-fornax-trace",
+            "--workspace-id",
+            "55",
+            "--log-id",
+            "log-1",
+            "--case-file",
+            str(case_file(tmp_path, expected_knowledge_ids=[])),
+            "--output-dir",
+            str(tmp_path / "case-out"),
+            cwd=SKILL_ROOT,
+            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    suggested = payload["ingest_summary"]["suggested_probe_set"]
+    actions = [item["action"] for item in payload["ingest_summary"]["host_action_required"]]
+    assert "generate-probe-plan" in actions
+    assert "run-probe-plan" in suggested
+
+
+def test_cli_ingest_preserves_host_agent_answer_claim(tmp_path: Path) -> None:
+    case_path = tmp_path / "case.json"
+    case_path.write_text(
+        json.dumps(
+            {
+                "case_input": {"query": "云图是什么", "workspace_id": "55", "app_id": "100"},
+                "host_agent": {
+                    "answer_claim": [
+                        {
+                            "text": "正确答案应说明云图是指标分析的数据产品。",
+                            "role": "expected_required",
+                            "confidence": 0.9,
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    with TraceServer(trace_payload()) as server:
+        result = run_cli(
+            "ingest-fornax-trace",
+            "--workspace-id",
+            "55",
+            "--log-id",
+            "log-1",
+            "--case-file",
+            str(case_path),
+            "--output-dir",
+            str(tmp_path / "case-out"),
+            cwd=SKILL_ROOT,
+            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    claims = payload["raw_artifacts"]["attribution_request"]["host_agent"]["answer_claim"]
+    assert claims == [
+        {
+            "text": "正确答案应说明云图是指标分析的数据产品",
+            "role": "expected_required",
+            "source": "host_agent.answer_claim",
+            "confidence": 0.9,
+        }
+    ]
+    assert "extract_host_agent_answer_claim" not in [
+        item["action"] for item in payload["ingest_summary"]["host_action_required"]
+    ]
+
+
+def test_cli_ingest_preserves_host_agent_answer_claim_in_case_object(tmp_path: Path) -> None:
+    case_path = case_file(
+        tmp_path,
+        expected_knowledge_ids=[],
+        host_agent={
+            "answer_claim": [
+                {
+                    "text": "正确答案应说明云图是指标分析的数据产品。",
+                    "role": "expected_required",
+                    "confidence": 0.9,
+                }
+            ]
+        },
+    )
+    with TraceServer(trace_payload()) as server:
+        result = run_cli(
+            "ingest-fornax-trace",
+            "--workspace-id",
+            "55",
+            "--log-id",
+            "log-1",
+            "--case-file",
+            str(case_path),
+            "--output-dir",
+            str(tmp_path / "case-out"),
+            cwd=SKILL_ROOT,
+            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    claims = payload["raw_artifacts"]["attribution_request"]["host_agent"]["answer_claim"]
+    assert claims == [
+        {
+            "text": "正确答案应说明云图是指标分析的数据产品",
+            "role": "expected_required",
+            "source": "host_agent.answer_claim",
+            "confidence": 0.9,
+        }
+    ]
+    assert "extract_host_agent_answer_claim" not in [
+        item["action"] for item in payload["ingest_summary"]["host_action_required"]
+    ]
+
+
+def test_report_explains_empty_assertion_matrix_needs_probe_plan() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {"query": "同店铺下两个千川号人群会不会互相影响", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "同店铺 千川号 人群 互相影响"},
+        "retrieval": {"knowledge_exists": None, "origin_doc_list": [{"id": "d1", "title": "千川人群说明"}]},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": "会互相影响。"},
+    }
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
+    report = payload["human_report_markdown"]
+
+    assert "未提供 `host_agent.answer_claim` 中的 `expected_required/missing_expected` 断言" in report
+    assert "先用 probe-v1 提示词生成探针计划" in report
+    assert "run-probe-plan" in report
+
+
 def test_probe_and_orchestrate_select_rerank_drop(tmp_path: Path) -> None:
     with TraceServer(trace_payload()) as server:
         ingest_result = run_cli(
@@ -1039,6 +1178,150 @@ def test_host_answer_claims_drive_point_coverage() -> None:
     assert not any("Agent_Reply" in row["text"] for row in payload["oracle_status"]["point_coverage"])
 
 
+def test_orchestrate_uses_ingest_host_assertions_without_self_oracle() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    support_doc = {
+        "id": "d1",
+        "title": "新享投",
+        "content": "2、功能入口 当客户完成注册后，首次进入巨量千川后，即可在首页查看到新客试投功能。",
+    }
+    request = {
+        "case_input": {"query": "一元试投在哪里", "workspace_id": "55", "app_id": "100"},
+        "retrieval": {
+            "knowledge_exists": None,
+            "theoretical_recall_status": "ok",
+            "wide_recall_docs": [support_doc],
+            "origin_doc_list": [support_doc],
+        },
+        "rerank": {"rerank_docs": [support_doc], "prompt_docs": [support_doc]},
+        "qa": {"answer": "在首页。"},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "普通新客的一元试投/新客试投入口是在完成注册后首次进入巨量千川首页即可看到。",
+                    "role": "expected_required",
+                }
+            ]
+        },
+    }
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
+
+    assert payload["oracle_status"]["source"] == "host_assertions"
+    assert [point["text"] for point in payload["oracle_status"]["expected_knowledge_points"]] == [
+        "普通新客的一元试投/新客试投入口是在完成注册后首次进入巨量千川首页即可看到"
+    ]
+    row = payload["oracle_status"]["point_coverage"][0]
+    assert row["missing_stage"] == "covered"
+    assert row["prompt_docs"][0]["support_status"] == "full_support"
+
+
+def test_assertion_coverage_overrides_doc_id_only_rerank_drop() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    support_doc = {
+        "id": "support-doc",
+        "title": "新享投",
+        "content": "2、功能入口 当客户完成注册后，首次进入巨量千川后，即可在首页查看到新客试投功能。",
+    }
+    dropped_expected_doc = {
+        "id": "expected-doc",
+        "title": "新享投历史说明",
+        "content": "新享投是面向新客户的试投活动。",
+    }
+    request = {
+        "case_input": {
+            "query": "一元试投在哪里",
+            "workspace_id": "55",
+            "app_id": "100",
+            "expected_knowledge_ids": ["expected-doc"],
+        },
+        "preprocess": {"rewrite_query": "一元试投 入口"},
+        "retrieval": {
+            "knowledge_exists": True,
+            "theoretical_recall_status": "ok",
+            "online_retrieval_hit": True,
+            "expected_knowledge_hit": True,
+            "wide_recall_docs": [support_doc],
+            "origin_doc_list": [support_doc, dropped_expected_doc],
+        },
+        "rerank": {
+            "rerank_docs": [support_doc],
+            "prompt_docs": [support_doc],
+            "expected_doc_survived_rerank": False,
+        },
+        "qa": {"answer": "在首页。"},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "普通新客的一元试投/新客试投入口是在完成注册后首次进入巨量千川首页即可看到。",
+                    "role": "expected_required",
+                }
+            ]
+        },
+    }
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
+
+    row = payload["oracle_status"]["point_coverage"][0]
+    rerank = next(item for item in payload["evidence_chain"] if item["stage"] == "rerank")
+    context = next(item for item in payload["evidence_chain"] if item["stage"] == "context")
+    assert row["missing_stage"] == "covered"
+    assert rerank["status"] == "pass"
+    assert context["status"] == "pass"
+    assert payload["primary_cause"] is None
+
+
+def test_point_coverage_requires_answerable_support_span() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import build_probe_result, orchestrate_v3
+
+    request = {
+        "case_input": {
+            "query": "同店铺下两个千川户是否会互相影响",
+            "workspace_id": "55",
+            "app_id": "100",
+        },
+        "preprocess": {"rewrite_query": "同店铺 两个千川户 互相影响"},
+        "retrieval": {
+            "knowledge_exists": None,
+            "theoretical_recall_status": "ok",
+            "wide_recall_docs": [
+                {
+                    "id": "good",
+                    "title": "一个主体下开的不同的千川户相互影响不",
+                    "content": "如果两个千川户是在同一个店铺下，那么它们的评分会相互影响。",
+                }
+            ],
+            "origin_doc_list": [
+                {
+                    "id": "lexical",
+                    "title": "同店铺千川户互相影响说明",
+                    "content": "千川人群包支持从数据模块进入标签广场圈选人群包。",
+                }
+            ],
+        },
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": ""},
+        "host_agent": {
+            "answer_claim": [
+                {"text": "正确答案应说明同店铺下两个千川户是否会互相影响。", "role": "expected_required"}
+            ]
+        },
+    }
+    ingest = minimal_ingest(request)
+    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
+    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe], mode="final")
+
+    row = payload["oracle_status"]["point_coverage"][0]
+    assert row["missing_stage"] == "retrieval"
+    assert row["origin_docs"] == []
+    assert row["upper_bound_docs"][0]["id"] == "good"
+    assert row["upper_bound_docs"][0]["support_status"] == "full_support"
+    assert "两个千川户是在同一个店铺下" in row["upper_bound_docs"][0]["support_spans"][0]
+
+
 def test_answer_cause_requires_prompt_support_precondition() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import orchestrate_v3
@@ -1071,6 +1354,324 @@ def test_answer_cause_requires_prompt_support_precondition() -> None:
     answer = next(item for item in blocked["evidence_chain"] if item["stage"] == "answer")
     assert answer["status"] == "indeterminate"
     assert "candidate_cause" not in answer
+
+
+def _probe_plan_probe(stage_signals: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "v3",
+        "log_id": "log-x",
+        "workspace_id": "55",
+        "probe_name": "run-probe-plan",
+        "status": "ok",
+        "stage_signals": stage_signals,
+        "evidence_bundle": [],
+        "raw_artifacts": {},
+    }
+
+
+def _answer_ready_request(**qa_overrides: Any) -> dict[str, Any]:
+    request = {
+        "case_input": {"query": "q", "workspace_id": "55", "app_id": "100", "expected_knowledge_ids": ["d1"]},
+        "preprocess": {"rewrite_query": "q"},
+        "retrieval": {"knowledge_exists": True, "online_retrieval_hit": True, "expected_knowledge_hit": True},
+        "rerank": {
+            "rerank_docs": [{"id": "d1", "title": "doc", "content": "support"}],
+            "prompt_docs": [{"id": "d1", "title": "doc", "content": "support"}],
+            "expected_doc_survived_rerank": True,
+            "expected_doc_in_prompt": True,
+        },
+        "qa": {"answer": "bad", "prompt_supports_answer": True, "answer_satisfies_expected": False},
+        "host_agent": {"answer_claim": [{"text": "bad", "role": "unsupported_claim"}]},
+    }
+    request["qa"].update(qa_overrides)
+    return request
+
+
+def test_probe_plan_scope_violation_maps_answer_scope_violation() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = _answer_ready_request()
+    probe = _probe_plan_probe({"answer": {"scope_violation": True}})
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+
+    assert payload["primary_cause"]["stage"] == "answer"
+    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+
+
+def test_answer_span_scope_violation_miss_maps_answer_scope_violation() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3, run_probe_plan
+
+    request = _answer_ready_request()
+    request["case_input"]["query"] = "同店铺下的两个千川号人群会不会互相影响"
+    request["qa"]["answer"] = "会的。同店铺下的两个千川账户，其信用评分会相互影响。"
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-answer-object",
+                "direction": "scope_violation",
+                "role": "constraint_check",
+                "target_artifact": "answer_span",
+                "query": "答案必须直接回答同店铺下两个千川号的人群是否会互相影响",
+                "expected_hit_pattern": "人群",
+                "if_hit": "answer keeps the requested audience object",
+                "if_miss": "answer shifts from audience/persona to account score",
+            }
+        ],
+    }
+
+    ingest = minimal_ingest(request)
+    probe = run_probe_plan(ingest=ingest, plan=plan, no_cache=True)
+    payload = orchestrate_v3(ingest=ingest, probes=[probe], mode="final")
+
+    assert probe["content"]["probe_results"][0]["hit"] is False
+    assert probe["stage_signals"]["answer"]["scope_violation"] is True
+    assert payload["primary_cause"]["stage"] == "answer"
+    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+
+
+def test_probe_plan_internal_contradiction_maps_answer_branching_unclear() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = _answer_ready_request()
+    probe = _probe_plan_probe({"answer": {"branching_unclear": True}})
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+
+    assert payload["primary_cause"]["stage"] == "answer"
+    assert payload["primary_cause"]["cause_code"] == "answer_branching_unclear"
+
+
+def test_probe_plan_internal_contradiction_miss_maps_knowledge_inconsistency() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "q"},
+        "retrieval": {"knowledge_exists": None},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": "矛盾的答案"},
+        "host_agent": {"answer_claim": [{"text": "应说明唯一适用前提。", "role": "expected_required"}]},
+    }
+    probe = _probe_plan_probe({"knowledge": {"internal_inconsistency": True}})
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+
+    assert payload["primary_cause"]["stage"] == "knowledge"
+    assert payload["primary_cause"]["cause_code"] == "knowledge_internal_inconsistency"
+
+
+def test_probe_plan_citation_miss_maps_suspected_knowledge_missing() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    doc = {"id": "d1", "title": "铺底计划设置说明", "content": "铺底计划的设置入口在计划管理页，按步骤设置即可。"}
+    request = {
+        "case_input": {"query": "铺底计划怎么设置", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "铺底计划 设置 入口"},
+        "retrieval": {"knowledge_exists": None, "origin_doc_list": [doc]},
+        "rerank": {"rerank_docs": [doc], "prompt_docs": [doc]},
+        "qa": {"answer": "没有权威来源。"},
+        "host_agent": {"answer_claim": [{"text": "应说明铺底计划的设置入口。", "role": "expected_required"}]},
+    }
+    probe = _probe_plan_probe({"knowledge": {"lacks_authoritative_source": True}})
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+
+    assert payload["primary_cause"]["stage"] == "knowledge"
+    assert payload["primary_cause"]["cause_code"] == "suspected_knowledge_missing"
+
+
+def test_run_probe_plan_rejects_non_probe_v1_schema() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import V3Error, run_probe_plan
+
+    request = {"case_input": {"query": "q", "workspace_id": "55", "app_id": "100"}, "qa": {"answer": "a"}}
+    with pytest.raises(V3Error) as error:
+        run_probe_plan(ingest=minimal_ingest(request), plan={"schema_version": "v1", "probes": []})
+    assert error.value.error_code == "E_PROBE_PLAN_SCHEMA"
+
+
+def test_run_probe_plan_rejects_non_object_probe_item() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import V3Error, run_probe_plan
+
+    request = {"case_input": {"query": "q", "workspace_id": "55", "app_id": "100"}, "qa": {"answer": "a"}}
+    with pytest.raises(V3Error) as error:
+        run_probe_plan(ingest=minimal_ingest(request), plan={"schema_version": "probe-v1", "probes": [None]})
+    assert error.value.error_code == "E_PROBE_PLAN_INVALID"
+
+
+def test_run_probe_plan_requires_direction_and_target() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import V3Error, run_probe_plan
+
+    request = {"case_input": {"query": "q", "workspace_id": "55"}, "qa": {"answer": "a"}}
+    for probe in (
+        {"probe_id": "P-1", "target_artifact": "answer_span", "query": "a"},
+        {"probe_id": "P-2", "direction": "scope_violation", "query": "a"},
+    ):
+        with pytest.raises(V3Error) as error:
+            run_probe_plan(ingest=minimal_ingest(request), plan={"schema_version": "probe-v1", "probes": [probe]})
+        assert error.value.error_code == "E_PROBE_PLAN_INVALID"
+
+
+def test_run_probe_plan_answer_span_branching_signal() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import run_probe_plan
+
+    request = {
+        "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
+        "qa": {"answer": "可以在直播详情页追投，也可以在短视频页追投。"},
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-1",
+                "direction": "internal_contradiction",
+                "role": "consistency_check",
+                "target_artifact": "answer_span",
+                "query": "",
+                "expected_hit_pattern": "追投",
+                "if_hit": "answer mixes branches without clarifying premises",
+                "if_miss": "answer is consistent",
+            }
+        ],
+    }
+    result = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+
+    assert result["status"] == "ok"
+    assert result["probe_name"] == "run-probe-plan"
+    executed = result["content"]["probe_results"][0]
+    assert executed["hit"] is True
+    assert executed["target_artifact"] == "answer_span"
+    assert result["stage_signals"]["answer"]["branching_unclear"] is True
+
+
+def test_run_probe_plan_matched_docs_include_support_spans() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import run_probe_plan
+
+    request = {
+        "case_input": {"query": "同店铺下两个千川户是否会互相影响", "workspace_id": "55", "app_id": "100"},
+        "retrieval": {
+            "origin_doc_list": [
+                {
+                    "id": "lexical",
+                    "title": "同店铺千川户互相影响说明",
+                    "content": "千川人群包支持从数据模块进入标签广场圈选人群包。",
+                },
+                {
+                    "id": "good",
+                    "title": "一个主体下开的不同的千川户相互影响不",
+                    "content": "如果两个千川户是在同一个店铺下，那么它们的评分会相互影响。",
+                },
+            ]
+        },
+        "qa": {"answer": ""},
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-1",
+                "direction": "coverage_gap",
+                "role": "expected_required",
+                "target_artifact": "online_origin_recall",
+                "query": "同店铺下两个千川户是否会互相影响",
+                "expected_hit_pattern": "文档应直接回答同店铺下两个千川户是否会互相影响",
+                "if_hit": "knowledge exists",
+                "if_miss": "retrieval miss",
+            }
+        ],
+    }
+    result = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+    matched = result["content"]["probe_results"][0]["matched_docs"]
+
+    assert [item["id"] for item in matched] == ["good"]
+    assert matched[0]["support_status"] == "full_support"
+    assert matched[0]["support_spans"]
+    assert "评分会相互影响" in matched[0]["support_spans"][0]
+
+
+def test_run_probe_plan_does_not_treat_unavailable_wide_recall_as_miss() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import run_probe_plan
+
+    request = {
+        "case_input": {"query": "千川赔付规则是什么", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "千川赔付规则"},
+        "qa": {"answer": "可以在广告管理中心申请广告投放。"},
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-1",
+                "direction": "scope_violation",
+                "target_artifact": "kb_wide_recall",
+                "query": "千川 广告管理中心 赔付规则",
+                "expected_hit_pattern": "千川赔付规则",
+                "if_hit": "scope ok",
+                "if_miss": "scope violation",
+            }
+        ],
+    }
+    result = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+    executed = result["content"]["probe_results"][0]
+
+    assert result["content"]["theoretical_recall_status"] == "not_configured"
+    assert executed["executed"] is False
+    assert executed["hit"] is None
+    assert executed["skip_reason"] == "kb_wide_recall_unavailable"
+    assert "answer" not in result["stage_signals"]
+
+
+def test_run_probe_plan_cli_emits_stage_signals(tmp_path: Path) -> None:
+    request = {
+        "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
+        "qa": {"answer": "可以在直播详情页追投。"},
+    }
+    ingest = minimal_ingest(request)
+    ingest_path = tmp_path / "ingest.json"
+    ingest_path.write_text(json.dumps(ingest, ensure_ascii=False), encoding="utf-8")
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-1",
+                "direction": "internal_contradiction",
+                "target_artifact": "answer_span",
+                "query": "",
+                "expected_hit_pattern": "追投",
+                "if_hit": "x",
+                "if_miss": "y",
+            }
+        ],
+    }
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    result = run_cli(
+        "run-probe-plan",
+        "--ingest-file",
+        str(ingest_path),
+        "--plan",
+        f"@{plan_path}",
+        "--output-dir",
+        str(tmp_path / "out"),
+        cwd=SKILL_ROOT,
+        env={"HOME": str(tmp_path)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["probe_name"] == "run-probe-plan"
+    assert payload["stage_signals"]["answer"]["branching_unclear"] is True
+    assert (tmp_path / "out" / "run-probe-plan.json").exists()
+
 
 
 def test_judgement_signals_over_2kb_fails_before_trace_request(tmp_path: Path) -> None:

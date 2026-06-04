@@ -1,6 +1,6 @@
-# Fornax Trace v3
+# Fornax Trace 说明 v3
 
-`ingest-fornax-trace` calls the OpenPlat trace detail API directly:
+`ingest-fornax-trace` 会直接调用 OpenPlat trace detail API：
 
 ```http
 POST http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail
@@ -9,13 +9,13 @@ x-zs-plt-open: zs_open
 Authorization: Bearer <OPEN_PLAT_TRACE_TOKEN>
 ```
 
-Request body:
+请求体：
 
 ```json
 {"workspaceId": 89, "logId": "20260601191946A85794168A7D7BF20EB0", "limit": 1000}
 ```
 
-Response shape:
+响应结构：
 
 ```json
 {
@@ -30,15 +30,15 @@ Response shape:
 }
 ```
 
-The ingest command extracts:
+Ingest 命令会抽取：
 
-- root span `custom_tags.zhishang.app_id` when `--app-id` is missing
+- 当 `--app-id` 缺失时，从根 span 的 `custom_tags.zhishang.app_id` 获取 app_id fallback
 - `rewrite_query`
-- `origin_doc_list`, `origin_faq_list`
+- `origin_doc_list`、`origin_faq_list`
 - `rerank_docs`
 - `prompt_docs`
-- final answer
-- node order and workflow span input/output
-- trace token cost metadata when present
+- 最终 answer
+- 节点顺序和 workflow span 输入 / 输出
+- 可用时的 trace token cost metadata
 
-If trace lookup fails or lacks middle-node evidence, `ingest_summary.host_action_required` recommends `replay-workflow`. Replay is fallback evidence only.
+如果 trace 查询失败或缺少中间节点证据，`ingest_summary.host_action_required` 会建议 `replay-workflow`。Replay 只作为 fallback 证据。

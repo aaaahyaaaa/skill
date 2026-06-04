@@ -1,12 +1,12 @@
-# wide_recall
+# 宽召回（wide_recall）
 
-## Dev Probe
+## 开发探针
 
-When this skill is used, expose `SKILL_PROBE_USED:wide_recall:dev` with the captured `skill_input` and `skill_output` in the Case Execution Observer.
+使用本 skill 时，在 Case Execution Observer 中暴露 `SKILL_PROBE_USED:wide_recall:dev`，并记录捕获到的 `skill_input` 和 `skill_output`。
 
 ## 职责
 
-从 Fornax trace 的 Sirius recall http_client 子 span 抽取原始 request body，构建 open-label 诊断宽召回证据。
+从 Fornax trace 的 Sirius recall `http_client` 子 span 抽取原始 request body，构建 open-label 诊断宽召回证据。
 
 open-label 构造规则：
 

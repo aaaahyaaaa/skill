@@ -58,7 +58,17 @@ def _read_case_file(path: str | None) -> dict[str, Any]:
         return payload["case"]
     if isinstance(payload.get("case_input"), dict):
         case = dict(payload["case_input"])
-        for key in ("judgement_evidence", "unsupported_claims", "wrong_citations", "qa"):
+        for key in (
+            "judgement_evidence",
+            "host_agent",
+            "answer_claims",
+            "missing_expected_points",
+            "unsupported_claims",
+            "claim_alignments",
+            "expected_knowledge_points",
+            "wrong_citations",
+            "qa",
+        ):
             if key in payload:
                 case[key] = payload[key]
         return case

@@ -1,8 +1,8 @@
-# Evidence Spec
+# 证据规范
 
-Every `orchestrate` output contains `evidence_bundle` and `evidence_chain`.
+每个 `orchestrate` 输出都包含 `evidence_bundle` 和 `evidence_chain`。
 
-Evidence record fields:
+证据记录字段：
 
 - `evidence_id`
 - `evidence_type`
@@ -13,15 +13,15 @@ Evidence record fields:
 - `relation_to_answer`
 - `quality`
 
-Validation rules:
+校验规则：
 
-1. Every failed verdict with `candidate_cause` must bind at least one `evidence_id`.
-2. Every verdict `evidence_ids` entry must exist in `evidence_bundle`.
-3. Every `counterfactual.evidence_ids` entry must exist in `evidence_bundle`.
-4. Every verdict must include `counterfactual`.
-5. `candidate_cause` must be in the v3 enum.
+1. 每个带 `candidate_cause` 的失败 verdict 必须至少绑定一个 `evidence_id`。
+2. 每个 verdict 的 `evidence_ids` 都必须存在于 `evidence_bundle`。
+3. 每个 `counterfactual.evidence_ids` 都必须存在于 `evidence_bundle`。
+4. 每个 verdict 必须包含 `counterfactual`。
+5. `candidate_cause` 必须属于 v3 枚举。
 
-If validation fails, the CLI returns one of:
+校验失败时，CLI 返回以下错误之一：
 
 - `E_CAUSE_NOT_IN_ENUM`
 - `E_COUNTERFACTUAL_MISSING`

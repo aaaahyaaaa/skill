@@ -1,22 +1,22 @@
-# Wide Recall Notes v3
+# 宽召回说明 v3
 
-`probe-wide-recall` uses the real Sirius recall request found in the Fornax trace as its template. It calls `https://ad-sirius.bytedance.net/api/sirius_plugin/v1/recall` with original query + rewrite query, `topK >= 50`, and `upper_bound_scope=open_label`.
+`probe-wide-recall` 使用 Fornax trace 中真实的 Sirius recall 请求作为模板。它会用原 query 和 rewrite query 调用 `https://ad-sirius.bytedance.net/api/sirius_plugin/v1/recall`，并设置 `topK >= 50` 与 `upper_bound_scope=open_label`。
 
-Open-label means:
+`open_label` 表示：
 
-- keep the trace request's `recallStrategy`, `name`, `isPrivateDoc`, `contentMaxSize`, `params.workspaceId`, and `keyWordInfo`
-- set each recall request's `recallLabels=[]` and `level=[]`
-- set `maxCount=max(50, original maxCount)`
-- lower threshold-like params (`score`, `精选`, `内容中台`, `min_score`) to `0`
+- 保留 trace 请求中的 `recallStrategy`、`name`、`isPrivateDoc`、`contentMaxSize`、`params.workspaceId` 和 `keyWordInfo`
+- 将每个 recall 请求的 `recallLabels=[]`、`level=[]`
+- 设置 `maxCount=max(50, original maxCount)`
+- 将阈值类参数（`score`、`精选`、`内容中台`、`min_score`）降为 `0`
 
-The probe gets the workspace apiKey from `get-workspace-info?workspaceId=<id>` using `OPEN_PLAT_TRACE_TOKEN`/`OPEN_PLAT_BOOTSTRAP_TOKEN` as the bootstrap token. The apiKey is only used in memory and must not be written to reports or JSON.
+探针通过 `get-workspace-info?workspaceId=<id>` 获取 workspace apiKey，并使用 `OPEN_PLAT_TRACE_TOKEN` / `OPEN_PLAT_BOOTSTRAP_TOKEN` 作为 bootstrap token。apiKey 只在内存中使用，不能写入报告或 JSON。
 
-The probe output should be interpreted as:
+探针输出的解释方式：
 
-- expected knowledge point is not covered by open-label wide recall -> supports partial `suspected_knowledge_missing` for that point
-- expected knowledge point appears in open-label wide recall but not online origin recall -> supports `retrieval_miss`
-- expected knowledge point appears in online origin recall but not rerank -> supports `rerank_drop`
-- expected knowledge point appears in rerank but not prompt docs -> supports `context_assembly_error`
-- no expected doc and knowledge existence is unknown -> do not infer knowledge absence; require knowledge detail or human review
+- 期望知识点在 open-label 宽召回中仍无法覆盖：支持该知识点的局部 `suspected_knowledge_missing`
+- 期望知识点出现在 open-label 宽召回中，但不在线上 origin recall 中：支持 `retrieval_miss`
+- 期望知识点出现在 origin recall 中，但不在 rerank 中：支持 `rerank_drop`
+- 期望知识点出现在 rerank 中，但不在 prompt docs 中：支持 `context_assembly_error`
+- 没有 expected doc 且知识存在性未知：不要推断知识不存在；需要知识详情或人工复核
 
-Wide recall failure alone is never proof of KB absence. If the trace lacks a Sirius recall request template, the probe returns `not_configured`; workflow replay remains a separate fallback only when trace evidence is missing or trace lookup fails.
+宽召回失败本身不是知识库缺失的证明。如果 trace 缺少 Sirius recall 请求模板，探针返回 `not_configured`；workflow replay 仍是单独兜底，只在 trace 证据缺失或 trace 查询失败时使用。

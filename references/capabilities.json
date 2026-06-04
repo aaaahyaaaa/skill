@@ -90,6 +90,13 @@
       "outputs": ["stage_signals.retrieval", "evidence_bundle"]
     },
     {
+      "id": "run_probe_plan",
+      "command": "run-probe-plan",
+      "description": "Execute a host-Agent probe-v1 plan against requested evidence faces and emit deterministic hit/miss stage_signals.",
+      "inputs": ["ingest_file", "workspace_id", "log_id", "plan", "output_dir", "no_cache"],
+      "outputs": ["stage_signals", "content.probe_results", "evidence_bundle"]
+    },
+    {
       "id": "fetch_workflow_nodes",
       "command": "fetch-workflow-nodes",
       "description": "Fetch latest applications_wip.status=1 workflow nodes, edges, global_config, and input_schema.",

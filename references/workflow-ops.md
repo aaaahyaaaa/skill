@@ -1,15 +1,15 @@
-# Workflow Ops
+# Workflow 操作说明
 
-`fetch-workflow-nodes` reads the latest published workflow configuration from `applications_wip` where `status = 1`, ordered by newest `id`.
+`fetch-workflow-nodes` 读取 `applications_wip` 中 `status = 1` 的最新已发布 workflow 配置，按最新 `id` 排序。
 
-The command returns:
+命令返回：
 
 - `workflow.nodes`
 - `workflow.edges`
 - `workflow.global_config`
 - `workflow.input_schema`
-- `wip_id`, `version_id`, and status metadata
+- `wip_id`、`version_id` 和状态元数据
 
-Use this when trace spans need to be mapped to application-specific workflow nodes or when replay diverges from the historical trace.
+当 trace spans 需要映射到应用特定 workflow 节点，或 replay 与历史 trace 出现差异时，使用该命令。
 
-`replay-workflow` is a fallback only. If `ingest-fornax-trace` found middle-node evidence such as `Start`, `End`, `ZhiShangRAGRecall`, `ZhiShangRAGRerank`, or `ZhiShangRAGQA`, do not replay and do not overwrite trace evidence.
+`replay-workflow` 只是兜底手段。如果 `ingest-fornax-trace` 已找到 `Start`、`End`、`ZhiShangRAGRecall`、`ZhiShangRAGRerank`、`ZhiShangRAGQA` 等中间节点证据，不要 replay，也不要覆盖 trace 证据。

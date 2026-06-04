@@ -1,8 +1,8 @@
-# answer_faithfulness
+# 答案忠实性（answer_faithfulness）
 
-## Dev Probe
+## 开发探针
 
-When this skill is used, expose `SKILL_PROBE_USED:answer_faithfulness:dev` with the captured `skill_input` and `skill_output` in the Case Execution Observer.
+使用本 skill 时，在 Case Execution Observer 中暴露 `SKILL_PROBE_USED:answer_faithfulness:dev`，并记录捕获到的 `skill_input` 和 `skill_output`。
 
 ## 职责
 

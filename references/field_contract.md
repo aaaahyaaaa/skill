@@ -1,13 +1,13 @@
-# Field Contract v3
+# 字段契约 v3
 
-## Ingest Input
+## `ingest` 输入
 
-`ingest-fornax-trace` requires:
+`ingest-fornax-trace` 必填：
 
 - `workspace_id`
 - `log_id`
 
-Optional host fields can be provided through `--case-file`:
+可通过 `--case-file` 提供的宿主字段：
 
 - `query`
 - `judgement`
@@ -21,16 +21,21 @@ Optional host fields can be provided through `--case-file`:
 - `qa.prompt_supports_answer`
 - `qa.answer_satisfies_expected`
 
-`judgement_evidence.signals` must serialize to <= 2KB.
-`host_agent.answer_claim` is the only host assertion input. It must use nested JSON shape `{"host_agent": {"answer_claim": [...]}}`. Each item should contain host Agent supplied assertions with `text`, `role`, optional `source`, and optional `confidence`. Valid roles are `expected_required`, `missing_expected`, `answer_claim`, and `unsupported_claim`; the CLI normalizes `source` to `host_agent.answer_claim`.
-Only `expected_required` and `missing_expected` drive knowledge, retrieval, rerank, and context attribution. `unsupported_claim` is answer-stage evidence only.
-Evaluator dimensions, pass/fail labels, empty-answer diagnostics, query text, and unstructured rubric/judgement fragments are observations and must not become expected assertions.
-Do not put assertions into `case_input.expected_knowledge_points`, `qa.answer_claims`, `qa.missing_expected_points`, `qa.unsupported_claims`, `qa.claim_alignments`, or `judgement_evidence.signals[].assertions/fact_points/missing_expected_points`. Non-empty legacy assertion fields fail with `E_LEGACY_ASSERTION_INPUT`.
-When no required assertion is available, output `oracle_status.source=insufficient_assertions` and ask the host Agent to supply assertions before judging upstream stages.
+`judgement_evidence.signals` 序列化后必须小于等于 2KB。
 
-## Ingest Output
+`host_agent.answer_claim` 是唯一的宿主断言输入，必须使用嵌套 JSON 结构 `{"host_agent": {"answer_claim": [...]}}`。每项应包含宿主 Agent 给出的断言：`text`、`role`，可选 `source` 与 `confidence`。合法 role 包括 `expected_required`、`missing_expected`、`answer_claim`、`unsupported_claim`、`constraint_check`、`citation_check`、`consistency_check`；CLI 会把 `source` 归一化为 `host_agent.answer_claim`。
 
-Required top-level fields:
+只有 `expected_required` 和 `missing_expected` 驱动 knowledge、retrieval、rerank、context 归因。`unsupported_claim` 只作为 answer 阶段证据。`constraint_check`、`citation_check`、`consistency_check` 用于 `probe-v1` 计划和答案/知识观察，不直接作为必要事实断点。
+
+评估器维度、通过/失败标签、空回复诊断、query 文本、非结构化 rubric / judgement 片段都只是观察项，不得变成期望断言。
+
+不要把断言放入 `case_input.expected_knowledge_points`、`qa.answer_claims`、`qa.missing_expected_points`、`qa.unsupported_claims`、`qa.claim_alignments` 或 `judgement_evidence.signals[].assertions/fact_points/missing_expected_points`。旧断言字段非空会报 `E_LEGACY_ASSERTION_INPUT`。
+
+没有必要断言时，输出 `oracle_status.source=insufficient_assertions`，并要求宿主 Agent 补充断言后再判断上游阶段。
+
+## `ingest` 输出
+
+必需顶层字段：
 
 - `schema_version`
 - `log_id`
@@ -40,11 +45,11 @@ Required top-level fields:
 - `ingest_summary`
 - `raw_artifacts`
 
-`ingest_summary` includes `trace_completeness`, `suggested_probe_set`, `skip_reason`, and `host_action_required`.
+`ingest_summary` 包含 `trace_completeness`、`suggested_probe_set`、`skip_reason` 和 `host_action_required`。
 
-## Orchestrate Output
+## `orchestrate` 输出
 
-Required top-level fields:
+必需顶层字段：
 
 - `schema_version`
 - `log_id`
@@ -60,4 +65,4 @@ Required top-level fields:
 - `deprecations`
 - `raw_artifacts`
 
-`primary_cause` is either an object with `stage`, `cause_code`, `confidence`, `owner`, and `selection_rationale`, or `null` when attribution is blocked.
+`primary_cause` 要么是包含 `stage`、`cause_code`、`confidence`、`owner`、`selection_rationale` 的对象，要么在归因被阻塞时为 `null`。

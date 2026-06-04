@@ -1,4 +1,4 @@
-# FindReason Skill Specs
+# FindReason Skill 规格
 
 这个目录保存给宿主 Agent 和人阅读的简洁说明。可执行规则源头是 `backend/app/diagnostics.py` 里的 typed diagnostic registry。
 

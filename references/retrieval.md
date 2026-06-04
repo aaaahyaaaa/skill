@@ -1,17 +1,17 @@
-# Retrieval Notes v3
+# 召回说明 v3
 
-Retrieval-stage causes are:
+Retrieval 阶段的原因包括：
 
 - `retrieval_miss`
 - `permission_miss`
 
-Do not use retrieval causes when knowledge existence is `no` or `unknown`. In those cases, retrieval must set `upstream_blocked_by=knowledge` or remain indeterminate until `probe-knowledge-detail` resolves the tri-state.
+当知识存在性为 `no` 或 `unknown` 时，不要使用 retrieval 类原因。此时 retrieval 必须设置 `upstream_blocked_by=knowledge`，或在 `probe-knowledge-detail` 解析三态前保持不确定。
 
-Useful evidence:
+可用证据：
 
 - `origin_doc_list`
 - `origin_faq_list`
 - `expected_knowledge_hit`
 - `online_retrieval_hit`
-- `probe-wide-recall` matches
-- ACL/namespace signals from `probe-permission-check`
+- `probe-wide-recall` 命中结果
+- 来自 `probe-permission-check` 的 ACL / namespace 信号

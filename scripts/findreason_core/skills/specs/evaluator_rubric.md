@@ -1,8 +1,8 @@
-# evaluator_rubric
+# 评估器 Rubric（evaluator_rubric）
 
-## Dev Probe
+## 开发探针
 
-When this skill is used, expose `SKILL_PROBE_USED:evaluator_rubric:dev` with the captured `skill_input` and `skill_output` in the Case Execution Observer.
+使用本 skill 时，在 Case Execution Observer 中暴露 `SKILL_PROBE_USED:evaluator_rubric:dev`，并记录捕获到的 `skill_input` 和 `skill_output`。
 
 ## 职责
 
