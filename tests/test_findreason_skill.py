@@ -315,8 +315,38 @@ def test_schema_exposes_v3_and_old_commands_are_absent(tmp_path: Path) -> None:
     assert "probe-self-oracle" in payload["commands"]["probes"]
     assert "probe-rerank-bypass" in payload["commands"]["probes"]
     combined = result.stdout + run_module("--help", cwd=SKILL_ROOT, env={"HOME": str(tmp_path)}).stdout
-    for old in ("adapt-input", "fetch-fornax-trace", "rerank-experiment", "summarize-batch", "show-run", "env-info", "--use-llm", "MODELHUB"):
+    for old in (
+        "adapt-input",
+        "fetch-fornax-trace",
+        "rerank-experiment",
+        "summarize-batch",
+        "show-run",
+        "env-info",
+        "probe-by-judgement",
+        "probe-by-claim",
+        "probe-by-doc-title",
+        "probe-rerank-tune",
+        "--use-llm",
+        "MODELHUB",
+    ):
         assert old not in combined
+
+
+def test_output_schema_accepts_current_oracle_status_sources() -> None:
+    schema = json.loads((SKILL_ROOT / "references" / "output-schema.json").read_text(encoding="utf-8"))
+    source_enum = schema["properties"]["oracle_status"]["properties"]["source"]["enum"]
+
+    assert "insufficient_assertions" in source_enum
+    assert "host_assertions" in source_enum
+
+
+def test_capabilities_exclude_removed_weak_semantic_probes() -> None:
+    manifest = json.loads((SKILL_ROOT / "references" / "capabilities.json").read_text(encoding="utf-8"))
+    capabilities = {item["command"]: item for item in manifest["capabilities"]}
+
+    assert "topk" in capabilities["probe-wide-recall"]["inputs"]
+    for command in ("probe-by-judgement", "probe-by-claim", "probe-by-doc-title", "probe-rerank-tune"):
+        assert command not in capabilities
 
 
 def test_ingest_fetches_openplat_trace_and_emits_v3_summary(tmp_path: Path) -> None:
@@ -372,6 +402,8 @@ def test_ingest_without_host_assertions_requests_probe_plan(tmp_path: Path) -> N
     actions = [item["action"] for item in payload["ingest_summary"]["host_action_required"]]
     assert "generate-probe-plan" in actions
     assert "run-probe-plan" in suggested
+    for weak_probe in ("probe-by-judgement", "probe-by-claim", "probe-by-doc-title", "probe-rerank-tune"):
+        assert weak_probe not in suggested
 
 
 def test_cli_ingest_preserves_host_agent_answer_claim(tmp_path: Path) -> None:
@@ -385,6 +417,8 @@ def test_cli_ingest_preserves_host_agent_answer_claim(tmp_path: Path) -> None:
                         {
                             "text": "正确答案应说明云图是指标分析的数据产品。",
                             "role": "expected_required",
+                            "basis": ["trace_query", "evaluator_reason"],
+                            "why_required": "用户询问云图是什么。",
                             "confidence": 0.9,
                         }
                     ]
@@ -417,6 +451,8 @@ def test_cli_ingest_preserves_host_agent_answer_claim(tmp_path: Path) -> None:
             "text": "正确答案应说明云图是指标分析的数据产品",
             "role": "expected_required",
             "source": "host_agent.answer_claim",
+            "basis": ["trace_query", "evaluator_reason"],
+            "why_required": "用户询问云图是什么",
             "confidence": 0.9,
         }
     ]
@@ -484,12 +520,12 @@ def test_report_explains_empty_assertion_matrix_needs_probe_plan() -> None:
     payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
     report = payload["human_report_markdown"]
 
-    assert "未提供 `host_agent.answer_claim` 中的 `expected_required/missing_expected` 断言" in report
-    assert "先用 probe-v1 提示词生成探针计划" in report
+    assert "未提供 `host_agent.answer_claim` assertion set 中的 `expected_required` 断言" in report
+    assert "先用 Agent attribution planning 生成 assertion set 和 probe-v1 计划" in report
     assert "run-probe-plan" in report
 
 
-def test_probe_and_orchestrate_select_rerank_drop(tmp_path: Path) -> None:
+def test_probe_rerank_bypass_is_auxiliary_without_assertion_gap(tmp_path: Path) -> None:
     with TraceServer(trace_payload()) as server:
         ingest_result = run_cli(
             "ingest-fornax-trace",
@@ -529,20 +565,20 @@ def test_probe_and_orchestrate_select_rerank_drop(tmp_path: Path) -> None:
     )
     assert orchestrate_result.returncode == 0, orchestrate_result.stderr
     payload = json.loads(orchestrate_result.stdout)
-    assert payload["primary_cause"]["stage"] == "rerank"
-    assert payload["primary_cause"]["cause_code"] == "rerank_drop"
+    assert payload["primary_cause"] is None
     assert payload["app_id"] == "100"
     report = payload["human_report_markdown"]
-    assert "# FindReason 单 Case 归因摘要" in report
-    assert "## 3. 原始 Workflow 输入输出" in report
-    assert "## 5. 归因链路" in report
-    assert "## 7. 修改建议" in report
-    assert "log_id：`log-1`" in report
-    assert "app_id：`100`" in report
-    assert "主因枚举：`rerank_drop`" in report
+    assert "# FindReason 归因报告" in report
+    assert "## 阶段裁决" in report
+    assert "### 原始 Workflow 输入输出" in report
+    assert "- Workflow 输出：" not in report
     assert '"query": "云图是什么"' in report
     assert '"end": "云图是天气图片。"' in report
-    assert "retrieved_but_reranked_out" in payload["failure_patterns"]
+    assert "log_id：`log-1`" in report
+    assert "app_id：`100`" in report
+    assert "主因枚举：`null`" in report
+    assert "doc-id-only evidence does not prove the required assertion was lost" in json.dumps(payload["evidence_chain"], ensure_ascii=False)
+    assert "retrieved_but_reranked_out" not in payload["failure_patterns"]
     evidence_ids = {item["evidence_id"] for item in payload["evidence_bundle"]}
     assert evidence_ids
     for verdict in payload["evidence_chain"]:
@@ -683,7 +719,7 @@ def test_host_agent_answer_claim_generates_all_assertion_roles() -> None:
         "host_agent": {
             "answer_claim": [
                 {"text": "应说明短视频追投入口。", "role": "missing_expected"},
-                {"text": "答案称可在直播计划详情页追投。", "role": "answer_claim"},
+                {"text": "直播计划详情页可以追投。", "role": "answer_claim"},
                 {"text": "直播计划详情页可以追投短视频。", "role": "unsupported_claim"},
                 {"text": "全域随心推点击率应使用正确维度。", "role": "expected_required"},
             ],
@@ -693,10 +729,58 @@ def test_host_agent_answer_claim_generates_all_assertion_roles() -> None:
     points = v3._expected_knowledge_points(request)
     by_text = {item["text"]: item for item in points}
     assert all(item["source"] == "host_agent.answer_claim" for item in points)
-    assert by_text["应说明短视频追投入口"]["role"] == "missing_expected"
+    assert by_text["应说明短视频追投入口"]["role"] == "expected_required"
     assert by_text["直播计划详情页可以追投短视频"]["role"] == "unsupported_claim"
-    assert by_text["答案称可在直播计划详情页追投"]["role"] == "answer_claim"
+    assert by_text["直播计划详情页可以追投"]["role"] == "answer_claim"
     assert by_text["全域随心推点击率应使用正确维度"]["role"] == "expected_required"
+
+
+def test_oracle_claim_signal_uses_only_required_assertions() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+
+    request = {
+        "case_input": {"query": "同店铺下两个千川号人群会不会互相影响", "workspace_id": "55", "app_id": "100"},
+        "host_agent": {
+            "answer_claim": [
+                {"text": "正确输出应回答两个千川号的人群模型是否互相影响。", "role": "expected_required"},
+                {"text": "同店铺下的不同千川号信用评分会相互影响。", "role": "answer_claim"},
+                {"text": "用户问题限定在人群模型，不应只回答信用评分。", "role": "constraint_check"},
+            ]
+        },
+    }
+
+    signal = v3._oracle_signal_text(request, "claim_back_recall")
+
+    assert "人群模型是否互相影响" in signal
+    assert "信用评分" not in signal
+    assert "不应只回答" not in signal
+
+
+def test_probe_cache_key_changes_when_host_assertions_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import build_probe_result
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    base = {
+        "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
+        "retrieval": {"origin_doc_list": [{"id": "d1", "title": "云图定义", "content": "云图是指标分析数据产品。"}]},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": ""},
+    }
+    first = json.loads(json.dumps(base))
+    first["host_agent"] = {"answer_claim": [{"text": "正确答案应说明云图是指标分析数据产品。", "role": "expected_required"}]}
+    second = json.loads(json.dumps(base))
+    second["host_agent"] = {"answer_claim": [{"text": "正确答案应说明铺底计划设置入口。", "role": "expected_required"}]}
+
+    first_probe = build_probe_result("probe-self-oracle", ingest=minimal_ingest(first))
+    second_probe = build_probe_result("probe-self-oracle", ingest=minimal_ingest(second))
+
+    assert first_probe["telemetry"]["cache_hit"] is False
+    assert second_probe["telemetry"]["cache_hit"] is False
+    assert first_probe["telemetry"]["cache_key"] != second_probe["telemetry"]["cache_key"]
+    assert first_probe["oracle_status"]["expected_knowledge_points"][0]["text"] == "正确答案应说明云图是指标分析数据产品"
+    assert second_probe["oracle_status"]["expected_knowledge_points"][0]["text"] == "正确答案应说明铺底计划设置入口"
 
 
 def test_empty_legacy_assertion_fields_do_not_block() -> None:
@@ -806,6 +890,7 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
     report = payload["human_report_markdown"]
     assert "理论召回范围：`open_label`" in report
     assert "断言覆盖矩阵" in report
+    assert "这些观察项只用于 answer grounding / scope / citation / consistency 检查" in report
     assert "角色" in report
     assert "线上召回缺失" in report
     assert payload["primary_cause"]["cause_code"] == "retrieval_miss"
@@ -931,8 +1016,9 @@ def test_self_oracle_enables_upstream_rerank_drop_without_expected_ids() -> None
     assert payload["primary_cause"]["cause_code"] == "rerank_drop"
     assert payload["primary_cause"]["confidence"] < 0.86
     report = payload["human_report_markdown"]
-    assert "初召回已命中、但重排丢失的期望知识 ID / 文档" in report
-    assert "`d1` 云图定义" in report
+    assert "重排断点" in report
+    assert "云图应被解释为用于指标分析的数据产品" in report
+    assert "命中 `d1` 云图定义" in report
 
 
 def test_self_oracle_point_gap_selects_knowledge_missing() -> None:
@@ -1430,6 +1516,168 @@ def test_answer_span_scope_violation_miss_maps_answer_scope_violation() -> None:
     assert probe["stage_signals"]["answer"]["scope_violation"] is True
     assert payload["primary_cause"]["stage"] == "answer"
     assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+
+
+def test_answer_span_scope_violation_hit_supports_spaced_terms() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import run_probe_plan
+
+    request = {
+        "case_input": {"query": "同店铺下的两个千川号人群会不会互相影响", "workspace_id": "55", "app_id": "100"},
+        "qa": {"answer": "会的。同店铺下的不同千川号，它们的信用评分是会相互影响的。"},
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-scope-shift",
+                "direction": "scope_violation",
+                "role": "constraint_check",
+                "target_artifact": "answer_span",
+                "query": "信用评分 店铺综合评分 投放消耗",
+                "expected_hit_pattern": "信用评分 综合评分 投放消耗",
+                "if_hit": "答案包含信用评分解释，存在对象偏移风险。",
+                "if_miss": "答案未出现信用评分对象偏移。",
+            }
+        ],
+    }
+
+    probe = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+
+    result = probe["content"]["probe_results"][0]
+    assert result["hit"] is True
+    assert "信用评分" in result["matched_terms"]
+    assert probe["stage_signals"]["answer"]["scope_violation"] is True
+
+
+def test_required_assertions_covered_can_satisfy_answer_precondition() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    doc = {"id": "d1", "title": "人群模型说明", "content": "同店铺下两个千川号的人群模型不会互相继承，需要分别学习。"}
+    request = {
+        "case_input": {"query": "同店铺下两个千川号人群会不会互相影响", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "同店铺 千川号 人群模型 影响"},
+        "retrieval": {"knowledge_exists": True, "theoretical_recall_status": "ok", "wide_recall_docs": [doc], "origin_doc_list": [doc]},
+        "rerank": {"rerank_docs": [doc], "prompt_docs": [doc]},
+        "qa": {"answer": "会的，信用评分会互相影响。", "answer_satisfies_expected": False},
+        "host_agent": {
+            "answer_claim": [
+                {"text": "正确答案应回答同店铺下两个千川号的人群模型是否会互相影响。", "role": "expected_required"},
+                {"text": "用户问题限定在人群模型，不应只回答信用评分。", "role": "constraint_check"},
+            ]
+        },
+    }
+    probe = _probe_plan_probe({"answer": {"scope_violation": True}})
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+
+    assert payload["oracle_status"]["point_coverage"][0]["missing_stage"] == "covered"
+    assert payload["primary_cause"]["stage"] == "answer"
+    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+
+
+def test_trace_incomplete_pattern_requires_blocking_stage() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    doc = {"id": "d1", "title": "人群模型说明", "content": "同店铺下两个千川号的人群模型不会互相继承，需要分别学习。"}
+    request = {
+        "case_input": {"query": "同店铺下两个千川号人群会不会互相影响", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "同店铺 千川号 人群模型 影响"},
+        "retrieval": {"knowledge_exists": True, "theoretical_recall_status": "ok", "wide_recall_docs": [doc], "origin_doc_list": [doc]},
+        "rerank": {"rerank_docs": [doc], "prompt_docs": [doc]},
+        "qa": {"answer": "会的，信用评分会互相影响。", "answer_satisfies_expected": False},
+        "host_agent": {
+            "answer_claim": [
+                {"text": "正确答案应回答同店铺下两个千川号的人群模型是否会互相影响。", "role": "expected_required"},
+                {"text": "用户问题限定在人群模型，不应只回答信用评分。", "role": "constraint_check"},
+            ]
+        },
+    }
+    ingest = minimal_ingest(request)
+    ingest["ingest_summary"]["trace_completeness"]["knowledge"] = "missing_evidence"
+    probe = _probe_plan_probe({"answer": {"scope_violation": True}})
+    payload = orchestrate_v3(ingest=ingest, probes=[probe], mode="final")
+
+    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+    assert "trace_incomplete_blocking_attribution" not in payload["failure_patterns"]
+    assert payload["needs_human_review"] is False
+
+
+def test_probe_plan_coverage_gap_can_drive_rerank_stage() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3, run_probe_plan
+
+    doc = {"id": "d1", "title": "云图定义", "content": "云图是用于指标分析的数据产品。"}
+    request = {
+        "case_input": {"query": "云图是什么", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "云图是什么"},
+        "retrieval": {"knowledge_exists": None, "origin_doc_list": [doc], "origin_faq_list": []},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": "云图是天气图片。"},
+        "host_agent": {
+            "answer_claim": [{"text": "正确答案应说明云图是用于指标分析的数据产品。", "role": "expected_required"}]
+        },
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-origin",
+                "direction": "coverage_gap",
+                "role": "expected_required",
+                "target_artifact": "online_origin_recall",
+                "query": "云图是用于指标分析的数据产品",
+                "expected_hit_pattern": "指标分析 数据产品",
+                "if_hit": "origin supports required assertion",
+                "if_miss": "origin misses required assertion",
+            },
+            {
+                "probe_id": "P-rerank",
+                "direction": "coverage_gap",
+                "role": "expected_required",
+                "target_artifact": "rerank_output",
+                "query": "云图是用于指标分析的数据产品",
+                "expected_hit_pattern": "指标分析 数据产品",
+                "if_hit": "rerank keeps required assertion",
+                "if_miss": "rerank drops required assertion",
+            },
+        ],
+    }
+
+    ingest = minimal_ingest(request)
+    probe = run_probe_plan(ingest=ingest, plan=plan, no_cache=True)
+    payload = orchestrate_v3(ingest=ingest, probes=[probe], mode="final")
+
+    assert probe["stage_signals"]["rerank"]["missing_expected_points_from_rerank"] == [
+        "云图是用于指标分析的数据产品"
+    ]
+    assert payload["primary_cause"]["stage"] == "rerank"
+    assert payload["primary_cause"]["cause_code"] == "rerank_drop"
+
+
+def test_doc_id_only_rerank_bypass_does_not_select_primary_without_assertion_gap() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import build_probe_result, orchestrate_v3
+
+    request = {
+        "case_input": {"query": "云图是什么", "workspace_id": "55", "app_id": "100", "expected_knowledge_ids": ["d1"]},
+        "preprocess": {"rewrite_query": "云图是什么"},
+        "retrieval": {
+            "knowledge_exists": True,
+            "origin_doc_list": [{"id": "d1", "title": "云图定义", "content": "云图是用于指标分析的数据产品。"}],
+        },
+        "rerank": {"rerank_docs": [], "prompt_docs": [], "expected_doc_survived_rerank": False},
+        "qa": {"answer": "云图是天气图片。"},
+    }
+    ingest = minimal_ingest(request)
+    probe = build_probe_result("probe-rerank-bypass", ingest=ingest, no_cache=True)
+    payload = orchestrate_v3(ingest=ingest, probes=[probe], mode="final")
+
+    rerank = next(item for item in payload["evidence_chain"] if item["stage"] == "rerank")
+    assert rerank["status"] == "indeterminate"
+    assert "candidate_cause" not in rerank
+    assert payload["primary_cause"] is None
 
 
 def test_probe_plan_internal_contradiction_maps_answer_branching_unclear() -> None:

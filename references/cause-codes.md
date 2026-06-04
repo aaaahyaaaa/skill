@@ -12,9 +12,9 @@
 | knowledge | `knowledge_internal_inconsistency` | kb_owner | KB 中存在冲突说法，且没有清晰的适用前提（probe `internal_contradiction` 未命中能消歧的 KB 来源）。 |
 | retrieval | `retrieval_miss` | retrieval_strategy_owner | 知识存在，但线上召回漏掉期望文档。 |
 | retrieval | `permission_miss` | knowledge_permission_owner | 正确知识存在，但线上被 ACL / namespace 隐藏。 |
-| rerank | `rerank_drop` | rerank_strategy_owner | 召回已命中，但期望文档没有通过 rerank。 |
+| rerank | `rerank_drop` | rerank_strategy_owner | 必要断言在 online origin recall 中有可回答支撑，但 rerank output 不再有同一断言的支撑。doc ID 没通过 rerank 只能作观察，不能单独触发。 |
 | rerank | `rerank_tunable` | rerank_strategy_owner | 参数或 tunable 证据显示 rerank 可恢复目标文档。 |
-| context | `context_assembly_error` | workflow_or_prompt_context_owner | 期望文档通过 rerank 但未进入 prompt context，或 context 被截断 / 噪声污染。 |
+| context | `context_assembly_error` | workflow_or_prompt_context_owner | 必要断言已通过 rerank 但未进入 prompt context，或存在明确截断 / 噪声污染证据。doc ID 没进入 prompt 只能作观察，不能单独触发。 |
 | answer | `unsupported_claim` | prompt_or_model_owner | `prompt_supports_answer=true`、`answer_satisfies_expected=false`，且存在 unsupported claims。 |
 | answer | `wrong_citation` | prompt_or_model_owner | 在答案阶段前置条件满足时，答案引用了错误文档。 |
 | answer | `partial_answer` | prompt_or_model_owner | Prompt 支持完整答案，但输出遗漏必要方面。 |
@@ -32,7 +32,7 @@ Evaluation 在 v3 中只作为观察层，没有官方 cause code。
 | direction | target_artifact | hit / miss 结果 |
 |-|-|-|
 | `relevance_gap` | kb_wide_recall | 进入确定性的 `point_coverage` 链路（knowledge / retrieval / rerank / context）。 |
-| `coverage_gap` | kb_wide_recall / online_origin_recall | 进入确定性的 `point_coverage` 链路。 |
+| `coverage_gap` | kb_wide_recall / online_origin_recall / rerank_output / prompt_context | 进入确定性的断言级覆盖链路；只有 required assertion 的 hit/miss 可驱动 knowledge / retrieval / rerank / context。 |
 | `scope_violation` | kb_wide_recall | miss → `answer_scope_violation`。 |
 | `citation_missing` | online_origin_recall / rerank_output | hit → `wrong_citation`；miss → `suspected_knowledge_missing`（缺少权威来源）。 |
 | `internal_contradiction` | answer_span / kb_wide_recall | hit → `answer_branching_unclear`；miss → `knowledge_internal_inconsistency`。 |

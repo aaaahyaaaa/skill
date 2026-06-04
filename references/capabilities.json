@@ -1,6 +1,6 @@
 {
   "name": "findreason-rag-attribution",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "schema_version": "v3",
   "runtime": "python",
   "entrypoint": "python -m findreason",
@@ -17,7 +17,7 @@
       "command": "orchestrate",
       "description": "Merge v3 ingest and probe evidence, validate evidence bindings, and select primary_cause with counterfactual rules.",
       "inputs": ["ingest_file", "workspace_id", "log_id", "probe_dir", "mode", "schema_version", "only_stages", "output_dir"],
-      "outputs": ["oracle_status", "case_assessment", "primary_cause", "evidence_chain", "evidence_bundle", "failure_patterns", "next_actions", "short_summary.json"]
+      "outputs": ["oracle_status", "case_assessment", "primary_cause", "evidence_chain", "evidence_bundle", "failure_patterns", "next_actions", "short_summary.json", "case_report.md"]
     },
     {
       "id": "probe_self_oracle",
@@ -44,21 +44,14 @@
       "id": "probe_wide_recall",
       "command": "probe-wide-recall",
       "description": "Use broad recall evidence to distinguish retrieval_miss from upstream knowledge issues.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "output_dir", "no_cache"],
+      "inputs": ["ingest_file", "workspace_id", "log_id", "topk", "output_dir", "no_cache"],
       "outputs": ["stage_signals.retrieval", "evidence_bundle"]
     },
     {
       "id": "probe_rerank_bypass",
       "command": "probe-rerank-bypass",
-      "description": "Compare recall docs vs rerank docs to detect rerank_drop.",
+      "description": "Compare recall docs vs rerank docs as an auxiliary doc-id observation; rerank_drop still requires assertion-level support loss.",
       "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.rerank", "evidence_bundle"]
-    },
-    {
-      "id": "probe_rerank_tune",
-      "command": "probe-rerank-tune",
-      "description": "Emit rerank_tunable evidence from parameter/tunable trace signals.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "param_grid", "rerank_tunable", "output_dir", "no_cache"],
       "outputs": ["stage_signals.rerank", "evidence_bundle"]
     },
     {
@@ -67,27 +60,6 @@
       "description": "Compare rerank docs vs prompt docs to detect context_assembly_error.",
       "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
       "outputs": ["stage_signals.context", "evidence_bundle"]
-    },
-    {
-      "id": "probe_by_judgement",
-      "command": "probe-by-judgement",
-      "description": "Record host-supplied judgement signals as retrieval-stage probe evidence.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "judgement", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.retrieval", "evidence_bundle"]
-    },
-    {
-      "id": "probe_by_claim",
-      "command": "probe-by-claim",
-      "description": "Record host-extracted unsupported claims/wrong citation signals for answer-stage attribution.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "claims", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.answer", "evidence_bundle"]
-    },
-    {
-      "id": "probe_by_doc_title",
-      "command": "probe-by-doc-title",
-      "description": "Match expected doc titles/ids against trace docs.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "titles", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.retrieval", "evidence_bundle"]
     },
     {
       "id": "run_probe_plan",

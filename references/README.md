@@ -1,17 +1,42 @@
-# FindReason Skill 规范说明
+# FindReason References
 
-这个目录保存给宿主 Agent 和人阅读的简洁说明。可执行规则的来源是 `diagnostics.py` 中的 typed diagnostic registry；这里的 Markdown 只负责解释和约束口径。
+这个目录保存 FindReason v3 的宿主 Agent playbook、CLI 契约和证据裁决说明。当前主线是：
 
-## 输出契约
+```text
+trace hydration
+  -> evaluator compression
+  -> Agent attribution planning
+  -> CLI/probe evidence execution
+  -> orchestrate
+```
 
-- 工具型步骤产出 `evidence_chain`：输入适配、pipeline replay、Sirius open-label wide recall、knowledge detail、reference evidence。
-- 诊断型步骤产出 `diagnostic_results`：每个结果绑定 `spec_id`、`matched_rule_id`、`candidate_cause`、证据要求和实际 evidence。
-- 仲裁步骤产出 `arbitration`：`immediate_failure`、`primary_cause`、`causal_path`、置信度和下一步动作。
-- 原始 badcase 复现优先使用 OpenPlat trace detail 导出的 trace，再用 `ingest-fornax-trace` 转为标准 `AttributionRequest`；有中间节点证据时不执行 workflow replay，避免当前 workflow 版本漂移。
-- `host_agent.answer_claim` 是宿主 Agent 唯一的断言输入，使用 `{"host_agent": {"answer_claim": [...]}}` 嵌套结构，包含 `text/role/source/confidence`；`source` 会统一归一化为 `host_agent.answer_claim`。禁止由 query、评价标签、空回复诊断或 rubric 长句碎片兜底生成断言，也不要把断言放入 `case_input.expected_knowledge_points`、`qa.answer_claims`、`qa.missing_expected_points` 或 `judgement_evidence.signals[].assertions`；旧字段非空会报 `E_LEGACY_ASSERTION_INPUT`。
-- `probe-wide-recall` 使用 trace 中真实 Sirius recall 请求作为模板，清空标签/层级并以 topK >= 50 执行原 query + 改写 query，用于判断必要断言在知识库上界、线上初召回、重排和 Prompt 之间的断点。
+## 核心口径
 
-## 必须遵守
+- Trace artifacts 是 workflow 现场的权威来源。外部 `query` / `answer` 只作为 hint。
+- 评估器输出只压缩为 `judgement_evidence.signals`，用于说明“怀疑哪里坏了”；它不直接决定 `primary_cause`。
+- `host_agent.answer_claim` 是向后兼容字段，语义上表示宿主 Agent 产出的 assertion set。
+- 主设计只使用 `expected_required` 和 `answer_claim` 两个核心 role。`missing_expected` 仅作为 legacy 输入映射到 `expected_required`。
+- `expected_required` 驱动 knowledge / retrieval / rerank / context 覆盖链路；`answer_claim` 用于 output grounding、scope、citation 和 consistency 检查。
+- `probe-v1` plan 是实验计划，不是证据。只有 `run-probe-plan` 执行后的 hit/miss、matched docs、support spans 和 evidence IDs 才能进入 `orchestrate`。
 
-- Markdown 不是规则实现，不允许和 registry 写出两套口径。
-- 新增或修改根因时，先改规则实现，再同步这里的说明。
+## 当前正式入口
+
+- 正式 CLI 入口是 `scripts/findreason.py`，正式归因实现集中在 `scripts/findreason_core/v3.py`，输出契约以 `schema_version: "v3"` 为准。
+- `references/` 是当前唯一文档源。新增 cause、probe、字段契约或报告口径时，先更新 `references/` 与 v3 测试。
+- 旧 agent/diagnostics 路径已移除，包括 `agent_graph`、`diagnostics`、`attribution`、旧 `skills/*` wrapper、旧 `skills/specs/*`、未接入 v3 的旧 `wide_recall.py` / `knowledge_detail.py` / `rerank_experiment.py`。
+- 需要恢复旧能力时，应先按 v3 语义重新接入 `v3.py`、`references/` 和测试，不能重新引入并行规则源。
+
+## 主要文档
+
+- `agent_attribution_planning.md`：宿主 Agent 如何从 trace artifacts 和评估器信号生成 assertion set 与 `probe-v1` plan。
+- `field_contract.md`：case 输入、ingest 输出和 orchestrate 输出字段契约。
+- `probe-spec.md`：probe 输出格式、缓存、失败语义和 `run-probe-plan` 契约。
+- `cause-codes.md`：v3 cause enum、owner 和边界。
+- `orchestrator-rules.md`：counterfactual 与 primary cause 选择规则。
+- `host_agent_playbook.md`：端到端宿主 Agent 操作流程。
+- `output-schema.json`：orchestrate JSON 输出 schema。
+- `capabilities.json`：CLI capability manifest。
+
+## 已移除旧能力
+
+`probe-by-judgement`、`probe-by-claim`、`probe-by-doc-title`、`probe-rerank-tune` 已从 CLI 和 capability manifest 中移除。语义判断、问题拆解和探针规划由宿主 Agent 按 `agent_attribution_planning.md` 完成，并交给 `run-probe-plan` 执行确定性检查。

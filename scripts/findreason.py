@@ -36,11 +36,7 @@ PROBE_COMMANDS = [
     "probe-permission-check",
     "probe-wide-recall",
     "probe-rerank-bypass",
-    "probe-rerank-tune",
     "probe-context-assembly",
-    "probe-by-judgement",
-    "probe-by-claim",
-    "probe-by-doc-title",
 ]
 
 
@@ -336,15 +332,6 @@ def _add_probe_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     parser.add_argument("--no-cache", action="store_true")
     if command in {"probe-knowledge-detail", "probe-permission-check", "probe-rerank-bypass", "probe-context-assembly"}:
         parser.add_argument("--doc-ids")
-    if command == "probe-rerank-tune":
-        parser.add_argument("--param-grid")
-        parser.add_argument("--rerank-tunable", action="store_true")
-    if command == "probe-by-claim":
-        parser.add_argument("--claims")
-    if command == "probe-by-judgement":
-        parser.add_argument("--judgement")
-    if command == "probe-by-doc-title":
-        parser.add_argument("--titles")
     if command == "probe-self-oracle":
         parser.add_argument("--signals", default="judgement_back_recall,claim_back_recall,query_wide_recall")
         parser.add_argument("--topk", type=int, default=50)

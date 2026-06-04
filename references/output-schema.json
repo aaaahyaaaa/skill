@@ -27,7 +27,7 @@
       "type": "object",
       "required": ["source", "inferred_doc_count", "inferred_doc_ids", "confidence"],
       "properties": {
-        "source": {"enum": ["provided", "self_inferred", "mixed", "insufficient"]},
+        "source": {"enum": ["provided", "self_inferred", "mixed", "insufficient", "insufficient_assertions", "host_assertions"]},
         "signals_used": {"type": "array", "items": {"type": "string"}},
         "signals_attempted": {"type": "array", "items": {"type": "string"}},
         "signals_failed": {"type": "object"},
