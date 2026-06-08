@@ -39,7 +39,7 @@ Probe 缓存位于 `~/.findreason/cache/<workspace_id>/<log_id>/`。传入 `--no
 - `answer_claim.text` 必须是 workflow output 中抽取出的命题 X，不应写成“答案称 X”。`answer_claim` 只用于 answer grounding、scope、citation 和 consistency 检查，不驱动 knowledge / retrieval / rerank / context 归因。
 - `probe-wide-recall` 应运行原 query + rewrite query，topK >= 50，并将结果视为理论召回上界。
 
-输入边界不是 probe plan 创造的断言。`orchestrate` 会读取 `raw_artifacts.workflow_span_ios[].input` 作为 Workflow 原始输入，并把它与用户实际问题/评估器用户上下文线索对比；如果关键场景约束在进入 Workflow 前已经丢失，优先判 `workflow_input_loss`。`rewrite_query` / `keywords` 只作为预处理节点输出，用于后续判断 `query_rewrite_drift` / `keyword_loss`。
+输入边界不是 probe plan 创造的断言。`orchestrate` 会读取 `raw_artifacts.workflow_span_ios[].input` 作为 Workflow 原始输入，并把它与用户实际问题/评估器用户上下文线索对比；如果关键场景约束在进入 Workflow 前已经丢失，先记录输入边界风险。只有受影响的 `expected_required` 已绑定到 `point_coverage`，且理论召回上界可支撑、online origin recall 缺失时，才判 `workflow_input_loss`。如果同一断言已经进入 online origin / rerank / prompt，输入差异不能作为主因。`rewrite_query` / `keywords` 只作为预处理节点输出，用于后续判断 `query_rewrite_drift` / `keyword_loss`。
 - `point_coverage`：逐必要断言匹配理论召回上界文档、`origin_doc_list/origin_faq_list`、`rerank_docs` 和 `prompt_docs`。文档匹配必须包含可回答的正文片段；标题命中或纯词面命中不计入。每个被接受的文档可包含 `support_status`（`full_support` 或 `partial_support`）、`support_score`、`support_spans`、`matched_terms` 和 `missing_constraints`。如果断言行带 `merged_from`，它代表多个原始 `expected_required` 已合并为一个覆盖靶子。人类报告应把线上阶段渲染为断言覆盖矩阵，把理论召回上界文档渲染为单独的断言关系小节，而不是无解释的阶段列。
 - `missing_expected_points_from_theoretical_recall`：没有上界支撑文档的必要断言，视为部分知识缺失。
 - `missing_expected_points_from_origin`：上界支持但线上 origin recall 未命中的必要断言。

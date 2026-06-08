@@ -1496,12 +1496,8 @@ def _oracle_adjusted_confidence(base: float, probe_state: dict[str, Any]) -> flo
 
 
 def _required_assertions_all_covered(request_dict: dict[str, Any], probe_state: dict[str, Any]) -> bool:
-    raw_oracle = request_dict.get("raw_oracle_fields") if isinstance(request_dict.get("raw_oracle_fields"), dict) else {}
-    rows = raw_oracle.get("point_coverage")
-    if not isinstance(rows, list):
-        oracle_state = probe_state.get("oracle_status") if isinstance(probe_state.get("oracle_status"), dict) else {}
-        rows = oracle_state.get("point_coverage")
-    if not isinstance(rows, list):
+    rows = _point_coverage_rows(request_dict, probe_state)
+    if not rows:
         return False
     required_rows = [
         row
@@ -1509,6 +1505,78 @@ def _required_assertions_all_covered(request_dict: dict[str, Any], probe_state: 
         if isinstance(row, dict) and str(row.get("role") or "expected_required") in REQUIRED_ASSERTION_ROLES
     ]
     return bool(required_rows) and all(row.get("missing_stage") == "covered" for row in required_rows)
+
+
+def _point_coverage_rows(request_dict: dict[str, Any], probe_state: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_oracle = request_dict.get("raw_oracle_fields") if isinstance(request_dict.get("raw_oracle_fields"), dict) else {}
+    rows = raw_oracle.get("point_coverage")
+    if not isinstance(rows, list):
+        oracle_state = probe_state.get("oracle_status") if isinstance(probe_state.get("oracle_status"), dict) else {}
+        rows = oracle_state.get("point_coverage")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _workflow_input_loss_impact(request_dict: dict[str, Any], probe_state: dict[str, Any], workflow_input_signal: dict[str, Any]) -> dict[str, Any]:
+    if workflow_input_signal.get("status") != "fail":
+        return {"status": "not_applicable", "causal": False, "reason": "workflow input boundary did not fail"}
+    affected = _string_list(workflow_input_signal.get("affected_assertions"))
+    rows = _point_coverage_rows(request_dict, probe_state)
+    if not affected or not rows:
+        return {
+            "status": "unproven",
+            "causal": False,
+            "reason": "missing affected assertions or point_coverage; workflow input loss is only a risk signal",
+        }
+    affected_keys = {_compact_assertion_text(text) for text in affected if _compact_assertion_text(text)}
+    matched_rows: list[dict[str, Any]] = []
+    for row in rows:
+        row_key = _compact_assertion_text(row.get("text"))
+        if row_key and any(row_key == key or row_key in key or key in row_key for key in affected_keys):
+            matched_rows.append(row)
+    if not matched_rows:
+        return {
+            "status": "unproven",
+            "causal": False,
+            "reason": "affected assertions are not bound to point_coverage rows",
+        }
+    stages = [str(row.get("missing_stage") or "unknown") for row in matched_rows]
+    online_support_stages = {"covered", "rerank", "context"}
+    if any(stage in online_support_stages for stage in stages):
+        return {
+            "status": "online_evidence_not_blocked",
+            "causal": False,
+            "reason": "affected required assertions were already supported by online origin/rerank/prompt evidence",
+            "missing_stages": stages,
+        }
+    if any(stage == "knowledge" for stage in stages):
+        return {
+            "status": "knowledge_gap",
+            "causal": False,
+            "reason": "affected required assertions are unsupported by the theoretical recall upper bound; do not blame workflow input",
+            "missing_stages": stages,
+        }
+    if any(stage == "upper_bound_unavailable" for stage in stages):
+        return {
+            "status": "unproven",
+            "causal": False,
+            "reason": "theoretical recall upper bound is unavailable for affected assertions",
+            "missing_stages": stages,
+        }
+    if stages and all(stage == "retrieval" for stage in stages):
+        return {
+            "status": "causal_retrieval_gap",
+            "causal": True,
+            "reason": "affected required assertions are recoverable in the theoretical upper bound but absent from online origin recall",
+            "missing_stages": stages,
+        }
+    return {
+        "status": "unproven",
+        "causal": False,
+        "reason": "mixed or unknown point_coverage stages do not prove workflow input loss changed downstream output",
+        "missing_stages": stages,
+    }
 
 
 def _infer_verdicts(
@@ -1535,6 +1603,8 @@ def _infer_verdicts(
     required_assertions_all_covered = _required_assertions_all_covered(request_dict, probe_state)
     expected_points = _expected_knowledge_points(request_dict)
     workflow_input_signal = _workflow_input_boundary_signal(request_dict, ingest, expected_points)
+    workflow_input_signal = dict(workflow_input_signal)
+    workflow_input_signal["impact"] = _workflow_input_loss_impact(request_dict, probe_state, workflow_input_signal)
     preprocess_output_signal = _preprocess_output_boundary_signal(request_dict, ingest, expected_points)
     verdicts: list[dict[str, Any]] = []
 
@@ -1565,7 +1635,7 @@ def _infer_verdicts(
         verdicts.append(_verdict(stage="preprocess", status="not_probed", evidence_ids=ev, counterfactual=_counterfactual(False, "stage excluded by --only-stages")))
     elif case_input.get("is_knowledge_qa") is False:
         verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="non_rag_route_boundary", confidence=0.86, evidence_ids=ev, counterfactual=_counterfactual(True, "route would switch to non-RAG path", "route to the correct non-RAG/tool workflow", True, ev)))
-    elif workflow_input_signal.get("status") == "fail":
+    elif workflow_input_signal.get("status") == "fail" and (workflow_input_signal.get("impact") or {}).get("causal") is True:
         detail = "、".join(_string_list(workflow_input_signal.get("missing_terms"))[:5])
         verdicts.append(
             _verdict(
@@ -1580,6 +1650,19 @@ def _infer_verdicts(
                     "preserve the original user question/context before invoking the workflow",
                     True,
                     ev,
+                ),
+            )
+        )
+    elif workflow_input_signal.get("status") == "fail":
+        impact = workflow_input_signal.get("impact") if isinstance(workflow_input_signal.get("impact"), dict) else {}
+        verdicts.append(
+            _verdict(
+                stage="preprocess",
+                status="pass",
+                evidence_ids=ev,
+                counterfactual=_counterfactual(
+                    False,
+                    str(impact.get("reason") or "workflow input differs, but current evidence does not prove it changed downstream output"),
                 ),
             )
         )
@@ -2422,7 +2505,9 @@ BOUNDARY_STOPWORDS = {
 
 
 def _normalize_boundary_text(value: Any) -> str:
-    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").lower())
+    text = str(value or "").lower()
+    text = re.sub(r"(是否|会不会|能不能|可不可以|有没有)", "", text)
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text)
 
 
 def _contains_boundary_term(container: Any, term: str) -> bool:
@@ -2506,6 +2591,7 @@ def _user_question_surface(request_dict: dict[str, Any]) -> str:
 
 def _strip_assertion_prefix(text: str) -> str:
     cleaned = re.sub(r"^(正确答案|正确输出|答案|输出)?应(该)?(在|覆盖|回答|说明|给出|包含)?", "", text)
+    cleaned = re.sub(r"^(用户问的是|用户问题是|用户核心问题是|核心问题是)", "", cleaned)
     cleaned = re.sub(r"^(用户截图所处的|用户问题中的|用户上下文中的)", "", cleaned)
     return cleaned.strip(" ：:，,、。；;")
 
@@ -2856,7 +2942,12 @@ def _format_input_boundary_summary(input_signal: dict[str, Any], preprocess_sign
     ]
     if input_signal.get("status") == "fail":
         missing = "、".join(_string_list(input_signal.get("missing_terms"))[:8])
-        lines.append(f"- 输入边界判断：Workflow 原始输入丢失用户实际问题中的关键约束：{missing}")
+        impact = input_signal.get("impact") if isinstance(input_signal.get("impact"), dict) else {}
+        if impact.get("causal") is True:
+            lines.append(f"- 输入边界判断：Workflow 原始输入丢失用户实际问题中的关键约束，且影响线上证据链：{missing}")
+        else:
+            reason = _report_short_text(impact.get("reason"), limit=180)
+            lines.append(f"- 输入边界判断：Workflow 原始输入存在关键约束差异：{missing}；但当前证据未证明该差异影响输出，原因：{reason}")
     elif preprocess_signal.get("status") == "fail":
         missing = "、".join(_string_list(preprocess_signal.get("missing_terms"))[:8])
         lines.append(f"- 输入边界判断：Workflow 原始输入保留了关键约束，但预处理输出丢失：{missing}")
@@ -2925,6 +3016,8 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     upper_bound_relation_rows = _format_upper_bound_assertion_relations(point_coverage)
     all_assertions = _expected_knowledge_points(request_dict)
     input_boundary_signal = _workflow_input_boundary_signal(request_dict, ingest, all_assertions)
+    input_boundary_signal = dict(input_boundary_signal)
+    input_boundary_signal["impact"] = _workflow_input_loss_impact(request_dict, {"oracle_status": {"point_coverage": point_coverage}}, input_boundary_signal)
     preprocess_output_signal = _preprocess_output_boundary_signal(request_dict, ingest, all_assertions)
     input_boundary_rows = _format_input_boundary_summary(input_boundary_signal, preprocess_output_signal)
     missing_point_rows = [row for row in point_coverage if isinstance(row, dict) and row.get("missing_stage") == "knowledge"]

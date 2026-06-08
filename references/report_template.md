@@ -27,7 +27,9 @@
 - 用户实际问题/评估问题线索
 - Workflow 原始输入
 - 预处理输出（rewrite query / keywords）
-- 如果用户约束未进入 Workflow 原始输入，报告明确写 `workflow_input_loss`；如果 Workflow 输入完整但预处理输出丢失，报告写 `query_rewrite_drift` 或 `keyword_loss`
+- 如果用户约束未进入 Workflow 原始输入，报告先写输入边界风险；只有受影响断言在理论召回上界可支撑、但线上初召回缺失时，才写 `workflow_input_loss`
+- 如果同一断言已经进入 online origin / rerank / prompt，报告写“输入差异未证明影响输出”，继续展示下游主因
+- 如果 Workflow 输入完整但预处理输出丢失，报告写 `query_rewrite_drift` 或 `keyword_loss`
 
 ## 3. 必要断言
 

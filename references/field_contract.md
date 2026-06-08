@@ -26,7 +26,7 @@
 
 外部 `query` / `answer` 只作为 hint。`case_input.query` 优先表示用户实际问题或评估器问题线索，不得被当作 Workflow 原始输入；真实 Workflow 原始输入/输出以 `raw_artifacts.workflow_span_ios[].input/output` 为权威。`rewrite_query`、`keywords` 是 Workflow 内部预处理节点输出，用于判断预处理是否丢语义，不能覆盖 Workflow 原始输入。
 
-当用户实际问题或评估器用户上下文线索与 Workflow 原始输入存在关键约束差异时，orchestrate 应先输出 `workflow_input_loss`。只有 Workflow 原始输入保留了用户约束，才继续比较 `rewrite_query` / `keywords` 并判断 `query_rewrite_drift` / `keyword_loss`。
+当用户实际问题或评估器用户上下文线索与 Workflow 原始输入存在关键约束差异时，orchestrate 应先记录输入边界风险，但不能直接输出 `workflow_input_loss`。只有受影响的 `expected_required` 已绑定到 `point_coverage`，且该断言在理论召回上界可支撑、online origin recall 缺失时，才能把该风险升级为 `workflow_input_loss` 主因。如果同一断言已被 online origin / rerank / prompt 支撑，说明输入差异没有切断正确证据链，应继续比较 `rewrite_query` / `keywords` 或下游阶段。
 
 `host_agent.answer_claim` 是向后兼容字段，语义上表示宿主 Agent 产出的 assertion set，必须使用嵌套 JSON 结构 `{"host_agent": {"answer_claim": [...]}}`。每项应包含断言：`text`、`role`，可选 `basis`、`why_required`、`source` 与 `confidence`；合并输出可包含 `merged_from`。核心 role 是 `expected_required` 和 `answer_claim`；`missing_expected` 仅作为兼容输入，应归一化为 `expected_required` 并保留遗漏 hint。CLI 会把 `source` 归一化为 `host_agent.answer_claim`。
 

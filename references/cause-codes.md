@@ -5,7 +5,7 @@
 | 阶段 | cause_code | 负责人 | 必要条件 |
 |-|-|-|-|
 | preprocess | `non_rag_route_boundary` | agent_router_owner | Case 不是知识问答，或应该路由到 RAG 之外。 |
-| preprocess | `workflow_input_loss` | workflow_input_owner | 用户实际问题或评估器用户上下文线索包含关键场景约束，但 trace 中 Workflow 原始输入已丢失这些约束；此时先判输入边界，不直接下钻到知识缺失。 |
+| preprocess | `workflow_input_loss` | workflow_input_owner | 用户实际问题或评估器用户上下文线索包含关键场景约束，trace 中 Workflow 原始输入已丢失这些约束，且受影响的 `expected_required` 在理论召回上界可支撑但线上初召回缺失。 |
 | preprocess | `query_rewrite_drift` | rag_preprocess_or_workflow_owner | rewrite 改变了用户意图，并影响下游召回。 |
 | preprocess | `keyword_loss` | rag_preprocess_or_workflow_owner | 核心实体 / 短语在召回前丢失。 |
 | knowledge | `suspected_knowledge_missing` | kb_owner | `knowledge_exists=no`、理论召回无法支撑必要断言，或必要引用缺少权威 / 可引用来源；状态为 `unknown` 时不得使用。 |
@@ -22,7 +22,7 @@
 | answer | `answer_scope_violation` | prompt_or_model_owner | 答案超出问题约束下 KB 可支持的范围（probe `scope_violation` miss）。 |
 | answer | `answer_branching_unclear` | prompt_or_model_owner | KB 已澄清分支前提，但答案混用分支且未区分（probe `internal_contradiction` hit）。 |
 
-`workflow_input_loss` 比知识、召回、重排、答案都更上游。只有 Workflow 原始输入保留了用户约束，才继续判断预处理输出、知识、召回和答案。
+`workflow_input_loss` 比知识、召回、重排、答案都更上游，但必须有 counterfactual 证据证明输入丢失影响线上证据链。若受影响断言已被 online origin / rerank / prompt 支撑，不能把 badcase 归因为 `workflow_input_loss`；若理论召回上界也不支撑该断言，应优先落到知识缺口或人工复核，而不是输入丢失。
 
 答案类原因要求同时满足 `qa.prompt_supports_answer=true` 和 `qa.answer_satisfies_expected=false`。如果 `prompt_supports_answer=false`，主因必须停留在上游。
 

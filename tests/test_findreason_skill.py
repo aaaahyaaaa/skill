@@ -1243,9 +1243,15 @@ def test_workflow_input_loss_precedes_knowledge_attribution() -> None:
         },
         "preprocess": {"rewrite_query": "巨量千川1元试投在哪里", "keywords": ["巨量千川", "1元试投"]},
         "retrieval": {
-            "knowledge_exists": False,
+            "knowledge_exists": True,
             "theoretical_recall_status": "ok",
-            "wide_recall_docs": [],
+            "wide_recall_docs": [
+                {
+                    "id": "doc-entry",
+                    "title": "电商启航计划一元试投入口说明",
+                    "content": "抖音电商千川启航计划全域投放推商品场景下，一元试投入口位置在活动中心-启航计划-马上试，也可以从对应电商端入口进入。",
+                }
+            ],
             "origin_doc_list": [],
         },
         "rerank": {"rerank_docs": [], "prompt_docs": []},
@@ -1279,6 +1285,111 @@ def test_workflow_input_loss_precedes_knowledge_attribution() -> None:
     assert "启航计划" in json.dumps(preprocess, ensure_ascii=False)
     assert "### 输入边界" in payload["human_report_markdown"]
     assert "Workflow 原始输入丢失" in payload["human_report_markdown"]
+    assert "影响线上证据链" in payload["human_report_markdown"]
+
+
+def test_workflow_input_loss_does_not_win_when_online_chain_covers_assertion() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    support_doc = {
+        "id": "doc-entry",
+        "title": "电商启航计划一元试投入口说明",
+        "content": "抖音电商千川启航计划全域投放推商品场景下，一元试投入口位置在活动中心-启航计划-马上试，也可以从对应电商端入口进入。",
+    }
+    request = {
+        "case_input": {
+            "query": "用户截图显示抖音电商千川启航计划/全域投放-推商品，问这个一元试投在哪里。",
+            "workspace_id": "55",
+            "app_id": "100",
+        },
+        "preprocess": {"rewrite_query": "巨量千川1元试投在哪里", "keywords": ["巨量千川", "1元试投"]},
+        "retrieval": {
+            "knowledge_exists": True,
+            "theoretical_recall_status": "ok",
+            "wide_recall_docs": [support_doc],
+            "origin_doc_list": [support_doc],
+        },
+        "rerank": {"rerank_docs": [support_doc], "prompt_docs": [support_doc]},
+        "qa": {"answer": "首次进入巨量千川首页即可看到新客试投入口。", "answer_satisfies_expected": False},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "正确输出应在用户截图所处的抖音电商千川启航计划/全域投放推商品场景下回答一元试投入口位置，例如活动中心-启航计划-马上试或对应电商端入口路径。",
+                    "role": "expected_required",
+                    "basis": ["trace_query", "chat_history", "evaluator_reason"],
+                }
+            ]
+        },
+    }
+    ingest = minimal_ingest(request)
+    ingest["raw_artifacts"]["workflow_span_ios"] = [
+        {
+            "span_id": "workflow",
+            "selected": True,
+            "input": {"sys": {"query": "巨量千川1元试投在哪里"}},
+            "output": {"answer": "首次进入巨量千川首页即可看到新客试投入口。"},
+        }
+    ]
+
+    payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
+
+    assert payload["primary_cause"]["stage"] == "answer"
+    assert payload["primary_cause"]["cause_code"] == "unsupported_claim"
+    preprocess = next(item for item in payload["evidence_chain"] if item["stage"] == "preprocess")
+    assert preprocess["status"] == "pass"
+    assert "online origin/rerank/prompt" in json.dumps(preprocess, ensure_ascii=False)
+    assert "当前证据未证明该差异影响输出" in payload["human_report_markdown"]
+
+
+def test_input_boundary_treats_whether_phrasing_as_same_constraint() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {
+            "query": "同店铺下的两个千川号人群会不会互相影响",
+            "workspace_id": "55",
+            "app_id": "100",
+        },
+        "judgement_evidence": {
+            "signals": [
+                {
+                    "label": "相关性",
+                    "result": "否",
+                    "reason": "用户问的是“人群是否互相影响”，Agent 仅讨论信用评分。",
+                }
+            ]
+        },
+        "preprocess": {"rewrite_query": "同店铺下的两个千川号人群会不会互相影响"},
+        "retrieval": {"knowledge_exists": True, "origin_doc_list": [{"id": "d1", "content": "人群是否互相影响需要看投放账户与人群包设置。"}]},
+        "rerank": {"rerank_docs": [{"id": "d1", "content": "人群是否互相影响需要看投放账户与人群包设置。"}], "prompt_docs": [{"id": "d1", "content": "人群是否互相影响需要看投放账户与人群包设置。"}]},
+        "qa": {"answer": "信用评分会互相影响。", "answer_satisfies_expected": False},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "正确输出应覆盖：用户问的是“人群是否互相影响”。",
+                    "role": "expected_required",
+                    "basis": ["evaluator_reason", "query_hint"],
+                }
+            ]
+        },
+    }
+    ingest = minimal_ingest(request)
+    ingest["raw_artifacts"]["workflow_span_ios"] = [
+        {
+            "span_id": "workflow",
+            "selected": True,
+            "input": {"sys": {"query": "同店铺下的两个千川号人群会不会互相影响"}},
+            "output": {"answer": "信用评分会互相影响。"},
+        }
+    ]
+
+    payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
+
+    preprocess = next(item for item in payload["evidence_chain"] if item["stage"] == "preprocess")
+    assert preprocess["status"] == "pass"
+    assert "Workflow 原始输入存在关键约束差异" not in payload["human_report_markdown"]
 
 
 def test_preprocess_rewrite_drift_when_workflow_input_is_complete() -> None:

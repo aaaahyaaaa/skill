@@ -42,7 +42,7 @@ Workflow 原始输入
 预处理输出 rewrite_query / keywords
 ```
 
-如果用户实际问题或评估器用户上下文中的关键场景约束没有进入 Workflow 原始输入，归因到 `workflow_input_loss`；如果 Workflow 原始输入保留了这些约束，但 rewrite / keywords 丢失，才归因到 `query_rewrite_drift` 或 `keyword_loss`。
+如果用户实际问题或评估器用户上下文中的关键场景约束没有进入 Workflow 原始输入，先记录输入边界风险；只有受影响的 `expected_required` 在理论召回上界可支撑、但 online origin recall 缺失时，才归因到 `workflow_input_loss`。如果同一断言已经被 online origin / rerank / prompt 支撑，继续判断下游阶段。若 Workflow 原始输入保留了这些约束，但 rewrite / keywords 丢失，再判断 `query_rewrite_drift` 或 `keyword_loss`。
 
 ## 输出
 
@@ -109,7 +109,7 @@ Agent planning 一次性输出两个对象：
 `expected_required` 驱动上游覆盖链：
 
 ```text
-用户约束未进入 Workflow 原始输入 -> workflow_input_loss
+用户约束未进入 Workflow 原始输入，且受影响断言上界可支撑但线上初召回缺失 -> workflow_input_loss
 Workflow 输入保留约束，但 rewrite / keywords 丢失 -> query_rewrite_drift / keyword_loss
 KB / wide recall 不支撑 -> suspected_knowledge_missing 或 human_review
 KB 支撑，origin 未召回 -> retrieval_miss

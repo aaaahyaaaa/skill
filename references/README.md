@@ -13,7 +13,7 @@ trace hydration
 ## 核心口径
 
 - Trace artifacts 是 workflow 现场的权威来源。外部 `query` / `answer` 只作为用户实际问题/评估问题线索或 hint；Workflow 原始输入/输出必须从 trace 的 `workflow_span_ios` 读取。
-- 输入边界先于 RAG 链路归因：用户约束未进入 Workflow 原始输入时判 `workflow_input_loss`；Workflow 输入完整但 rewrite / keywords 丢失时才判 `query_rewrite_drift` / `keyword_loss`。
+- 输入边界先于 RAG 链路归因，但不能只凭 query 差异判主因：只有用户约束未进入 Workflow 原始输入，且受影响的 `expected_required` 在理论召回上界可支撑、线上初召回缺失时，才判 `workflow_input_loss`。如果同一断言已经进入线上 origin / rerank / prompt，输入差异只作为风险信号，继续判断下游。
 - 评估器输出只压缩为 `judgement_evidence.signals`，用于说明“怀疑哪里坏了”；它不直接决定 `primary_cause`。
 - `host_agent.answer_claim` 是向后兼容字段，语义上表示宿主 Agent 产出的 assertion set。
 - 主设计只使用 `expected_required` 和 `answer_claim` 两个核心 role。`missing_expected` 仅作为 legacy 输入映射到 `expected_required`。
