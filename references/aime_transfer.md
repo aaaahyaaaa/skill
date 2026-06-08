@@ -40,6 +40,6 @@ python -m findreason orchestrate \
 
 ## 配置
 
-`config/runtime_defaults.json` 不应包含真实 token。通过导出的环境变量或宿主本地 env 文件提供 `OPEN_PLAT_TRACE_TOKEN`，值不带 `Bearer` 前缀。
+`config/runtime_defaults.json` 不应包含真实 token。通过导出的环境变量或宿主本地 env 文件提供 `OPEN_PLAT_ZS_OPEN_TOKEN`，值不带 `Bearer` 前缀；不要再使用旧 token 变量名。
 
 当宿主需要使用不同 token 或 endpoint 时，导出的环境变量仍然优先于项目默认配置。

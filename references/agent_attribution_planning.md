@@ -48,7 +48,7 @@ Workflow 原始输入
 
 Agent planning 一次性输出两个对象：
 
-1. Assertion set，落到兼容字段 `host_agent.answer_claim`。
+1. Assertion set，落到唯一输入字段 `host_agent.answer_claim`。
 2. `probe-v1` plan，交给 `run-probe-plan` 执行。
 
 ### Assertion Set
@@ -58,11 +58,12 @@ Agent planning 一次性输出两个对象：
 - `expected_required`：正确输出应覆盖的检查点。
 - `answer_claim`：从 workflow output 中抽出的可验证命题 X。
 
-兼容 role：
+检查 role：
 
-- `missing_expected`：legacy 输入，归一化为 `expected_required`，并保留 `evaluator_hint.omitted=true`。
 - `constraint_check`、`citation_check`、`consistency_check`：用于 probe planning，不直接驱动上游归因。
 - `unsupported_claim`：answer 阶段线索，不触发 `suspected_knowledge_missing`。
+
+不要输出旧 role 或字段别名。字段契约只保留最新约定字段，CLI 不会把旧 role 自动映射成当前 role。
 
 `expected_required` 可基于 `trace_query`、`chat_history`、`evaluator_reason`、`rewrite_query`、`keywords` 推断，但必须写清 `basis` 和 `why_required`。它是验证靶子，不是事实证据。宿主 Agent 可以把“场景约束”和“入口要求”拆成相邻断言交给 CLI；CLI 只会在两条断言构成“场景约束 + 同一入口/路径要求”的包含或细化关系时保守合并，合并后的 `basis` 取并集，原始断言放到 `merged_from` 审计字段，覆盖矩阵只保留合并行。
 

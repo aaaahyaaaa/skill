@@ -22,7 +22,7 @@ def run_cli(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subproc
         {
             "FINDREASON_ENV_DISABLE": "true",
             "FINDREASON_TRACE_WORKFLOW_MAPPING": "false",
-            "OPEN_PLAT_TRACE_TOKEN": "test-token",
+            "OPEN_PLAT_ZS_OPEN_TOKEN": "test-token",
         }
     )
     merged_env.update(env or {})
@@ -43,7 +43,7 @@ def run_module(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subp
         {
             "FINDREASON_ENV_DISABLE": "true",
             "FINDREASON_TRACE_WORKFLOW_MAPPING": "false",
-            "OPEN_PLAT_TRACE_TOKEN": "test-token",
+            "OPEN_PLAT_ZS_OPEN_TOKEN": "test-token",
         }
     )
     merged_env.update(env or {})
@@ -839,7 +839,7 @@ def test_legacy_assertion_fields_fail_fast() -> None:
     assert error.value.details["required_field"] == "host_agent.answer_claim"
 
 
-def test_host_agent_answer_claim_generates_all_assertion_roles() -> None:
+def test_host_agent_answer_claim_generates_current_assertion_roles() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     import findreason_core.v3 as v3
 
@@ -847,7 +847,7 @@ def test_host_agent_answer_claim_generates_all_assertion_roles() -> None:
         "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
         "host_agent": {
             "answer_claim": [
-                {"text": "应说明短视频追投入口。", "role": "missing_expected"},
+                {"text": "应说明短视频追投入口。", "role": "expected_required"},
                 {"text": "直播计划详情页可以追投。", "role": "answer_claim"},
                 {"text": "直播计划详情页可以追投短视频。", "role": "unsupported_claim"},
                 {"text": "全域随心推点击率应使用正确维度。", "role": "expected_required"},
@@ -862,6 +862,26 @@ def test_host_agent_answer_claim_generates_all_assertion_roles() -> None:
     assert by_text["直播计划详情页可以追投短视频"]["role"] == "unsupported_claim"
     assert by_text["直播计划详情页可以追投"]["role"] == "answer_claim"
     assert by_text["全域随心推点击率应使用正确维度"]["role"] == "expected_required"
+
+
+def test_host_agent_answer_claim_rejects_old_role_alias() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+
+    request = {
+        "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
+        "host_agent": {
+            "answer_claim": [
+                {"text": "应说明短视频追投入口。", "role": "missing_expected"},
+            ],
+        },
+    }
+
+    with pytest.raises(v3.V3Error) as error:
+        v3._normalize_assertion_inputs(request)
+
+    assert error.value.error_code == "E_ASSERTION_ROLE_INVALID"
+    assert error.value.details["role"] == "missing_expected"
 
 
 def test_oracle_claim_signal_uses_only_required_assertions() -> None:
@@ -990,7 +1010,7 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
     with RecallServer() as server:
         ingest = minimal_ingest(request)
         ingest["raw_artifacts"]["trace_detail"] = trace_payload_with_recall_template(server.recall_url)
-        monkeypatch.setenv("OPEN_PLAT_TRACE_TOKEN", "bootstrap-token")
+        monkeypatch.setenv("OPEN_PLAT_ZS_OPEN_TOKEN", "bootstrap-token")
         monkeypatch.setenv("OPEN_PLAT_WORKSPACE_INFO_URL", server.workspace_info_url)
         monkeypatch.delenv("WORKFLOW_AUTH_TOKEN", raising=False)
 
@@ -2576,7 +2596,56 @@ def test_fetch_workflow_nodes_preserves_nodes_edges_and_global_config(monkeypatc
     assert (tmp_path / "workflow_nodes.json").exists()
 
 
-def test_static_trace_token_has_no_bearer_prefix_when_configured() -> None:
+def test_static_openplat_token_has_no_bearer_prefix_when_configured() -> None:
     config = json.loads((SKILL_ROOT / "config" / "runtime_defaults.json").read_text(encoding="utf-8"))
-    token = config["OPEN_PLAT_TRACE_TOKEN"]
-    assert not token.lower().startswith("bearer ")
+    zs_open_token = config["OPEN_PLAT_ZS_OPEN_TOKEN"]
+    assert not zs_open_token.lower().startswith("bearer ")
+    assert "OPEN_PLAT_TRACE_TOKEN" not in config
+    assert "OPEN_PLAT_BOOTSTRAP_TOKEN" not in config
+
+
+def test_openplat_auth_reads_only_zs_open_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import _openplat_token
+
+    monkeypatch.delenv("OPEN_PLAT_ZS_OPEN_TOKEN", raising=False)
+    monkeypatch.setenv("OPEN_PLAT_TRACE_TOKEN", "jwt-token")
+
+    token, source = _openplat_token()
+
+    assert token == ""
+    assert source == "not_configured"
+
+    monkeypatch.setenv("OPEN_PLAT_ZS_OPEN_TOKEN", "fixed-token")
+
+    token, source = _openplat_token()
+
+    assert token == "fixed-token"
+    assert source == "OPEN_PLAT_ZS_OPEN_TOKEN"
+
+
+def test_project_contract_does_not_document_old_field_aliases() -> None:
+    files = [
+        SKILL_ROOT / "SKILL.md",
+        SKILL_ROOT / ".env.example",
+        SKILL_ROOT / "config" / "runtime_defaults.json",
+        *sorted((SKILL_ROOT / "references").glob("*.md")),
+    ]
+    forbidden_terms = [
+        "向后兼容",
+        "兼容变量",
+        "兼容字段",
+        "兼容输入",
+        "`missing_expected`",
+        "OPEN_PLAT_TRACE_TOKEN",
+        "OPEN_PLAT_BOOTSTRAP_TOKEN",
+    ]
+
+    offenders: list[str] = []
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for term in forbidden_terms:
+            if term in text:
+                offenders.append(f"{path.relative_to(SKILL_ROOT)}: {term}")
+
+    assert offenders == []

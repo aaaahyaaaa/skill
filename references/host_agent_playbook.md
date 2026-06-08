@@ -7,7 +7,8 @@
 - 从粘贴文本、curl/body 片段或表格行中抽取 `judgement`、`workspace_id`、`app_id`、`log_id`、`case_id/source_row`，以及强暗示的 `expected_knowledge_ids`。外部 `query` / `answer` 只能作为用户实际问题/评估问题线索或 `query_hint` / `answer_hint`；Workflow 原始输入/输出必须优先来自 trace artifacts。
 - 将较长的 grader / rubric 输出压缩为 2KB 内的 `judgement_evidence.signals`。评估器只说明“怀疑哪里坏了”，不是 trace 证据，也不能直接决定主因。
 - 运行 probes 前，先执行 Agent attribution planning：消费 trace artifacts 和 `judgement_evidence.signals`，同时生成 assertion set 与 `probe-v1` plan。详细规则见 `references/agent_attribution_planning.md`。
-- `host_agent.answer_claim` 是向后兼容字段，语义上表示 assertion set，必须使用嵌套结构 `{"host_agent": {"answer_claim": [...]}}`。核心 role 是 `expected_required` 和 `answer_claim`；`missing_expected` 只作为 legacy 输入，归一化为 `expected_required`。
+- 字段契约只保留最新约定字段。不要提供旧字段、旧 role 或旧 schema alias；外部输入出现过时断言字段时 CLI 会 fail fast。
+- `host_agent.answer_claim` 是唯一 assertion set 输入字段，必须使用嵌套结构 `{"host_agent": {"answer_claim": [...]}}`。每项必须是对象并包含 `text`、`role`。核心 role 是 `expected_required` 和 `answer_claim`。
 - `expected_required` 用于判断 knowledge、retrieval、rerank、context 缺口。CLI 会保守合并“场景约束 + 同一入口/路径要求”的包含/细化断言，`basis` 取并集，原始断言保存在 `merged_from`，覆盖矩阵只看合并后的行。`answer_claim` 是从 workflow output 中抽取出的可验证命题 X，用于 grounding、scope、citation 和 consistency 检查；文本不要写成“答案称 X”。
 - 归因前先看输入边界：如果用户实际问题或评估器用户上下文包含关键场景约束，但 `raw_artifacts.workflow_span_ios[].input` 中的 Workflow 原始输入已丢失，先记录输入边界风险；只有受影响的 `expected_required` 在理论召回上界可支撑、但线上初召回缺失时，主因才停在 `workflow_input_loss`。如果正确断言已经进入 online origin / rerank / prompt，不能把该 badcase 归因为输入丢失，应继续判断 rerank、context 或 answer。
 - 如果 ingest 返回 `host_action_required[].action=generate-probe-plan`，按照 Agent planning playbook 构造 `probe-v1` plan，并把 `expected_required` / `answer_claim` 写入 `host_agent.answer_claim`。用更新后的 case 文件重新运行 ingest，再执行 `run-probe-plan`，最后再 `orchestrate`。

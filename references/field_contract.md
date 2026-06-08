@@ -28,7 +28,9 @@
 
 当用户实际问题或评估器用户上下文线索与 Workflow 原始输入存在关键约束差异时，orchestrate 应先记录输入边界风险，但不能直接输出 `workflow_input_loss`。只有受影响的 `expected_required` 已绑定到 `point_coverage`，且该断言在理论召回上界可支撑、online origin recall 缺失时，才能把该风险升级为 `workflow_input_loss` 主因。如果同一断言已被 online origin / rerank / prompt 支撑，说明输入差异没有切断正确证据链，应继续比较 `rewrite_query` / `keywords` 或下游阶段。
 
-`host_agent.answer_claim` 是向后兼容字段，语义上表示宿主 Agent 产出的 assertion set，必须使用嵌套 JSON 结构 `{"host_agent": {"answer_claim": [...]}}`。每项应包含断言：`text`、`role`，可选 `basis`、`why_required`、`source` 与 `confidence`；合并输出可包含 `merged_from`。核心 role 是 `expected_required` 和 `answer_claim`；`missing_expected` 仅作为兼容输入，应归一化为 `expected_required` 并保留遗漏 hint。CLI 会把 `source` 归一化为 `host_agent.answer_claim`。
+字段契约只保留最新约定字段。不得为旧字段、旧 role、旧 env var 或旧 schema alias 做自动映射；外部输入出现过时断言字段时应 fail fast，并要求宿主 Agent 按当前契约重写。
+
+`host_agent.answer_claim` 是宿主 Agent 产出的唯一 assertion set 输入字段，必须使用嵌套 JSON 结构 `{"host_agent": {"answer_claim": [...]}}`。每项必须包含当前字段 `text`、`role`，可选 `basis`、`why_required`、`source` 与 `confidence`；合并输出可包含 `merged_from`。核心 role 是 `expected_required` 和 `answer_claim`。CLI 会把 `source` 归一化为 `host_agent.answer_claim`。
 
 `expected_required` 表示模型基于 trace query、chat_history、评估器 reason、rewrite query、keywords 等上下文推断出的正确输出应覆盖检查点。它驱动 knowledge、retrieval、rerank、context 归因，但本身不是事实证据。CLI 会在覆盖计算前对 `expected_required` 做保守语义去重：只有“场景约束 + 同一入口/路径要求”的包含或细化关系才合并，合并行的 `basis` 为原断言并集，`merged_from` 保留原始断言，原始断言不再重复进入 `point_coverage`。`answer_claim` 表示 workflow output 中抽取出的可验证命题 X，文本不得写成“答案称 X”。`unsupported_claim`、`constraint_check`、`citation_check`、`consistency_check` 用于答案、引用、一致性和范围检查，不直接作为上游必要事实断点。
 

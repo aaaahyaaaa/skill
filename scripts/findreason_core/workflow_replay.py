@@ -885,20 +885,26 @@ def _workflow_headers(token: str) -> dict[str, str]:
     }
 
 
+def _openplat_bootstrap_token() -> tuple[str, str]:
+    value = os.getenv("OPEN_PLAT_ZS_OPEN_TOKEN", "").strip()
+    if value:
+        return value, "OPEN_PLAT_ZS_OPEN_TOKEN"
+    return "", "not_configured"
+
+
 async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, str]:
     if os.getenv("FINDREASON_LIVE", "true").lower() in {"0", "false", "no"}:
         return None, "live_disabled"
-    bootstrap_token = os.getenv("OPEN_PLAT_BOOTSTRAP_TOKEN", "").strip()
+    bootstrap_token, bootstrap_source = _openplat_bootstrap_token()
     env_token = os.getenv("WORKFLOW_AUTH_TOKEN", "").strip()
     if bootstrap_token:
         workspace_info_url = os.getenv("OPEN_PLAT_WORKSPACE_INFO_URL", DEFAULT_OPEN_PLAT_WORKSPACE_INFO_URL)
-        platform_env = os.getenv("OPEN_PLAT_ENV", DEFAULT_WORKFLOW_RDS_DATABASE)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
                 workspace_info_url,
                 params={"workspaceId": workspace_id},
                 headers={
-                    "x-zs-plt-open": platform_env,
+                    "x-zs-plt-open": "zs_open",
                     "Authorization": f"Bearer {bootstrap_token}",
                 },
             )
@@ -911,7 +917,7 @@ async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, st
         auth_info = data.get("authInfo") if isinstance(data, dict) else None
         api_key = auth_info.get("apiKey") if isinstance(auth_info, dict) else None
         if isinstance(api_key, str) and api_key.strip():
-            return api_key.strip(), "workspace_info_api"
+            return api_key.strip(), f"workspace_info_api:{bootstrap_source}"
         if env_token:
             return env_token, "workflow_auth_token_env_fallback"
         code = payload.get("code") if isinstance(payload, dict) else None
@@ -1010,7 +1016,7 @@ async def replay_workflow(request: AttributionRequest) -> AttributionRequest:
             endpoint=endpoint,
             request_payload=request_payload,
             auth_token_source=auth_token_source,
-            notes="未配置 OPEN_PLAT_BOOTSTRAP_TOKEN 或 WORKFLOW_AUTH_TOKEN，跳过流水线重跑。",
+            notes="未配置 OPEN_PLAT_ZS_OPEN_TOKEN 或 WORKFLOW_AUTH_TOKEN，跳过流水线重跑。",
         )
         return _merge_replay_evidence(request, replay)
 

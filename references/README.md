@@ -15,8 +15,9 @@ trace hydration
 - Trace artifacts 是 workflow 现场的权威来源。外部 `query` / `answer` 只作为用户实际问题/评估问题线索或 hint；Workflow 原始输入/输出必须从 trace 的 `workflow_span_ios` 读取。
 - 输入边界先于 RAG 链路归因，但不能只凭 query 差异判主因：只有用户约束未进入 Workflow 原始输入，且受影响的 `expected_required` 在理论召回上界可支撑、线上初召回缺失时，才判 `workflow_input_loss`。如果同一断言已经进入线上 origin / rerank / prompt，输入差异只作为风险信号，继续判断下游。
 - 评估器输出只压缩为 `judgement_evidence.signals`，用于说明“怀疑哪里坏了”；它不直接决定 `primary_cause`。
-- `host_agent.answer_claim` 是向后兼容字段，语义上表示宿主 Agent 产出的 assertion set。
-- 主设计只使用 `expected_required` 和 `answer_claim` 两个核心 role。`missing_expected` 仅作为 legacy 输入映射到 `expected_required`。
+- 字段契约只保留最新约定字段，不为旧字段、旧 role、旧 env var 或旧 schema alias 做自动映射；过时断言字段应 fail fast。
+- `host_agent.answer_claim` 是宿主 Agent 产出的唯一 assertion set 输入字段。
+- 主设计只使用 `expected_required` 和 `answer_claim` 两个核心 role。
 - `expected_required` 驱动 knowledge / retrieval / rerank / context 覆盖链路；`answer_claim` 用于 output grounding、scope、citation 和 consistency 检查。
 - `probe-v1` plan 是实验计划，不是证据。只有 `run-probe-plan` 执行后的 hit/miss、matched docs、support spans 和 evidence IDs 才能进入 `orchestrate`。
 

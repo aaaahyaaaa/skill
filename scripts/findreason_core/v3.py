@@ -245,10 +245,9 @@ def validate_judgement_signals(case: dict[str, Any]) -> None:
 
 
 def _openplat_token() -> tuple[str, str]:
-    for name in ("OPEN_PLAT_TRACE_TOKEN", "OPEN_PLAT_BOOTSTRAP_TOKEN"):
-        value = os.getenv(name, "").strip()
-        if value:
-            return value, name
+    value = os.getenv("OPEN_PLAT_ZS_OPEN_TOKEN", "").strip()
+    if value:
+        return value, "OPEN_PLAT_ZS_OPEN_TOKEN"
     return "", "not_configured"
 
 
@@ -264,7 +263,7 @@ def fetch_openplat_trace_detail(
     if not token:
         raise V3Error(
             "E_TRACE_AUTH_REQUIRED",
-            "Missing OpenPlat trace token. Configure OPEN_PLAT_TRACE_TOKEN without the Bearer prefix.",
+            "Missing OpenPlat trace token. Configure OPEN_PLAT_ZS_OPEN_TOKEN without the Bearer prefix.",
             status_code=2,
             details={"token_source": token_source},
         )
@@ -313,6 +312,7 @@ def fetch_openplat_trace_detail(
         "request_payload": request_payload,
         "token_source": token_source,
         "authorization_header": "Bearer <redacted>",
+        "x_zs_plt_open_header": "zs_open",
     }
     return payload if isinstance(payload, dict) else {"data": {"spans": []}}, meta
 
@@ -611,7 +611,7 @@ def _run_sirius_open_label_wide_recall(
         return {
             "status": "not_configured",
             "error": "",
-            "notes": "未配置 OPEN_PLAT_TRACE_TOKEN/OPEN_PLAT_BOOTSTRAP_TOKEN 或 WORKFLOW_AUTH_TOKEN，跳过 Sirius 宽召回。",
+            "notes": "未配置 OPEN_PLAT_ZS_OPEN_TOKEN 或 WORKFLOW_AUTH_TOKEN，跳过 Sirius 宽召回。",
             "query_variants": query_variants,
             "upper_bound_scope": "open_label",
             "auth_token_source": auth_source,
@@ -2850,7 +2850,6 @@ def _format_upper_bound_assertion_relations(rows: list[dict[str, Any]], *, limit
 
 ASSERTION_ROLE_DISPLAY = {
     "expected_required": "应覆盖事实",
-    "missing_expected": "遗漏事实",
     "answer_claim": "答案 claim",
     "unsupported_claim": "未支持 claim",
 }
@@ -3855,7 +3854,7 @@ def _infer_knowledge_detail_reference(doc: dict[str, Any]) -> dict[str, str] | N
 
 
 def _knowledge_detail_auth_token() -> tuple[str, str]:
-    for name in ("KNOWLEDGE_DETAIL_TOKEN", "OPEN_PLAT_TRACE_TOKEN", "OPEN_PLAT_BOOTSTRAP_TOKEN"):
+    for name in ("KNOWLEDGE_DETAIL_TOKEN", "OPEN_PLAT_ZS_OPEN_TOKEN"):
         value = os.getenv(name, "").strip()
         if value:
             return value, name
@@ -4130,7 +4129,6 @@ EVALUATION_LABEL_NAMES = {
 
 ASSERTION_ROLES = {
     "expected_required",
-    "missing_expected",
     "answer_claim",
     "unsupported_claim",
     "constraint_check",
@@ -4208,29 +4206,16 @@ def _looks_like_diagnostic_text(text: Any) -> bool:
 
 def _normalize_assertion_role(value: Any, default_role: str) -> str:
     role = str(value or default_role or "").strip()
-    aliases = {
-        "required": "expected_required",
-        "expected": "expected_required",
-        "expected_point": "expected_required",
-        "expected_required": "expected_required",
-        "missing": "expected_required",
-        "missing_point": "expected_required",
-        "missing_expected": "expected_required",
-        "claim": "answer_claim",
-        "answer_claim": "answer_claim",
-        "unsupported": "unsupported_claim",
-        "unsupported_claim": "unsupported_claim",
-        "contradicted": "unsupported_claim",
-        "constraint": "constraint_check",
-        "constraint_check": "constraint_check",
-        "scope": "constraint_check",
-        "citation": "citation_check",
-        "citation_check": "citation_check",
-        "consistency": "consistency_check",
-        "consistency_check": "consistency_check",
-        "contradiction": "consistency_check",
-    }
-    return aliases.get(role, role if role in ASSERTION_ROLES else default_role)
+    if not role:
+        return default_role
+    if role in ASSERTION_ROLES:
+        return role
+    raise V3Error(
+        "E_ASSERTION_ROLE_INVALID",
+        "Assertion role is not accepted. Use only the current canonical role names.",
+        status_code=2,
+        details={"role": role, "allowed_roles": sorted(ASSERTION_ROLES)},
+    )
 
 
 def _canonical_assertion_source(_: Any = None) -> str:
@@ -4247,6 +4232,35 @@ def _assertion_item_text(item: Any) -> str:
         value = item.get("text") or item.get("point") or item.get("content") or item.get("value") or item.get("claim") or item.get("assertion") or item.get("fact")
         return _clean_point_text(value)
     return _clean_point_text(item)
+
+
+def _canonical_host_assertion_text(item: Any) -> Any:
+    if not isinstance(item, dict):
+        raise V3Error(
+            "E_ASSERTION_ITEM_INVALID",
+            "host_agent.answer_claim items must be objects using the current field contract.",
+            status_code=2,
+            details={"required_fields": ["text", "role"]},
+        )
+    if "text" not in item:
+        raise V3Error(
+            "E_ASSERTION_FIELD_INVALID",
+            "host_agent.answer_claim items must use the canonical text field.",
+            status_code=2,
+            details={"required_field": "text"},
+        )
+    return item.get("text")
+
+
+def _canonical_host_assertion_role(item: dict[str, Any], default_role: str) -> str:
+    if "role" not in item:
+        raise V3Error(
+            "E_ASSERTION_FIELD_INVALID",
+            "host_agent.answer_claim items must use the canonical role field.",
+            status_code=2,
+            details={"required_field": "role"},
+        )
+    return _normalize_assertion_role(item.get("role"), default_role)
 
 
 def _legacy_assertion_fields(request_dict: dict[str, Any]) -> list[str]:
@@ -4550,17 +4564,17 @@ def _expected_knowledge_points(request_dict: dict[str, Any]) -> list[dict[str, A
 
     def add_point_item(item: Any, source: str, default_confidence: float, default_role: str) -> None:
         if isinstance(item, dict):
-            value = item.get("text") or item.get("point") or item.get("content") or item.get("value") or item.get("claim") or item.get("assertion") or item.get("fact")
+            value = _canonical_host_assertion_text(item)
             confidence = item.get("confidence", default_confidence)
             try:
                 confidence_value = float(confidence)
             except (TypeError, ValueError):
                 confidence_value = default_confidence
-            role = _normalize_assertion_role(item.get("role") or item.get("assertion_role"), default_role)
+            role = _canonical_host_assertion_role(item, default_role)
             source_value = _canonical_assertion_source(item.get("source") or source)
             add(value, source_value, confidence_value, role, item)
         else:
-            add(item, source, default_confidence, default_role)
+            _canonical_host_assertion_text(item)
 
     for item in _host_answer_claim_items(request_dict):
         add_point_item(item, CANONICAL_ASSERTION_SOURCE, 0.55, "answer_claim")
@@ -4579,17 +4593,13 @@ def _normalize_assertion_inputs(request_dict: dict[str, Any]) -> dict[str, Any]:
 
     def add(item: Any, default_role: str, default_confidence: float) -> None:
         if isinstance(item, dict):
-            text = item.get("text") or item.get("point") or item.get("content") or item.get("value") or item.get("claim") or item.get("assertion") or item.get("fact")
-            role = _normalize_assertion_role(item.get("role") or item.get("assertion_role"), default_role)
+            text = _canonical_host_assertion_text(item)
+            role = _canonical_host_assertion_role(item, default_role)
             confidence_raw = item.get("confidence", default_confidence)
             basis = [str(value).strip() for value in _as_list(item.get("basis")) if str(value).strip()]
             why_required = _clean_point_text(item.get("why_required"))
         else:
-            text = item
-            role = default_role
-            confidence_raw = default_confidence
-            basis = []
-            why_required = ""
+            _canonical_host_assertion_text(item)
         cleaned = _clean_point_text(text)
         if not cleaned:
             return

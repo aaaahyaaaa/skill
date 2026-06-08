@@ -26,13 +26,13 @@ Probe 缓存位于 `~/.findreason/cache/<workspace_id>/<log_id>/`。传入 `--no
 - `claim_back_recall`：`host_agent.answer_claim` 项，包括 `expected_required`、`answer_claim` 和其他检查对象。
 - `query_wide_recall`：原 query / rewrite query 只作为召回 query variant，不能作为 expected assertion。
 
-当前 P0 实现会在 trace-local candidate docs 中匹配这些信号，并输出 `evidence_type=inferred_oracle`。输出契约兼容后续接入实时 KB recall 后端。
+当前 P0 实现会在 trace-local candidate docs 中匹配这些信号，并输出 `evidence_type=inferred_oracle`。输出契约预留后续接入实时 KB recall 后端。
 
 `probe-knowledge-detail` 默认只使用 trace/provided id 做三态判断；如果配置了 `KNOWLEDGE_DETAIL_URL`，会尝试把 trace docs 中的飞书 / OceanEngine 链接解析为 `source + identifier`，调用 `GET /api/sirius_knowledge/v1/data/doc/record_id?source=...&identifier=...` 形态的详情接口，并在 `raw_artifacts.knowledge_detail.fetched_docs` 中记录 title/link/content excerpt/split count 等有界摘要。接口错误、鉴权失败或链接无法解析时保持 `knowledge_exists=unknown` 或沿用 trace id 证据，不直接判 `suspected_knowledge_missing`。
 
 它会与 `probe-wide-recall` 一起构建断言覆盖矩阵：
 
-- `host_agent.answer_claim`：向后兼容的 assertion set 输入，使用嵌套结构 `{"host_agent": {"answer_claim": [...]}}`。每项会归一化为 `expected_knowledge_points` 输出，字段包括 `text`、`role`、`source` 和可选 `basis`、`why_required`、`confidence`、`merged_from`。核心 role 是 `expected_required` 和 `answer_claim`；`missing_expected` 仅作为兼容输入映射到 `expected_required`。`constraint_check`、`citation_check`、`consistency_check` 用于 probe-v1 planning，不直接驱动上游断点；`source` 归一化为 `host_agent.answer_claim`。
+- `host_agent.answer_claim`：唯一 assertion set 输入，使用嵌套结构 `{"host_agent": {"answer_claim": [...]}}`。每项必须是对象，包含当前字段 `text`、`role`，归一化后输出到 `expected_knowledge_points`，字段包括 `text`、`role`、`source` 和可选 `basis`、`why_required`、`confidence`、`merged_from`。核心 role 是 `expected_required` 和 `answer_claim`。`constraint_check`、`citation_check`、`consistency_check` 用于 probe-v1 planning，不直接驱动上游断点；`source` 归一化为 `host_agent.answer_claim`。
 - `expected_required` 会在进入 `point_coverage` 前做保守语义去重：如果两条断言是“场景约束 + 同一入口/路径要求”的包含或细化关系，CLI 合成一条，`basis` 取并集，原始断言写入 `merged_from`；未合并的原始断言不会重复进入覆盖矩阵。
 - CLI 不会把 `case_input.expected_knowledge_points`、`qa.answer_claims`、`qa.missing_expected_points`、`qa.unsupported_claims`、`qa.claim_alignments` 或 `judgement_evidence.signals[].assertions/fact_points/missing_expected_points` 当成断言来源。旧字段非空会报 `E_LEGACY_ASSERTION_INPUT`。
 - CLI 不得从 query 文本、评估器标签、空回复诊断或任意 rubric / judgement 片段中生成期望断言。没有 `expected_required` 时，`oracle_status.source=insufficient_assertions`。
