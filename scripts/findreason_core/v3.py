@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import time
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -27,13 +28,23 @@ SCHEMA_VERSION = "v3"
 DEFAULT_OPEN_PLAT_TRACE_DETAIL_URL = "http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail"
 DEFAULT_OPEN_PLAT_WORKSPACE_INFO_URL = "https://zhishang.bytedance.net/open-plat/api/workspace/get-workspace-info"
 DEFAULT_SIRIUS_RECALL_URL = "https://ad-sirius.bytedance.net/api/sirius_plugin/v1/recall"
+DEFAULT_KNOWLEDGE_DETAIL_TIMEOUT_SECONDS = 20
 SIRIUS_RECALL_PATH = "/api/sirius_plugin/v1/recall"
 RECALL_THRESHOLD_KEYS = {"score", "精选", "内容中台", "min_score"}
 JUDGEMENT_SIGNALS_LIMIT_BYTES = 2048
+KNOWLEDGE_DETAIL_SOURCES = {
+    "LARK_DOC",
+    "PERSONAL_LARK_DOC",
+    "COGNITION",
+    "COGNITION_FAQ",
+    "FAQ",
+    "LARK_WIKI",
+}
 
 STAGE_ORDER = ["preprocess", "knowledge", "retrieval", "rerank", "context", "answer", "evaluation"]
 CAUSE_ENUM = {
     "non_rag_route_boundary",
+    "workflow_input_loss",
     "query_rewrite_drift",
     "keyword_loss",
     "suspected_knowledge_missing",
@@ -52,6 +63,7 @@ CAUSE_ENUM = {
 }
 CAUSE_OWNER = {
     "non_rag_route_boundary": "agent_router_owner",
+    "workflow_input_loss": "workflow_input_owner",
     "query_rewrite_drift": "rag_preprocess_or_workflow_owner",
     "keyword_loss": "rag_preprocess_or_workflow_owner",
     "suspected_knowledge_missing": "kb_owner",
@@ -70,6 +82,7 @@ CAUSE_OWNER = {
 }
 CAUSE_PATTERN = {
     "non_rag_route_boundary": "query_understanding_break",
+    "workflow_input_loss": "query_understanding_break",
     "query_rewrite_drift": "query_understanding_break",
     "keyword_loss": "query_understanding_break",
     "suspected_knowledge_missing": "knowledge_gap_in_kb",
@@ -1520,6 +1533,9 @@ def _infer_verdicts(
     oracle_state = probe_state.get("oracle_status") if isinstance(probe_state.get("oracle_status"), dict) else {}
     assertion_insufficient = oracle_state.get("source") == "insufficient_assertions"
     required_assertions_all_covered = _required_assertions_all_covered(request_dict, probe_state)
+    expected_points = _expected_knowledge_points(request_dict)
+    workflow_input_signal = _workflow_input_boundary_signal(request_dict, ingest, expected_points)
+    preprocess_output_signal = _preprocess_output_boundary_signal(request_dict, ingest, expected_points)
     verdicts: list[dict[str, Any]] = []
 
     def join_short(values: list[str], limit: int = 3) -> str:
@@ -1537,15 +1553,55 @@ def _infer_verdicts(
         return "indeterminate"
 
     # preprocess
-    ev = builder.ensure_stage_evidence("preprocess", {"preprocess": preprocess})
+    ev = builder.ensure_stage_evidence(
+        "preprocess",
+        {
+            "preprocess": preprocess,
+            "workflow_input_boundary": workflow_input_signal,
+            "preprocess_output_boundary": preprocess_output_signal,
+        },
+    )
     if only_stages is not None and "preprocess" not in only_stages:
         verdicts.append(_verdict(stage="preprocess", status="not_probed", evidence_ids=ev, counterfactual=_counterfactual(False, "stage excluded by --only-stages")))
     elif case_input.get("is_knowledge_qa") is False:
         verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="non_rag_route_boundary", confidence=0.86, evidence_ids=ev, counterfactual=_counterfactual(True, "route would switch to non-RAG path", "route to the correct non-RAG/tool workflow", True, ev)))
+    elif workflow_input_signal.get("status") == "fail":
+        detail = "、".join(_string_list(workflow_input_signal.get("missing_terms"))[:5])
+        verdicts.append(
+            _verdict(
+                stage="preprocess",
+                status="fail",
+                candidate_cause="workflow_input_loss",
+                confidence=float(workflow_input_signal.get("confidence") or 0.78),
+                evidence_ids=ev,
+                counterfactual=_counterfactual(
+                    True,
+                    f"workflow input lost required user-context constraints: {detail}",
+                    "preserve the original user question/context before invoking the workflow",
+                    True,
+                    ev,
+                ),
+            )
+        )
     elif preprocess.get("rewrite_drift"):
         verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="query_rewrite_drift", confidence=0.8, evidence_ids=ev, counterfactual=_counterfactual(True, "rewrite drift changes retrieval input", "preserve the original user intent in rewrite_query", True, ev)))
     elif preprocess.get("keyword_loss"):
         verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="keyword_loss", confidence=0.8, evidence_ids=ev, counterfactual=_counterfactual(True, "keyword loss changes retrieval candidates", "preserve key entities before retrieval", True, ev)))
+    elif preprocess_output_signal.get("status") == "fail":
+        detail = "、".join(_string_list(preprocess_output_signal.get("missing_terms"))[:5])
+        cause = str(preprocess_output_signal.get("cause") or "query_rewrite_drift")
+        reason = "rewrite drift changes retrieval input" if cause == "query_rewrite_drift" else "keyword loss changes retrieval candidates"
+        fix = "preserve the workflow input constraints in rewrite_query" if cause == "query_rewrite_drift" else "preserve workflow input constraints in extracted keywords"
+        verdicts.append(
+            _verdict(
+                stage="preprocess",
+                status="fail",
+                candidate_cause=cause,
+                confidence=float(preprocess_output_signal.get("confidence") or 0.76),
+                evidence_ids=ev,
+                counterfactual=_counterfactual(True, f"{reason}: {detail}", fix, True, ev),
+            )
+        )
     elif preprocess.get("rewrite_query") or preprocess.get("keywords"):
         verdicts.append(_verdict(stage="preprocess", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "stage healthy")))
     else:
@@ -2182,6 +2238,7 @@ STATUS_DISPLAY = {
 
 CAUSE_DISPLAY = {
     "non_rag_route_boundary": "非 RAG 路由边界",
+    "workflow_input_loss": "Workflow 输入丢失",
     "query_rewrite_drift": "Query 改写偏移",
     "keyword_loss": "关键词丢失",
     "suspected_knowledge_missing": "疑似知识缺失",
@@ -2198,6 +2255,7 @@ CAUSE_DISPLAY = {
 
 OWNER_DISPLAY = {
     "manual_review": "人工复核",
+    "workflow_input_owner": "Workflow 输入负责人",
     "preprocess_owner": "输入改写负责人",
     "knowledge_owner": "知识库负责人",
     "retrieval_owner": "召回负责人",
@@ -2276,6 +2334,15 @@ def _display_reason(reason: Any) -> str:
     if text.startswith(prefix):
         stage = text[len(prefix) :]
         return f"上游阶段 {_display_stage(stage)} 还无法判定，所以本阶段暂不继续下钻。"
+    prefix = "workflow input lost required user-context constraints: "
+    if text.startswith(prefix):
+        return f"Workflow 原始输入丢失了用户实际问题中的关键场景约束：{text[len(prefix):]}"
+    prefix = "rewrite drift changes retrieval input: "
+    if text.startswith(prefix):
+        return f"预处理改写丢失了会影响召回输入的关键约束：{text[len(prefix):]}"
+    prefix = "keyword loss changes retrieval candidates: "
+    if text.startswith(prefix):
+        return f"关键词抽取丢失了会影响候选集的关键约束：{text[len(prefix):]}"
     prefix = "recall stage has no supporting docs for required assertions: "
     if text.startswith(prefix):
         return f"理论召回上界也没有找到可承载这些必要断言的文档：{text[len(prefix):]}"
@@ -2311,6 +2378,252 @@ def _selected_workflow_io(ingest: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("selected"):
             return item
     return next((item for item in items if isinstance(item, dict)), {})
+
+
+BOUNDARY_PHRASE_MARKERS = (
+    "场景",
+    "页面",
+    "活动",
+    "计划",
+    "入口",
+    "路径",
+    "账户",
+    "账号",
+    "产品",
+    "品牌",
+    "店铺",
+    "人群",
+    "模型",
+    "指标",
+    "维度",
+    "周期",
+    "时间",
+    "步骤",
+    "设置",
+)
+
+BOUNDARY_STOPWORDS = {
+    "入口",
+    "路径",
+    "场景",
+    "页面",
+    "活动",
+    "计划",
+    "正确",
+    "回答",
+    "覆盖",
+    "用户",
+    "问题",
+    "答案",
+    "输出",
+    "应该",
+    "应",
+}
+
+
+def _normalize_boundary_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _contains_boundary_term(container: Any, term: str) -> bool:
+    needle = _normalize_boundary_text(term)
+    if len(needle) < 2:
+        return False
+    return needle in _normalize_boundary_text(container)
+
+
+def _nested_value(value: Any, path: list[str]) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _workflow_input_query(ingest: dict[str, Any]) -> str:
+    workflow_io = _selected_workflow_io(ingest)
+    workflow_input = workflow_io.get("input") if isinstance(workflow_io, dict) else {}
+    for path in (["sys", "query"], ["query"], ["input", "query"], ["question"], ["text"], ["content"]):
+        value = _nested_value(workflow_input, path) if path else None
+        if value not in (None, ""):
+            return re.sub(r"\s+", " ", str(value)).strip()
+    return ""
+
+
+def _preprocess_query_text(preprocess: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("rewrite_query", "query", "normalized_query"):
+        if preprocess.get(key):
+            parts.append(str(preprocess.get(key)))
+    keywords = preprocess.get("keywords") or preprocess.get("keyword")
+    if isinstance(keywords, dict):
+        for key in ("words", "keywords", "items"):
+            parts.extend(_string_list(keywords.get(key)))
+    else:
+        parts.extend(_string_list(keywords))
+    return " ".join(part for part in parts if part).strip()
+
+
+def _judgement_user_context_text(request_dict: dict[str, Any]) -> str:
+    judgement = request_dict.get("judgement_evidence") if isinstance(request_dict.get("judgement_evidence"), dict) else {}
+    parts: list[str] = []
+    for signal in judgement.get("signals") or []:
+        values: list[Any]
+        if isinstance(signal, dict):
+            values = [signal.get("evidence_text"), signal.get("reason"), signal.get("query_context")]
+        else:
+            values = [signal]
+        for value in values:
+            text = str(value or "")
+            if not text:
+                continue
+            for clause in re.split(r"[。；;\n\r，,]+", text):
+                clause = clause.strip()
+                if not clause:
+                    continue
+                if any(marker in clause for marker in ("用户", "上下文", "截图", "问题", "询问", "问的是", "场景", "页面", "query")) and not any(marker in clause for marker in ("正确答案", "正确输出", "应覆盖", "应回答", "Agent", "回复", "反而")):
+                    parts.append(clause)
+    return " ".join(parts)
+
+
+def _user_question_surface(request_dict: dict[str, Any]) -> str:
+    case_input = request_dict.get("case_input") if isinstance(request_dict.get("case_input"), dict) else {}
+    parts = [
+        case_input.get("query"),
+        case_input.get("query_text"),
+        case_input.get("query_hint"),
+        case_input.get("user_query"),
+        case_input.get("trace_query"),
+        case_input.get("chat_history"),
+        request_dict.get("query_text"),
+        request_dict.get("query_hint"),
+        request_dict.get("chat_history"),
+        _judgement_user_context_text(request_dict),
+    ]
+    return " ".join(str(item) for item in parts if item not in (None, ""))
+
+
+def _strip_assertion_prefix(text: str) -> str:
+    cleaned = re.sub(r"^(正确答案|正确输出|答案|输出)?应(该)?(在|覆盖|回答|说明|给出|包含)?", "", text)
+    cleaned = re.sub(r"^(用户截图所处的|用户问题中的|用户上下文中的)", "", cleaned)
+    return cleaned.strip(" ：:，,、。；;")
+
+
+def _add_boundary_term(terms: list[str], term: str) -> None:
+    cleaned = _strip_assertion_prefix(term)
+    cleaned = re.sub(r"^(在|的|需|需要|应|应该|覆盖|回答|说明|给出)+", "", cleaned)
+    cleaned = re.sub(r"(场景下.*|场景内.*|下回答.*|位置$|对应.*)$", "", cleaned).strip(" ：:，,、。；;")
+    if not cleaned:
+        return
+    if cleaned in BOUNDARY_STOPWORDS:
+        return
+    normalized = _normalize_boundary_text(cleaned)
+    if len(normalized) < 2 or len(normalized) > 30:
+        return
+    if cleaned not in terms:
+        terms.append(cleaned)
+
+
+def _boundary_terms(text: Any) -> list[str]:
+    raw = str(text or "")
+    terms: list[str] = []
+    for term in _probe_literal_terms(raw):
+        _add_boundary_term(terms, term)
+    for marker in ("入口", "路径"):
+        for match in re.finditer(marker, raw):
+            prefix = raw[max(0, match.start() - 30) : match.start()]
+            prefix = re.split(r"[，,；;。]|例如|比如|或|以及", prefix)[-1]
+            _add_boundary_term(terms, prefix + marker)
+    compact_chunks = re.split(r"[\s，,。；;、/|（）()「」【】《》]+", raw)
+    for chunk in compact_chunks:
+        cleaned = _strip_assertion_prefix(chunk)
+        if not cleaned:
+            continue
+        if any(marker in cleaned for marker in BOUNDARY_PHRASE_MARKERS):
+            _add_boundary_term(terms, cleaned)
+    return terms[:14]
+
+
+def _terms_grounded_in_context(assertion_text: str, context_text: str) -> list[str]:
+    terms: list[str] = []
+    for term in _boundary_terms(assertion_text):
+        if _contains_boundary_term(context_text, term):
+            _add_boundary_term(terms, term)
+    return terms
+
+
+def _workflow_input_boundary_signal(request_dict: dict[str, Any], ingest: dict[str, Any], expected_points: list[dict[str, Any]]) -> dict[str, Any]:
+    workflow_query = _workflow_input_query(ingest)
+    user_surface = _user_question_surface(request_dict)
+    required_points = _required_assertion_points(expected_points)
+    if not workflow_query or not user_surface or not required_points:
+        return {
+            "status": "not_enough_evidence",
+            "user_question_surface": _report_short_text(user_surface, limit=420),
+            "workflow_input_query": workflow_query,
+            "missing_terms": [],
+        }
+    missing_terms: list[str] = []
+    affected_assertions: list[str] = []
+    for point in required_points:
+        text = str(point.get("text") or "")
+        grounded_terms = _terms_grounded_in_context(text, user_surface)
+        point_missing = [term for term in grounded_terms if not _contains_boundary_term(workflow_query, term)]
+        if point_missing:
+            for term in point_missing:
+                _add_boundary_term(missing_terms, term)
+            affected_assertions.append(text)
+    status = "fail" if missing_terms else "pass"
+    return {
+        "status": status,
+        "user_question_surface": _report_short_text(user_surface, limit=420),
+        "workflow_input_query": workflow_query,
+        "missing_terms": missing_terms[:8],
+        "affected_assertions": affected_assertions[:5],
+        "confidence": 0.82 if status == "fail" else 0.7,
+    }
+
+
+def _preprocess_output_boundary_signal(request_dict: dict[str, Any], ingest: dict[str, Any], expected_points: list[dict[str, Any]]) -> dict[str, Any]:
+    workflow_query = _workflow_input_query(ingest)
+    preprocess = request_dict.get("preprocess") if isinstance(request_dict.get("preprocess"), dict) else {}
+    preprocess_text = _preprocess_query_text(preprocess)
+    required_points = _required_assertion_points(expected_points)
+    if not workflow_query or not preprocess_text or not required_points:
+        return {
+            "status": "not_enough_evidence",
+            "workflow_input_query": workflow_query,
+            "preprocess_output": preprocess_text,
+            "missing_terms": [],
+        }
+    missing_terms: list[str] = []
+    affected_assertions: list[str] = []
+    for point in required_points:
+        text = str(point.get("text") or "")
+        grounded_terms = _terms_grounded_in_context(text, workflow_query)
+        point_missing = [term for term in grounded_terms if not _contains_boundary_term(preprocess_text, term)]
+        if point_missing:
+            for term in point_missing:
+                _add_boundary_term(missing_terms, term)
+            affected_assertions.append(text)
+    if not missing_terms:
+        return {
+            "status": "pass",
+            "workflow_input_query": workflow_query,
+            "preprocess_output": preprocess_text,
+            "missing_terms": [],
+        }
+    cause = "query_rewrite_drift" if preprocess.get("rewrite_query") else "keyword_loss"
+    return {
+        "status": "fail",
+        "cause": cause,
+        "workflow_input_query": workflow_query,
+        "preprocess_output": preprocess_text,
+        "missing_terms": missing_terms[:8],
+        "affected_assertions": affected_assertions[:5],
+        "confidence": 0.78,
+    }
 
 
 def _stage_key_basis(verdict: dict[str, Any]) -> str:
@@ -2533,6 +2846,27 @@ def _format_judgement_signals(request_dict: dict[str, Any], *, limit: int = 4) -
     return lines
 
 
+def _format_input_boundary_summary(input_signal: dict[str, Any], preprocess_signal: dict[str, Any]) -> list[str]:
+    workflow_query = input_signal.get("workflow_input_query") or preprocess_signal.get("workflow_input_query")
+    preprocess_output = preprocess_signal.get("preprocess_output")
+    lines = [
+        f"- 用户实际问题/评估问题线索：{_report_short_text(input_signal.get('user_question_surface'), limit=260)}",
+        f"- Workflow 原始输入：{_report_short_text(workflow_query, limit=220)}",
+        f"- 预处理输出：{_report_short_text(preprocess_output, limit=220)}",
+    ]
+    if input_signal.get("status") == "fail":
+        missing = "、".join(_string_list(input_signal.get("missing_terms"))[:8])
+        lines.append(f"- 输入边界判断：Workflow 原始输入丢失用户实际问题中的关键约束：{missing}")
+    elif preprocess_signal.get("status") == "fail":
+        missing = "、".join(_string_list(preprocess_signal.get("missing_terms"))[:8])
+        lines.append(f"- 输入边界判断：Workflow 原始输入保留了关键约束，但预处理输出丢失：{missing}")
+    elif input_signal.get("status") == "pass":
+        lines.append("- 输入边界判断：用户实际问题中的关键约束已进入 Workflow 原始输入。")
+    else:
+        lines.append("- 输入边界判断：缺少用户实际问题、Workflow 原始输入或 expected_required，无法自动比较。")
+    return lines
+
+
 def _format_assertion_items(items: list[dict[str, Any]], *, roles: set[str], limit: int = 6) -> list[str]:
     rows = [item for item in items if isinstance(item, dict) and str(item.get("role") or "") in roles]
     if not rows:
@@ -2590,6 +2924,9 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     point_rows = _format_point_coverage_table(point_coverage)
     upper_bound_relation_rows = _format_upper_bound_assertion_relations(point_coverage)
     all_assertions = _expected_knowledge_points(request_dict)
+    input_boundary_signal = _workflow_input_boundary_signal(request_dict, ingest, all_assertions)
+    preprocess_output_signal = _preprocess_output_boundary_signal(request_dict, ingest, all_assertions)
+    input_boundary_rows = _format_input_boundary_summary(input_boundary_signal, preprocess_output_signal)
     missing_point_rows = [row for row in point_coverage if isinstance(row, dict) and row.get("missing_stage") == "knowledge"]
     retrieval_point_rows = [row for row in point_coverage if isinstance(row, dict) and row.get("missing_stage") == "retrieval"]
     rerank_point_rows = [row for row in point_coverage if isinstance(row, dict) and row.get("missing_stage") == "rerank"]
@@ -2658,6 +2995,24 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         else "未配置"
     )
     qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
+    workflow_output = workflow_io.get("output") if isinstance(workflow_io.get("output"), dict) else {}
+    answer_text = (
+        qa.get("answer")
+        or qa.get("final_answer")
+        or _nested_value(workflow_output, ["answer"])
+        or _nested_value(workflow_output, ["end"])
+        or _nested_value(workflow_output, ["output"])
+    )
+    answer_status = "已给出答案" if str(answer_text or "").strip() else "未给出答案"
+    answer_signal_pairs = [
+        ("prompt_supports_answer", qa.get("prompt_supports_answer")),
+        ("answer_satisfies_expected", qa.get("answer_satisfies_expected")),
+        ("partial_answer", qa.get("partial_answer")),
+        ("wrong_citation", qa.get("wrong_citation")),
+        ("scope_violation", qa.get("scope_violation")),
+        ("branching_unclear", qa.get("branching_unclear")),
+    ]
+    answer_signal_text = "，".join(f"{key}=`{value}`" for key, value in answer_signal_pairs if value is not None) or "无结构化答案检查信号"
     breakpoint_lines: list[str] = []
     if missing_point_rows:
         breakpoint_lines.append("- 知识缺口：" + "；".join(_report_short_text(row.get("text"), limit=120) for row in missing_point_rows[:4]))
@@ -2674,59 +3029,48 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     report = [
         "# FindReason 归因报告",
         "",
-        "## 结论",
+        "## 1. 结论摘要",
         "",
         *primary_lines,
         f"- Case 判定：{_display_assessment(assessment_status)}",
-        f"- 判定原因：{_report_short_text(assessment_reason, limit=260)}",
+        f"- 一句话原因：{_report_short_text(assessment_reason, limit=260)}",
         f"- 是否需要人工复核：`{human_review}`",
         f"- 失败模式：`{', '.join(result.get('failure_patterns') or []) or '无'}`",
         f"- 选择依据：{_report_short_text(rationale or '证据不足，需要补充探针或人工复核。', limit=320)}",
         "",
-        "## Case 摘要",
+        "## 2. 问题与答案观察",
         "",
         f"- log_id：`{result.get('log_id') or ingest.get('log_id') or ''}`",
         f"- workspace_id：`{result.get('workspace_id') or ingest.get('workspace_id') or ''}`",
         f"- app_id：`{result.get('app_id') or ingest.get('app_id') or case_input.get('app_id') or ''}`",
         f"- 用户问题：{_report_short_text(case_input.get('query'), limit=260)}",
+        f"- 答案状态：{answer_status}",
+        f"- 原始答案：{_report_short_text(answer_text, limit=360)}",
+        f"- 答案检查信号：{answer_signal_text}",
         f"- 证据来源：{'fornax_trace' if trace_summary.get('has_middle_node_trace') else 'trace_or_replay_incomplete'}",
         f"- 线上文档数量：origin=`{counts.get('origin_doc_list', 0)}`，faq=`{counts.get('origin_faq_list', 0)}`，rerank=`{counts.get('rerank_docs', 0)}`，prompt=`{counts.get('prompt_docs', 0)}`",
-        "",
-        "### 原始 Workflow 输入输出",
-        "",
-        f"- workflow_span_id：`{workflow_io.get('span_id') or ''}`",
-        f"- workflow_node_id：`{workflow_io.get('node_id') or ''}`",
-        "- 以下为原始 input/output 摘录；完整值见 `final/attribution_record.json.raw_artifacts.workflow_span_ios`。",
-        "",
-        "#### 输入",
-        "",
-        "```json",
-        _report_json_excerpt(workflow_io.get("input")),
-        "```",
-        "",
-        "#### 输出",
-        "",
-        "```json",
-        _report_json_excerpt(workflow_io.get("output")),
-        "```",
         "",
         "### 评估器线索",
         "",
         *_format_judgement_signals(request_dict),
         "",
-        "## 断言覆盖",
+        "### 输入边界",
         "",
-        "### expected_required",
+        *input_boundary_rows,
+        "",
+        "## 3. 必要断言",
+        "",
+        "### 正确答案必须覆盖",
         "",
         *_format_assertion_items(all_assertions, roles=REQUIRED_ASSERTION_ROLES),
         "",
-        "### answer / check 观察",
+        "### 当前答案/检查观察",
         "",
         *_format_assertion_items(all_assertions, roles={"answer_claim", "unsupported_claim", "constraint_check", "citation_check", "consistency_check"}),
         "",
         "> 这些观察项只用于 answer grounding / scope / citation / consistency 检查，不进入 origin -> rerank -> prompt 的上游断言覆盖矩阵。",
         "",
-        "### 断言覆盖矩阵",
+        "## 4. 断言覆盖矩阵",
         "",
         *point_rows,
         "",
@@ -2734,7 +3078,7 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         "",
         *breakpoint_lines,
         "",
-        "## 召回上界",
+        "## 5. 召回上界与知识判断",
         "",
         f"- Oracle 来源：`{oracle_status.get('source', 'unknown')}`，置信度：`{oracle_status.get('confidence', 0)}`，冲突：`{oracle_status.get('conflict_detected', False)}`",
         f"- 理论召回上界状态：`{retrieval_state.get('theoretical_recall_status', 'not_configured')}`",
@@ -2748,19 +3092,37 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         "",
         *upper_bound_relation_rows,
         "",
-        "## Probe Plan 结果",
-        "",
-        *_format_probe_plan_summary(result),
-        "",
-        "## 阶段裁决",
+        "## 6. 阶段归因链路",
         "",
         "| 阶段 | 结论 | 关键依据 |",
         "|---|---|---|",
         *(stage_rows or ["| unknown | indeterminate | no evidence_chain |"]),
         "",
-        "## 下一步",
+        "## 7. Probe 结果",
+        "",
+        *_format_probe_plan_summary(result),
+        "",
+        "## 8. 下一步",
         "",
         actions,
+        "",
+        "## 附录：原始 Trace 摘录",
+        "",
+        "- 以下为 workflow input/output 有界摘录；完整值见 `final/attribution_record.json.raw_artifacts.workflow_span_ios`。",
+        f"- workflow_span_id：`{workflow_io.get('span_id') or ''}`",
+        f"- workflow_node_id：`{workflow_io.get('node_id') or ''}`",
+        "",
+        "### Workflow 输入",
+        "",
+        "```json",
+        _report_json_excerpt(workflow_io.get("input")),
+        "```",
+        "",
+        "### Workflow 输出",
+        "",
+        "```json",
+        _report_json_excerpt(workflow_io.get("output")),
+        "```",
     ]
     return "\n".join(report).rstrip() + "\n"
 
@@ -2789,6 +3151,7 @@ def _next_actions(
         "unsupported_claim": "修正答案生成约束，要求只基于 prompt_docs 作答。",
         "wrong_citation": "修正引用映射和 citation 选择策略。",
         "partial_answer": "补齐答案覆盖策略，避免部分证据被当成完整回答。",
+        "workflow_input_loss": "检查评估入口、case 构造和调用 workflow 前的参数映射，确保用户实际问题、截图/上下文约束进入 Workflow 原始输入。",
         "query_rewrite_drift": "优化 rewrite prompt 或对该类 query 关闭/绕过 rewrite。",
         "keyword_loss": "调优关键词抽取并强制保留关键实体。",
         "non_rag_route_boundary": "将 case 分流到正确的非 RAG 或工具规划路径。",
@@ -3199,7 +3562,7 @@ def _compute_probe(probe_name: str, request_dict: dict[str, Any], ingest: dict[s
     if probe_name == "probe-self-oracle":
         return _probe_self_oracle(probe_name, request_dict, params)
     if probe_name == "probe-knowledge-detail":
-        return _probe_knowledge_detail(probe_name, request_dict, params)
+        return _probe_knowledge_detail(probe_name, request_dict, ingest, params)
     if probe_name == "probe-permission-check":
         return _probe_permission_check(probe_name, request_dict, params)
     if probe_name == "probe-wide-recall":
@@ -3252,6 +3615,18 @@ def _all_docs(request_dict: dict[str, Any]) -> list[dict[str, Any]]:
         *_docs_from_request(request_dict, "rerank", "prompt_docs"),
         *(_docs_from_request(request_dict, "reference", "support_docs") if isinstance(request_dict.get("reference"), dict) else []),
     ]
+
+
+def _trace_evidence_docs(ingest: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = ingest.get("raw_artifacts") if isinstance(ingest.get("raw_artifacts"), dict) else {}
+    evidence = raw.get("trace_evidence") if isinstance(raw.get("trace_evidence"), dict) else {}
+    docs: list[dict[str, Any]] = []
+    for key in ("origin_doc_list_raw", "origin_faq_list_raw", "rerank_docs_raw", "prompt_docs_raw"):
+        values = evidence.get(key)
+        if not isinstance(values, list):
+            continue
+        docs.extend(item for item in values if isinstance(item, dict))
+    return docs
 
 
 ORACLE_SIGNAL_SOURCES = ("judgement_back_recall", "claim_back_recall", "query_wide_recall")
@@ -3319,6 +3694,246 @@ def _unique_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         result.append(doc)
     return result
+
+
+def _first_doc_value(doc: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = doc.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _clean_detail_source(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    return upper if upper in KNOWLEDGE_DETAIL_SOURCES else ""
+
+
+def _infer_knowledge_detail_reference_from_url(url: str) -> dict[str, str] | None:
+    parsed = urlparse(str(url or "").strip())
+    host = parsed.netloc.lower()
+    path = unquote(parsed.path or "")
+    segments = [segment for segment in path.split("/") if segment]
+    if any(domain in host for domain in ("feishu.cn", "larksuite.com", "larkoffice.com")):
+        for marker in ("doc", "docx", "docs", "wiki", "sheets", "base"):
+            if marker in segments:
+                index = segments.index(marker)
+                if index + 1 < len(segments):
+                    identifier = segments[index + 1].strip()
+                    if identifier:
+                        return {"source": "LARK_DOC", "identifier": identifier, "basis": "url:feishu"}
+    ocean_match = re.search(r"/support/content/([^/?#]+)", path)
+    if "support.oceanengine.com" in host and ocean_match:
+        identifier = ocean_match.group(1).strip()
+        if identifier:
+            return {"source": "COGNITION", "identifier": identifier, "basis": "url:oceanengine_support_content"}
+    return None
+
+
+def _infer_knowledge_detail_reference(doc: dict[str, Any]) -> dict[str, str] | None:
+    source = _clean_detail_source(
+        _first_doc_value(doc, "knowledge_source", "detail_source", "doc_source", "document_source", "sourceType", "source_type", "source")
+    )
+    identifier = _first_doc_value(
+        doc,
+        "identifier",
+        "docToken",
+        "doc_token",
+        "documentToken",
+        "document_token",
+        "recordId",
+        "record_id",
+        "zhiShangId",
+        "zhishang_id",
+    )
+    if source and identifier:
+        return {"source": source, "identifier": identifier, "basis": "fields"}
+    for key in ("url", "link", "documentLink", "document_link", "docLink", "doc_link"):
+        value = _first_doc_value(doc, key)
+        if not value:
+            continue
+        inferred = _infer_knowledge_detail_reference_from_url(value)
+        if inferred:
+            return inferred
+    return None
+
+
+def _knowledge_detail_auth_token() -> tuple[str, str]:
+    for name in ("KNOWLEDGE_DETAIL_TOKEN", "OPEN_PLAT_TRACE_TOKEN", "OPEN_PLAT_BOOTSTRAP_TOKEN"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value, name
+    return "", "not_configured"
+
+
+def _knowledge_detail_endpoint(source: str, identifier: str) -> tuple[str, dict[str, str]]:
+    endpoint = os.getenv("KNOWLEDGE_DETAIL_URL", "").strip()
+    if not endpoint:
+        return "", {}
+    url = endpoint.replace("{source}", source).replace("{identifier}", identifier)
+    if "{source}" in endpoint or "{identifier}" in endpoint:
+        return url, {}
+    return url, {"source": source, "identifier": identifier}
+
+
+def _is_knowledge_detail_not_found(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    code = str(payload.get("code") or payload.get("status") or "").strip().lower()
+    message = str(payload.get("msg") or payload.get("message") or payload.get("error") or "").lower()
+    return code in {"404", "not_found", "notfound"} or any(term in message for term in ("not found", "不存在", "未找到"))
+
+
+def _unwrap_knowledge_detail_payload(payload: Any) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(payload, dict):
+        return None, "non_json_payload"
+    code = payload.get("code")
+    if code not in (None, 0, "0") and _is_knowledge_detail_not_found(payload):
+        return None, "not_found"
+    if code not in (None, 0, "0"):
+        return None, f"code={code}"
+    data: Any
+    if "data" in payload:
+        data = payload.get("data")
+    elif "result" in payload:
+        data = payload.get("result")
+    else:
+        data = payload
+    if data in (None, ""):
+        return None, "not_found"
+    if isinstance(data, dict):
+        for _ in range(2):
+            nested = data.get("data")
+            if not isinstance(nested, dict):
+                break
+            if any(key in data for key in ("title", "content", "identifier", "splits", "link")):
+                break
+            data = nested
+        return data, "ok"
+    return None, "unexpected_data_shape"
+
+
+def _split_text_from_detail(record: dict[str, Any]) -> str:
+    splits = record.get("splits") if isinstance(record.get("splits"), list) else []
+    parts: list[str] = []
+    for item in splits[:3]:
+        if isinstance(item, dict):
+            value = item.get("content") or item.get("text") or item.get("chunk") or item.get("summary")
+            if value not in (None, ""):
+                parts.append(str(value))
+        elif item not in (None, ""):
+            parts.append(str(item))
+    return "\n".join(parts)
+
+
+def _summarize_knowledge_detail_doc(doc: dict[str, Any], reference: dict[str, str], record: dict[str, Any]) -> dict[str, Any]:
+    content = str(record.get("content") or record.get("text") or "")
+    split_text = _split_text_from_detail(record)
+    excerpt_source = content or split_text
+    splits = record.get("splits") if isinstance(record.get("splits"), list) else []
+    return {
+        "doc_id": _doc_id(doc) or str(record.get("id") or ""),
+        "source": reference["source"],
+        "identifier": reference["identifier"],
+        "basis": reference.get("basis"),
+        "title": str(record.get("title") or record.get("documentName") or _doc_title(doc) or "").strip(),
+        "link": str(record.get("link") or record.get("documentLink") or doc.get("url") or doc.get("link") or "").strip(),
+        "content_available": bool(content.strip() or split_text.strip()),
+        "content_excerpt": re.sub(r"\s+", " ", excerpt_source).strip()[:500],
+        "split_count": len(splits),
+    }
+
+
+def _fetch_knowledge_doc_record(doc: dict[str, Any], reference: dict[str, str]) -> dict[str, Any]:
+    load_runtime_env()
+    endpoint, params = _knowledge_detail_endpoint(reference["source"], reference["identifier"])
+    if not endpoint:
+        return {"status": "not_configured", "doc_id": _doc_id(doc), "reference": reference}
+    headers = {"Accept": "application/json"}
+    token, token_source = _knowledge_detail_auth_token()
+    if token:
+        headers["Authorization"] = _authorization_header(token)
+    timeout = int(os.getenv("KNOWLEDGE_DETAIL_TIMEOUT_SECONDS") or DEFAULT_KNOWLEDGE_DETAIL_TIMEOUT_SECONDS)
+    try:
+        with httpx.Client(timeout=max(timeout, 1)) as client:
+            response = client.get(endpoint, params=params, headers=headers)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "doc_id": _doc_id(doc),
+            "reference": reference,
+            "endpoint": endpoint,
+            "params": params,
+            "token_source": token_source,
+            "error": str(exc)[:500],
+        }
+    if response.status_code == 404:
+        return {
+            "status": "not_found",
+            "doc_id": _doc_id(doc),
+            "reference": reference,
+            "endpoint": endpoint,
+            "params": params,
+            "token_source": token_source,
+        }
+    if response.status_code >= 400:
+        return {
+            "status": "error",
+            "doc_id": _doc_id(doc),
+            "reference": reference,
+            "endpoint": endpoint,
+            "params": params,
+            "token_source": token_source,
+            "error": f"HTTP {response.status_code}: {response.text[:300]}",
+        }
+    try:
+        payload = response.json()
+    except Exception:
+        return {
+            "status": "error",
+            "doc_id": _doc_id(doc),
+            "reference": reference,
+            "endpoint": endpoint,
+            "params": params,
+            "token_source": token_source,
+            "error": f"non-JSON response: {response.text[:300]}",
+        }
+    record, reason = _unwrap_knowledge_detail_payload(payload)
+    if reason == "not_found":
+        return {
+            "status": "not_found",
+            "doc_id": _doc_id(doc),
+            "reference": reference,
+            "endpoint": endpoint,
+            "params": params,
+            "token_source": token_source,
+        }
+    if not record:
+        return {
+            "status": "error",
+            "doc_id": _doc_id(doc),
+            "reference": reference,
+            "endpoint": endpoint,
+            "params": params,
+            "token_source": token_source,
+            "error": reason,
+        }
+    detail = _summarize_knowledge_detail_doc(doc, reference, record)
+    detail.update({"status": "ok", "endpoint": endpoint, "params": params, "token_source": token_source})
+    return detail
+
+
+def _knowledge_detail_candidate_docs(request_dict: dict[str, Any], ids: list[str], extra_docs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    docs = _unique_docs([*(extra_docs or []), *_all_docs(request_dict)])
+    wanted = {str(item) for item in ids if str(item).strip()}
+    if wanted:
+        matched = [doc for doc in docs if _doc_id(doc) in wanted]
+        if matched:
+            return matched[:10]
+    return docs[:10]
 
 
 def _oracle_tokens(text: Any) -> set[str]:
@@ -3401,11 +4016,6 @@ POINT_KEYWORDS = (
     "多久",
     "时间",
     "预警",
-    "短视频",
-    "全域",
-    "铺底",
-    "家居",
-    "素材",
 )
 
 EVALUATION_LABEL_NAMES = {
@@ -3606,6 +4216,194 @@ def _clean_point_text(value: Any) -> str:
     return text[:180].strip()
 
 
+ENTRY_REQUIREMENT_MARKERS = ("入口", "路径", "在哪", "哪里", "进入")
+ENTRY_CONTEXT_MARKERS = ("场景", "截图", "所处", "限定", "情况下")
+ENTRY_SUBFLOW_MARKERS = ("预算", "出价", "定向", "人群", "创意", "账户", "资质", "充值", "支付", "报表", "诊断", "赔付", "发票", "审核")
+ENTRY_ANCHOR_STOPWORDS = (
+    "正确输出",
+    "正确答案",
+    "应该",
+    "应",
+    "回答",
+    "说明",
+    "提供",
+    "覆盖",
+    "给出",
+    "具体",
+    "对应",
+    "相关",
+    "用户",
+    "截图",
+    "所处",
+    "场景",
+    "在",
+    "下",
+    "的",
+)
+
+
+def _compact_assertion_text(text: Any) -> str:
+    return re.sub(r"[\W_]+", "", str(text or "").lower())
+
+
+def _entry_requirement_anchor(value: Any) -> str:
+    text = _clean_point_text(value)
+    if not text or not any(marker in text for marker in ENTRY_REQUIREMENT_MARKERS):
+        return ""
+    candidates: list[str] = []
+    for marker in ("入口", "路径"):
+        for match in re.finditer(marker, text):
+            prefix = text[max(0, match.start() - 24) : match.start()]
+            prefix = re.split(r"[，,；;。]|例如|比如|或|以及", prefix)[-1]
+            for stopword in ENTRY_ANCHOR_STOPWORDS:
+                prefix = prefix.replace(stopword, "")
+            prefix = prefix.strip(" ：:，,、-—/（）()[]【】「」")
+            if 2 <= len(prefix) <= 18:
+                candidates.append(prefix)
+    candidates = [candidate for candidate in candidates if len(candidate) >= 2]
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: (len(item), item), reverse=True)
+    return candidates[0]
+
+
+def _longest_common_cjk_phrase(left: str, right: str) -> str:
+    left_text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "", left)
+    right_text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", "", right)
+    best = ""
+    for start in range(len(left_text)):
+        for end in range(start + max(4, len(best) + 1), len(left_text) + 1):
+            candidate = left_text[start:end]
+            if candidate in right_text and len(candidate) > len(best):
+                best = candidate
+    for stopword in ENTRY_ANCHOR_STOPWORDS:
+        best = best.replace(stopword, "")
+    return best
+
+
+def _is_same_entry_requirement(left_text: str, right_text: str) -> bool:
+    if not all(any(marker in text for marker in ENTRY_REQUIREMENT_MARKERS) for text in (left_text, right_text)):
+        return False
+    left_anchor = _entry_requirement_anchor(left_text)
+    right_anchor = _entry_requirement_anchor(right_text)
+    if left_anchor and right_anchor and (left_anchor in right_text or right_anchor in left_text or left_anchor == right_anchor):
+        return True
+    return len(_longest_common_cjk_phrase(left_text, right_text)) >= 4
+
+
+def _has_entry_context_constraint(text: str) -> bool:
+    return any(marker in text for marker in ENTRY_CONTEXT_MARKERS)
+
+
+def _has_conflicting_entry_subflow(left_text: str, right_text: str) -> bool:
+    left_terms = {term for term in ENTRY_SUBFLOW_MARKERS if term in left_text}
+    right_terms = {term for term in ENTRY_SUBFLOW_MARKERS if term in right_text}
+    return bool(left_terms ^ right_terms)
+
+
+def _entry_example_fragment(text: str) -> str:
+    match = re.search(r"(?:例如|比如)([^，。；;]+)", text)
+    if not match:
+        return ""
+    fragment = match.group(1).strip(" ：:，,、；;。")
+    return fragment if 2 <= len(fragment) <= 60 else ""
+
+
+def _should_merge_expected_required(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if str(left.get("role") or "") != "expected_required" or str(right.get("role") or "") != "expected_required":
+        return False
+    left_text = str(left.get("text") or "")
+    right_text = str(right.get("text") or "")
+    if not left_text or not right_text:
+        return False
+    left_key = _compact_assertion_text(left_text)
+    right_key = _compact_assertion_text(right_text)
+    if left_key and right_key and (left_key in right_key or right_key in left_key):
+        return True
+    if _has_conflicting_entry_subflow(left_text, right_text):
+        return False
+    if not (_has_entry_context_constraint(left_text) or _has_entry_context_constraint(right_text)):
+        return False
+    return _is_same_entry_requirement(left_text, right_text)
+
+
+def _merge_assertion_basis(*items: dict[str, Any]) -> list[str]:
+    basis: list[str] = []
+    for item in items:
+        for value in _as_list(item.get("basis")):
+            text = str(value).strip()
+            if text and text not in basis:
+                basis.append(text)
+    return basis
+
+
+def _assertion_audit_item(item: dict[str, Any]) -> dict[str, Any]:
+    copied = {
+        "text": item.get("text"),
+        "role": item.get("role"),
+        "source": item.get("source"),
+        "confidence": item.get("confidence"),
+    }
+    basis = [str(value).strip() for value in _as_list(item.get("basis")) if str(value).strip()]
+    if basis:
+        copied["basis"] = basis
+    why_required = _clean_point_text(item.get("why_required"))
+    if why_required:
+        copied["why_required"] = why_required
+    return {key: value for key, value in copied.items() if value not in (None, "", [])}
+
+
+def _merge_expected_required_text(left: str, right: str) -> str:
+    if _has_entry_context_constraint(right) and not _has_entry_context_constraint(left):
+        context_text, detail_text = right, left
+    elif _has_entry_context_constraint(left) and not _has_entry_context_constraint(right):
+        context_text, detail_text = left, right
+    else:
+        context_text, detail_text = (left, right) if len(left) >= len(right) else (right, left)
+    example = _entry_example_fragment(detail_text)
+    if example and example not in context_text:
+        for marker in ("或对应", "或其它", "或其他", "或"):
+            if marker in context_text:
+                return context_text.replace(marker, f"，例如{example}{marker}", 1)
+        return f"{context_text}，例如{example}"
+    return context_text
+
+
+def _combine_expected_required_assertions(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(left)
+    merged["text"] = _merge_expected_required_text(str(left.get("text") or ""), str(right.get("text") or ""))
+    merged["confidence"] = round(max(float(left.get("confidence") or 0.0), float(right.get("confidence") or 0.0)), 4)
+    basis = _merge_assertion_basis(left, right)
+    if basis:
+        merged["basis"] = basis
+    merged_from: list[dict[str, Any]] = []
+    for item in (left, right):
+        existing = item.get("merged_from")
+        if isinstance(existing, list) and existing:
+            merged_from.extend(sub_item for sub_item in existing if isinstance(sub_item, dict))
+        else:
+            merged_from.append(_assertion_audit_item(item))
+    merged["merged_from"] = merged_from
+    return merged
+
+
+def _merge_semantic_expected_required_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged_points: list[dict[str, Any]] = []
+    for point in points:
+        if str(point.get("role") or "") != "expected_required":
+            merged_points.append(point)
+            continue
+        for index, existing in enumerate(merged_points):
+            if _should_merge_expected_required(existing, point):
+                merged_points[index] = _combine_expected_required_assertions(existing, point)
+                break
+        else:
+            merged_points.append(point)
+    for index, point in enumerate(merged_points, start=1):
+        point["point_id"] = f"kp_{index:03d}"
+    return merged_points
+
+
 def _split_point_candidates(value: Any) -> list[str]:
     text = str(value or "")
     parts = re.split(r"[。；;\n\r]+", text)
@@ -3673,7 +4471,7 @@ def _expected_knowledge_points(request_dict: dict[str, Any]) -> list[dict[str, A
 
     for item in _host_answer_claim_items(request_dict):
         add_point_item(item, CANONICAL_ASSERTION_SOURCE, 0.55, "answer_claim")
-    return points[:20]
+    return _merge_semantic_expected_required_points(points)[:20]
 
 
 def _normalize_assertion_inputs(request_dict: dict[str, Any]) -> dict[str, Any]:
@@ -3793,6 +4591,13 @@ SUPPORT_PARTIAL_THRESHOLD = 0.3
 SUPPORT_ACCEPTED_STATUSES = {"full_support", "partial_support"}
 
 
+def _generic_matched_terms(point_text: str, target_text: str) -> list[str]:
+    phrase = _longest_common_cjk_phrase(point_text, target_text)
+    if 3 <= len(phrase) <= 24:
+        return [phrase]
+    return []
+
+
 def _support_span_candidates(text: Any, *, limit: int = 80) -> list[str]:
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if not normalized:
@@ -3849,6 +4654,7 @@ def _doc_support_evidence(point_text: str, doc: dict[str, Any], *, terms: list[s
     best_score = scored_spans[0][0] if scored_spans else 0.0
     best_terms = scored_spans[0][3] if scored_spans else []
     support_spans = [span for score, _, span, _ in scored_spans[:2] if score >= SUPPORT_PARTIAL_THRESHOLD]
+    fallback_terms = _generic_matched_terms(point_text, support_spans[0] if support_spans else body_text)
     missing_constraints = [term for term in terms if term and term not in (support_spans[0] if support_spans else body_text)]
 
     if best_score >= SUPPORT_FULL_THRESHOLD:
@@ -3863,7 +4669,7 @@ def _doc_support_evidence(point_text: str, doc: dict[str, Any], *, terms: list[s
         "support_status": status,
         "support_score": round(best_score, 4),
         "support_spans": support_spans[:2],
-        "matched_terms": (best_terms or lexical_terms)[:5],
+        "matched_terms": (best_terms or lexical_terms or fallback_terms)[:5],
         "missing_constraints": missing_constraints[:5],
         "score": doc_score,
     }
@@ -4325,28 +5131,104 @@ def _probe_self_oracle(probe_name: str, request_dict: dict[str, Any], params: di
     }
 
 
-def _probe_knowledge_detail(probe_name: str, request_dict: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+def _probe_knowledge_detail(probe_name: str, request_dict: dict[str, Any], ingest: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     ids = _expected_ids(request_dict, params)
-    known_ids = _doc_ids(_all_docs(request_dict))
+    trace_docs = _trace_evidence_docs(ingest)
+    known_ids = _doc_ids([*_all_docs(request_dict), *trace_docs])
     retrieval = request_dict.get("retrieval") or {}
-    if retrieval.get("knowledge_exists") is True or any(doc_id in known_ids for doc_id in ids):
+    load_runtime_env()
+    detail_endpoint_configured = bool(os.getenv("KNOWLEDGE_DETAIL_URL", "").strip())
+    candidates = _knowledge_detail_candidate_docs(request_dict, ids, trace_docs) if detail_endpoint_configured else []
+    fetched_docs: list[dict[str, Any]] = []
+    not_found_docs: list[dict[str, Any]] = []
+    detail_errors: list[dict[str, Any]] = []
+    unresolved_docs: list[dict[str, Any]] = []
+    if detail_endpoint_configured:
+        for doc in candidates:
+            reference = _infer_knowledge_detail_reference(doc)
+            if not reference:
+                unresolved_docs.append({"doc_id": _doc_id(doc), "title": _doc_title(doc), "reason": "missing_source_identifier"})
+                continue
+            fetched = _fetch_knowledge_doc_record(doc, reference)
+            if fetched.get("status") == "ok":
+                fetched_docs.append(fetched)
+            elif fetched.get("status") == "not_found":
+                not_found_docs.append(
+                    {
+                        "doc_id": fetched.get("doc_id") or _doc_id(doc),
+                        "source": reference.get("source"),
+                        "identifier": reference.get("identifier"),
+                        "basis": reference.get("basis"),
+                    }
+                )
+            elif fetched.get("status") != "not_configured":
+                detail_errors.append(
+                    {
+                        "doc_id": fetched.get("doc_id") or _doc_id(doc),
+                        "source": reference.get("source"),
+                        "identifier": reference.get("identifier"),
+                        "status": fetched.get("status"),
+                        "error": fetched.get("error"),
+                    }
+                )
+    trace_indicates_known = retrieval.get("knowledge_exists") is True or any(doc_id in known_ids for doc_id in ids)
+    if fetched_docs:
         state = "yes"
         status = "ok"
-        confidence = 0.86
+        confidence = 0.9
+    elif trace_indicates_known:
+        state = "yes"
+        status = "ok"
+        confidence = 0.86 if not detail_errors else 0.74
     elif retrieval.get("knowledge_exists") is False:
         state = "no"
         status = "ok"
         confidence = 0.82
+    elif detail_endpoint_configured and candidates and not_found_docs and len(not_found_docs) == len(candidates) and not detail_errors:
+        state = "no"
+        status = "ok"
+        confidence = 0.8
     else:
         state = "unknown"
         status = "indeterminate"
         confidence = 0.45
-    content = {"doc_ids": ids, "known_doc_ids": sorted(known_ids), "knowledge_exists": state, "retry_count": 1}
+    if fetched_docs:
+        detail_status = "ok"
+    elif detail_errors:
+        detail_status = "error"
+    elif not_found_docs:
+        detail_status = "not_found"
+    elif detail_endpoint_configured and candidates:
+        detail_status = "unresolved_reference"
+    else:
+        detail_status = "not_configured"
+    content = {
+        "doc_ids": ids,
+        "known_doc_ids": sorted(known_ids),
+        "knowledge_exists": state,
+        "retry_count": 1,
+        "detail_provider": "http_doc_record" if detail_endpoint_configured else "trace_ids",
+        "detail_status": detail_status,
+        "fetched_doc_ids": [str(item.get("doc_id") or "") for item in fetched_docs if item.get("doc_id")],
+        "content_available_doc_ids": [
+            str(item.get("doc_id") or "") for item in fetched_docs if item.get("doc_id") and item.get("content_available")
+        ],
+    }
     return {
         "status": status,
         "stage_signals": {"knowledge": content},
         "evidence_bundle": _probe_evidence(probe_name, "knowledge", content, confidence),
-        "raw_artifacts": {"note": "knowledge detail uses trace/provided ids unless live KB detail is configured by host"},
+        "raw_artifacts": {
+            "note": "knowledge detail uses trace/provided ids and optional live doc-record detail configured by KNOWLEDGE_DETAIL_URL",
+            "knowledge_detail": {
+                "provider": "http_doc_record",
+                "endpoint_configured": detail_endpoint_configured,
+                "fetched_docs": fetched_docs,
+                "not_found_docs": not_found_docs,
+                "detail_errors": detail_errors,
+                "unresolved_docs": unresolved_docs,
+            },
+        },
     }
 
 

@@ -288,6 +288,59 @@ class TraceServer:
         return f"http://{host}:{port}/open-plat/api/fornax/trace/detail"
 
 
+class KnowledgeDetailServer:
+    def __init__(self, records: dict[tuple[str, str], dict[str, Any]] | None = None) -> None:
+        self.records = records or {}
+        self.requests: list[dict[str, Any]] = []
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                from urllib.parse import parse_qs, urlparse
+
+                parsed = urlparse(self.path)
+                query = parse_qs(parsed.query)
+                source = (query.get("source") or [""])[0]
+                identifier = (query.get("identifier") or [""])[0]
+                parent.requests.append(
+                    {
+                        "method": "GET",
+                        "path": parsed.path,
+                        "query": {"source": source, "identifier": identifier},
+                        "headers": dict(self.headers),
+                    }
+                )
+                record = parent.records.get((source, identifier))
+                if record is None:
+                    raw = json.dumps({"code": 404, "msg": "not found", "data": None}, ensure_ascii=False).encode("utf-8")
+                else:
+                    raw = json.dumps({"code": 0, "data": record}, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> "KnowledgeDetailServer":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+
+    @property
+    def url(self) -> str:
+        host, port = self.server.server_address
+        return f"http://{host}:{port}/api/sirius_knowledge/v1/data/doc/record_id"
+
+
 def case_file(tmp_path: Path, **overrides: Any) -> Path:
     payload: dict[str, Any] = {
         "case": {
@@ -525,6 +578,82 @@ def test_report_explains_empty_assertion_matrix_needs_probe_plan() -> None:
     assert "run-probe-plan" in report
 
 
+def test_case_report_uses_readable_numbered_sections_and_trace_appendix(tmp_path: Path) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {
+            "query": "随心推铺底计划怎么设置",
+            "workspace_id": "55",
+            "app_id": "100",
+        },
+        "preprocess": {"rewrite_query": "随心推 铺底计划 设置"},
+        "retrieval": {
+            "knowledge_exists": None,
+            "theoretical_recall_status": "ok",
+            "upper_bound_scope": "open_label",
+            "theoretical_recall_topk": 50,
+            "theoretical_query_variants": ["随心推铺底计划怎么设置"],
+            "theoretical_recall_counts": {"total": 1},
+            "wide_recall_docs": [
+                {
+                    "id": "wide-setup-1",
+                    "title": "随心推铺底计划设置指南",
+                    "content": "随心推铺底计划支持在计划管理中进入铺底设置入口，并按步骤完成配置。",
+                }
+            ],
+            "origin_doc_list": [],
+        },
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": "可以在计划管理设置。"},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "随心推铺底计划的正确答案应说明设置入口和步骤",
+                    "role": "expected_required",
+                },
+                {"text": "答案只说可以在计划管理设置", "role": "answer_claim"},
+            ]
+        },
+    }
+    ingest = minimal_ingest(request)
+    ingest["raw_artifacts"]["workflow_span_ios"] = [
+        {
+            "span_id": "workflow",
+            "node_id": "node-1",
+            "selected": True,
+            "input": {"sys": {"query": "随心推铺底计划怎么设置"}},
+            "output": {"answer": "可以在计划管理设置。"},
+        }
+    ]
+
+    payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
+    report = payload["human_report_markdown"]
+
+    expected_order = [
+        "## 1. 结论摘要",
+        "## 2. 问题与答案观察",
+        "## 3. 必要断言",
+        "## 4. 断言覆盖矩阵",
+        "## 5. 召回上界与知识判断",
+        "### 理论召回上界与断言关系",
+        "## 6. 阶段归因链路",
+        "## 7. Probe 结果",
+        "## 8. 下一步",
+        "## 附录：原始 Trace 摘录",
+    ]
+    positions = [report.index(heading) for heading in expected_order]
+
+    assert positions == sorted(positions)
+    assert "原始答案：可以在计划管理设置。" in report
+    assert report.index("## 附录：原始 Trace 摘录") > report.index("## 8. 下一步")
+    assert "### 原始 Workflow 输入输出" not in report
+    assert "输入边界判断：用户实际问题中的关键约束已进入 Workflow 原始输入。" in report
+    assert "### 理论召回上界与断言关系" in report
+    assert "支持该断言：`wide-setup-1` 随心推铺底计划设置指南" in report
+
+
 def test_probe_rerank_bypass_is_auxiliary_without_assertion_gap(tmp_path: Path) -> None:
     with TraceServer(trace_payload()) as server:
         ingest_result = run_cli(
@@ -569,8 +698,8 @@ def test_probe_rerank_bypass_is_auxiliary_without_assertion_gap(tmp_path: Path) 
     assert payload["app_id"] == "100"
     report = payload["human_report_markdown"]
     assert "# FindReason 归因报告" in report
-    assert "## 阶段裁决" in report
-    assert "### 原始 Workflow 输入输出" in report
+    assert "## 6. 阶段归因链路" in report
+    assert "## 附录：原始 Trace 摘录" in report
     assert "- Workflow 输出：" not in report
     assert '"query": "云图是什么"' in report
     assert '"end": "云图是天气图片。"' in report
@@ -896,6 +1025,125 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
     assert payload["primary_cause"]["cause_code"] == "retrieval_miss"
 
 
+def test_knowledge_detail_reference_infers_source_and_identifier_from_links() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+
+    lark_ref = v3._infer_knowledge_detail_reference(
+        {"url": "https://bytedance.feishu.cn/doc/doccnGGktnmTzIBO13yUVzmd8rg?from=from_copylink"}
+    )
+    ocean_ref = v3._infer_knowledge_detail_reference(
+        {"documentLink": "https://support.oceanengine.com/support/content/140382?utm_source=x"}
+    )
+
+    assert lark_ref == {
+        "source": "LARK_DOC",
+        "identifier": "doccnGGktnmTzIBO13yUVzmd8rg",
+        "basis": "url:feishu",
+    }
+    assert ocean_ref == {
+        "source": "COGNITION",
+        "identifier": "140382",
+        "basis": "url:oceanengine_support_content",
+    }
+
+
+def test_probe_knowledge_detail_fetches_live_doc_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import build_probe_result
+
+    request = {
+        "case_input": {"query": "新客试投在哪里", "workspace_id": "55", "app_id": "100", "expected_knowledge_ids": ["55284"]},
+        "retrieval": {
+            "knowledge_exists": None,
+            "origin_doc_list": [
+                {
+                    "id": "55284",
+                    "title": "新客试投功能",
+                    "url": "https://bytedance.feishu.cn/doc/doccnGGktnmTzIBO13yUVzmd8rg",
+                }
+            ],
+        },
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": ""},
+    }
+    record = {
+        "id": 55284,
+        "source": "LARK_DOC",
+        "identifier": "doccnGGktnmTzIBO13yUVzmd8rg",
+        "title": "新客试投功能",
+        "link": "https://bytedance.feishu.cn/doc/doccnGGktnmTzIBO13yUVzmd8rg",
+        "content": "完成注册后，首次进入巨量千川首页，即可看到新客试投功能入口。",
+        "splits": [{"content": "新客试投入口在巨量千川首页。"}],
+    }
+    with KnowledgeDetailServer({("LARK_DOC", "doccnGGktnmTzIBO13yUVzmd8rg"): record}) as server:
+        monkeypatch.setenv("KNOWLEDGE_DETAIL_URL", server.url)
+        monkeypatch.setenv("KNOWLEDGE_DETAIL_TOKEN", "detail-token")
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        probe = build_probe_result("probe-knowledge-detail", ingest=minimal_ingest(request), no_cache=True)
+
+    assert server.requests == [
+        {
+            "method": "GET",
+            "path": "/api/sirius_knowledge/v1/data/doc/record_id",
+            "query": {"source": "LARK_DOC", "identifier": "doccnGGktnmTzIBO13yUVzmd8rg"},
+            "headers": server.requests[0]["headers"],
+        }
+    ]
+    assert server.requests[0]["headers"]["Authorization"] == "Bearer detail-token"
+    assert probe["status"] == "ok"
+    knowledge = probe["stage_signals"]["knowledge"]
+    assert knowledge["knowledge_exists"] == "yes"
+    assert knowledge["detail_provider"] == "http_doc_record"
+    assert knowledge["content_available_doc_ids"] == ["55284"]
+    detail = probe["raw_artifacts"]["knowledge_detail"]["fetched_docs"][0]
+    assert detail["doc_id"] == "55284"
+    assert detail["source"] == "LARK_DOC"
+    assert detail["identifier"] == "doccnGGktnmTzIBO13yUVzmd8rg"
+    assert "首次进入巨量千川首页" in detail["content_excerpt"]
+    assert "detail-token" not in json.dumps(probe, ensure_ascii=False)
+
+
+def test_probe_knowledge_detail_uses_raw_trace_doc_links(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import build_probe_result
+
+    request = {
+        "case_input": {"query": "新客试投在哪里", "workspace_id": "55", "app_id": "100", "expected_knowledge_ids": ["1514299"]},
+        "retrieval": {"knowledge_exists": None, "origin_doc_list": [{"id": "1514299", "title": "新享投"}]},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": ""},
+    }
+    ingest = minimal_ingest(request)
+    ingest["raw_artifacts"]["trace_evidence"] = {
+        "origin_doc_list_raw": [
+            {
+                "id": "1514299",
+                "title": "新享投",
+                "url": "https://support.oceanengine.com/support/content/129985",
+            }
+        ]
+    }
+    record = {
+        "id": 1514299,
+        "source": "COGNITION",
+        "identifier": "129985",
+        "title": "新享投",
+        "content": "新客试投功能入口：完成注册后，首次进入巨量千川首页即可看到。",
+    }
+    with KnowledgeDetailServer({("COGNITION", "129985"): record}) as server:
+        monkeypatch.setenv("KNOWLEDGE_DETAIL_URL", server.url)
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        probe = build_probe_result("probe-knowledge-detail", ingest=ingest, no_cache=True)
+
+    assert server.requests[0]["query"] == {"source": "COGNITION", "identifier": "129985"}
+    knowledge = probe["stage_signals"]["knowledge"]
+    assert knowledge["detail_status"] == "ok"
+    assert knowledge["content_available_doc_ids"] == ["1514299"]
+
+
 def minimal_ingest(request: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": "v3",
@@ -910,6 +1158,167 @@ def minimal_ingest(request: dict[str, Any]) -> dict[str, Any]:
         },
         "raw_artifacts": {"attribution_request": request, "workflow_span_ios": []},
     }
+
+
+def test_expected_required_merges_semantic_duplicates() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import _expected_knowledge_points
+
+    request = {
+        "case_input": {
+            "query": "用户截图显示抖音电商千川启航计划/全域投放-推商品，问一元试投在哪里。",
+            "workspace_id": "55",
+        },
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "正确输出应在用户截图所处的抖音电商千川启航计划/全域投放推商品场景下回答一元试投入口位置",
+                    "role": "expected_required",
+                    "basis": ["trace_query", "chat_history", "evaluator_reason"],
+                },
+                {
+                    "text": "正确输出应覆盖电商启航计划的一元试投入口，例如活动中心-启航计划-马上试或对应电商端入口路径",
+                    "role": "expected_required",
+                    "basis": ["evaluator_reason", "chat_history"],
+                    "confidence": 0.86,
+                },
+            ]
+        },
+    }
+
+    points = _expected_knowledge_points(request)
+    required = [point for point in points if point["role"] == "expected_required"]
+
+    assert len(required) == 1
+    merged = required[0]
+    assert "电商千川启航计划" in merged["text"]
+    assert "活动中心-启航计划-马上试" in merged["text"]
+    assert merged["basis"] == ["trace_query", "chat_history", "evaluator_reason"]
+    assert len(merged["merged_from"]) == 2
+
+
+def test_input_boundary_has_no_business_term_whitelist() -> None:
+    source = (SKILL_ROOT / "scripts" / "findreason_core" / "v3.py").read_text(encoding="utf-8")
+
+    forbidden_terms = [
+        "INPUT_BOUNDARY_TERMS",
+        "GENERIC_BOUNDARY_TERMS",
+        "启航计划",
+        "全域投放",
+        "推商品",
+        "一元试投",
+        "新客试投",
+        "活动中心",
+        "马上试",
+        "电商端",
+        "抖音电商",
+        "巨量千川",
+        "千川",
+        "随心推",
+        "铺底计划",
+        "人群模型",
+        "素材衰退",
+    ]
+    assert not any(term in source for term in forbidden_terms)
+
+
+def test_workflow_input_loss_precedes_knowledge_attribution() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {
+            "query": "用户截图显示抖音电商千川启航计划/全域投放-推商品，问这个一元试投在哪里。",
+            "workspace_id": "55",
+            "app_id": "100",
+        },
+        "judgement_evidence": {
+            "signals": [
+                {
+                    "label": "范围最小",
+                    "result": "否",
+                    "reason": "用户上下文明确为抖音电商-千川启航计划活动页面与全域投放-推商品场景，正确答案应覆盖活动中心-启航计划-马上试或对应电商端入口路径。",
+                }
+            ]
+        },
+        "preprocess": {"rewrite_query": "巨量千川1元试投在哪里", "keywords": ["巨量千川", "1元试投"]},
+        "retrieval": {
+            "knowledge_exists": False,
+            "theoretical_recall_status": "ok",
+            "wide_recall_docs": [],
+            "origin_doc_list": [],
+        },
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": "首次进入巨量千川首页即可看到新客试投入口。"},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "正确输出应在用户截图所处的抖音电商千川启航计划/全域投放推商品场景下回答一元试投入口位置，例如活动中心-启航计划-马上试或对应电商端入口路径。",
+                    "role": "expected_required",
+                    "basis": ["trace_query", "chat_history", "evaluator_reason"],
+                }
+            ]
+        },
+    }
+    ingest = minimal_ingest(request)
+    ingest["raw_artifacts"]["workflow_span_ios"] = [
+        {
+            "span_id": "workflow",
+            "selected": True,
+            "input": {"sys": {"query": "巨量千川1元试投在哪里"}},
+            "output": {"answer": "首次进入巨量千川首页即可看到新客试投入口。"},
+        }
+    ]
+
+    payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
+
+    assert payload["primary_cause"]["cause_code"] == "workflow_input_loss"
+    preprocess = next(item for item in payload["evidence_chain"] if item["stage"] == "preprocess")
+    assert preprocess["status"] == "fail"
+    assert preprocess["candidate_cause"] == "workflow_input_loss"
+    assert "启航计划" in json.dumps(preprocess, ensure_ascii=False)
+    assert "### 输入边界" in payload["human_report_markdown"]
+    assert "Workflow 原始输入丢失" in payload["human_report_markdown"]
+
+
+def test_preprocess_rewrite_drift_when_workflow_input_is_complete() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {
+            "query": "电商启航计划全域投放推商品的一元试投入口在哪里",
+            "workspace_id": "55",
+            "app_id": "100",
+        },
+        "preprocess": {"rewrite_query": "巨量千川1元试投在哪里", "keywords": ["巨量千川", "1元试投"]},
+        "retrieval": {"knowledge_exists": None, "origin_doc_list": []},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": "在首页。"},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "正确输出应覆盖电商启航计划全域投放推商品的一元试投入口。",
+                    "role": "expected_required",
+                    "basis": ["trace_query"],
+                }
+            ]
+        },
+    }
+    ingest = minimal_ingest(request)
+    ingest["raw_artifacts"]["workflow_span_ios"] = [
+        {
+            "span_id": "workflow",
+            "selected": True,
+            "input": {"sys": {"query": "电商启航计划全域投放推商品的一元试投入口在哪里"}},
+            "output": {"answer": "在首页。"},
+        }
+    ]
+
+    payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
+
+    assert payload["primary_cause"]["cause_code"] == "query_rewrite_drift"
+    assert payload["primary_cause"]["stage"] == "preprocess"
 
 
 def test_missing_expected_ids_does_not_block_downstream_answer_cause() -> None:
@@ -1145,7 +1554,7 @@ def test_report_explains_upper_bound_doc_assertion_relationship() -> None:
     }
     payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe, wide_probe], mode="final")
     report = payload["human_report_markdown"]
-    matrix_section = report.split("### 断言覆盖矩阵", 1)[1].split("### 答案断言观察", 1)[0]
+    matrix_section = report.split("## 4. 断言覆盖矩阵", 1)[1].split("## 5. 召回上界与知识判断", 1)[0]
 
     assert "理论召回上界 |" not in matrix_section
     assert "### 理论召回上界与断言关系" in report
@@ -1262,6 +1671,89 @@ def test_host_answer_claims_drive_point_coverage() -> None:
     assert all(point["source"] == "host_agent.answer_claim" for point in points)
     assert all(point["role"] == "expected_required" for point in points)
     assert not any("Agent_Reply" in row["text"] for row in payload["oracle_status"]["point_coverage"])
+
+
+def test_expected_required_semantic_merge_keeps_refined_entry_assertion() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+
+    support_doc = {
+        "id": "qianchuan-entry",
+        "title": "千川启航计划一元试投入口",
+        "content": "在抖音电商千川启航计划/全域投放推商品场景下，一元试投可以从活动中心-启航计划-马上试进入，也可以使用对应电商端入口路径。",
+    }
+    request = {
+        "case_input": {"query": "截图里一元试投在哪里", "workspace_id": "55", "app_id": "100"},
+        "retrieval": {
+            "knowledge_exists": None,
+            "theoretical_recall_status": "ok",
+            "wide_recall_docs": [support_doc],
+            "origin_doc_list": [support_doc],
+        },
+        "rerank": {"rerank_docs": [support_doc], "prompt_docs": [support_doc]},
+        "qa": {"answer": ""},
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "正确输出应回答一元试投的具体入口，例如活动中心-启航计划-马上试。",
+                    "role": "expected_required",
+                    "basis": ["evaluator_reason"],
+                    "confidence": 0.82,
+                },
+                {
+                    "text": "正确输出应在用户截图所处的抖音电商千川启航计划/全域投放推商品场景下，回答一元试投的具体入口或对应电商端入口路径。",
+                    "role": "expected_required",
+                    "basis": ["trace_query", "chat_history"],
+                    "confidence": 0.9,
+                },
+            ]
+        },
+    }
+
+    normalized = v3._normalize_assertion_inputs(request)
+    points = v3._expected_knowledge_points(normalized)
+    coverage = v3._knowledge_point_coverage(normalized, points)
+
+    assert [point["text"] for point in points] == [
+        "正确输出应在用户截图所处的抖音电商千川启航计划/全域投放推商品场景下，回答一元试投的具体入口，例如活动中心-启航计划-马上试或对应电商端入口路径"
+    ]
+    assert len(coverage) == 1
+    assert coverage[0]["missing_stage"] == "covered"
+    assert sorted(points[0]["basis"]) == ["chat_history", "evaluator_reason", "trace_query"]
+    assert [item["text"] for item in points[0]["merged_from"]] == [
+        "正确输出应回答一元试投的具体入口，例如活动中心-启航计划-马上试",
+        "正确输出应在用户截图所处的抖音电商千川启航计划/全域投放推商品场景下，回答一元试投的具体入口或对应电商端入口路径",
+    ]
+
+
+def test_expected_required_semantic_merge_keeps_distinct_entry_requirements() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+
+    request = {
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "正确输出应回答一元试投的具体入口，例如活动中心-启航计划-马上试。",
+                    "role": "expected_required",
+                    "basis": ["evaluator_reason"],
+                },
+                {
+                    "text": "正确输出应在用户截图所处的千川启航计划场景下，回答一元试投的预算设置入口。",
+                    "role": "expected_required",
+                    "basis": ["trace_query"],
+                },
+            ]
+        }
+    }
+
+    points = v3._expected_knowledge_points(v3._normalize_assertion_inputs(request))
+
+    assert [point["text"] for point in points] == [
+        "正确输出应回答一元试投的具体入口，例如活动中心-启航计划-马上试",
+        "正确输出应在用户截图所处的千川启航计划场景下，回答一元试投的预算设置入口",
+    ]
+    assert not any("merged_from" in point for point in points)
 
 
 def test_orchestrate_uses_ingest_host_assertions_without_self_oracle() -> None:

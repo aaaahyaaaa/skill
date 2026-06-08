@@ -14,7 +14,7 @@ Probe 缓存位于 `~/.findreason/cache/<workspace_id>/<log_id>/`。传入 `--no
 | Probe | 阶段 | 关键信号 |
 |-|-|-|
 | `probe-self-oracle` | knowledge | `inferred_expected_docs`、`expected_knowledge_points`、`point_coverage`、`oracle_status`、`oracle_confidence` |
-| `probe-knowledge-detail` | knowledge | `knowledge_exists: yes/no/unknown`、`retry_count` |
+| `probe-knowledge-detail` | knowledge | `knowledge_exists: yes/no/unknown`、`retry_count`、`detail_provider`、`detail_status`、`content_available_doc_ids` |
 | `probe-permission-check` | retrieval | `permission_miss`、`permission_available` |
 | `probe-wide-recall` | retrieval | `theoretical_recall_status`、`theoretical_query_variants`、`wide_recall_docs`、`matched_expected_ids`、`retrieval_gap_detected` |
 | `probe-rerank-bypass` | rerank | `bypass_would_restore`、`expected_doc_survived_rerank`；仅作 doc-id 观察，不能单独触发 `rerank_drop` |
@@ -28,14 +28,19 @@ Probe 缓存位于 `~/.findreason/cache/<workspace_id>/<log_id>/`。传入 `--no
 
 当前 P0 实现会在 trace-local candidate docs 中匹配这些信号，并输出 `evidence_type=inferred_oracle`。输出契约兼容后续接入实时 KB recall 后端。
 
+`probe-knowledge-detail` 默认只使用 trace/provided id 做三态判断；如果配置了 `KNOWLEDGE_DETAIL_URL`，会尝试把 trace docs 中的飞书 / OceanEngine 链接解析为 `source + identifier`，调用 `GET /api/sirius_knowledge/v1/data/doc/record_id?source=...&identifier=...` 形态的详情接口，并在 `raw_artifacts.knowledge_detail.fetched_docs` 中记录 title/link/content excerpt/split count 等有界摘要。接口错误、鉴权失败或链接无法解析时保持 `knowledge_exists=unknown` 或沿用 trace id 证据，不直接判 `suspected_knowledge_missing`。
+
 它会与 `probe-wide-recall` 一起构建断言覆盖矩阵：
 
-- `host_agent.answer_claim`：向后兼容的 assertion set 输入，使用嵌套结构 `{"host_agent": {"answer_claim": [...]}}`。每项会归一化为 `expected_knowledge_points` 输出，字段包括 `text`、`role`、`source` 和可选 `basis`、`why_required`、`confidence`。核心 role 是 `expected_required` 和 `answer_claim`；`missing_expected` 仅作为兼容输入映射到 `expected_required`。`constraint_check`、`citation_check`、`consistency_check` 用于 probe-v1 planning，不直接驱动上游断点；`source` 归一化为 `host_agent.answer_claim`。
+- `host_agent.answer_claim`：向后兼容的 assertion set 输入，使用嵌套结构 `{"host_agent": {"answer_claim": [...]}}`。每项会归一化为 `expected_knowledge_points` 输出，字段包括 `text`、`role`、`source` 和可选 `basis`、`why_required`、`confidence`、`merged_from`。核心 role 是 `expected_required` 和 `answer_claim`；`missing_expected` 仅作为兼容输入映射到 `expected_required`。`constraint_check`、`citation_check`、`consistency_check` 用于 probe-v1 planning，不直接驱动上游断点；`source` 归一化为 `host_agent.answer_claim`。
+- `expected_required` 会在进入 `point_coverage` 前做保守语义去重：如果两条断言是“场景约束 + 同一入口/路径要求”的包含或细化关系，CLI 合成一条，`basis` 取并集，原始断言写入 `merged_from`；未合并的原始断言不会重复进入覆盖矩阵。
 - CLI 不会把 `case_input.expected_knowledge_points`、`qa.answer_claims`、`qa.missing_expected_points`、`qa.unsupported_claims`、`qa.claim_alignments` 或 `judgement_evidence.signals[].assertions/fact_points/missing_expected_points` 当成断言来源。旧字段非空会报 `E_LEGACY_ASSERTION_INPUT`。
 - CLI 不得从 query 文本、评估器标签、空回复诊断或任意 rubric / judgement 片段中生成期望断言。没有 `expected_required` 时，`oracle_status.source=insufficient_assertions`。
 - `answer_claim.text` 必须是 workflow output 中抽取出的命题 X，不应写成“答案称 X”。`answer_claim` 只用于 answer grounding、scope、citation 和 consistency 检查，不驱动 knowledge / retrieval / rerank / context 归因。
 - `probe-wide-recall` 应运行原 query + rewrite query，topK >= 50，并将结果视为理论召回上界。
-- `point_coverage`：逐必要断言匹配理论召回上界文档、`origin_doc_list/origin_faq_list`、`rerank_docs` 和 `prompt_docs`。文档匹配必须包含可回答的正文片段；标题命中或纯词面命中不计入。每个被接受的文档可包含 `support_status`（`full_support` 或 `partial_support`）、`support_score`、`support_spans`、`matched_terms` 和 `missing_constraints`。人类报告应把线上阶段渲染为断言覆盖矩阵，把理论召回上界文档渲染为单独的断言关系小节，而不是无解释的阶段列。
+
+输入边界不是 probe plan 创造的断言。`orchestrate` 会读取 `raw_artifacts.workflow_span_ios[].input` 作为 Workflow 原始输入，并把它与用户实际问题/评估器用户上下文线索对比；如果关键场景约束在进入 Workflow 前已经丢失，优先判 `workflow_input_loss`。`rewrite_query` / `keywords` 只作为预处理节点输出，用于后续判断 `query_rewrite_drift` / `keyword_loss`。
+- `point_coverage`：逐必要断言匹配理论召回上界文档、`origin_doc_list/origin_faq_list`、`rerank_docs` 和 `prompt_docs`。文档匹配必须包含可回答的正文片段；标题命中或纯词面命中不计入。每个被接受的文档可包含 `support_status`（`full_support` 或 `partial_support`）、`support_score`、`support_spans`、`matched_terms` 和 `missing_constraints`。如果断言行带 `merged_from`，它代表多个原始 `expected_required` 已合并为一个覆盖靶子。人类报告应把线上阶段渲染为断言覆盖矩阵，把理论召回上界文档渲染为单独的断言关系小节，而不是无解释的阶段列。
 - `missing_expected_points_from_theoretical_recall`：没有上界支撑文档的必要断言，视为部分知识缺失。
 - `missing_expected_points_from_origin`：上界支持但线上 origin recall 未命中的必要断言。
 - `missing_expected_points_from_rerank`：初召回中存在但被 rerank 丢失的必要断言 / 文档。

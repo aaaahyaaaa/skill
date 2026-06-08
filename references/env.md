@@ -11,7 +11,10 @@
 - `OPEN_PLAT_BOOTSTRAP_TOKEN`：workspace info 和 workflow replay 可用的可选备用 bootstrap token。
 - `WORKFLOW_AUTH_TOKEN`：可选的直接 workspace apiKey fallback；设置后，`probe-wide-recall` 会在内存中用它调用 Sirius recall，workflow replay 也可能使用它。
 - `BYTEDCLI_BIN`、`WORKFLOW_RDS_DATABASE`、`WORKFLOW_OPEN_EXEC_BASE_URL`：workflow node fetch / replay 依赖。
-- `WIDE_RECALL_TOPK`、`KNOWLEDGE_DETAIL_URL`：可选 probe 集成。
+- `WIDE_RECALL_TOPK`：`probe-wide-recall` 的 topK 默认值；运行时仍会提升到至少 50。
+- `KNOWLEDGE_DETAIL_URL`：知识详情接口，默认值为 `https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id`。第一版支持 `GET /api/sirius_knowledge/v1/data/doc/record_id?source=...&identifier=...` 形态；也支持在 URL 中写 `{source}` / `{identifier}` 占位符。显式导出为空时，`probe-knowledge-detail` 只使用 trace/provided id 做三态判断。
+- `KNOWLEDGE_DETAIL_TOKEN`：可选知识详情鉴权 token，不带 `Bearer`。未设置时依次复用 `OPEN_PLAT_TRACE_TOKEN`、`OPEN_PLAT_BOOTSTRAP_TOKEN`；CLI 只输出 token 来源，不输出 token 原文。
+- `KNOWLEDGE_DETAIL_TIMEOUT_SECONDS`：可选知识详情 HTTP 超时，默认 20 秒。
 
 使用 `python -m findreason schema` 查看 v3 命令契约。CLI 有意不提供会打印 token 的 env 命令。
 

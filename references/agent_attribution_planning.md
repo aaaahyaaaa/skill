@@ -6,11 +6,11 @@
 
 宿主 Agent 消费：
 
-- `trace_artifacts`：真实 workflow 输入、输出、中间节点和脚本 I/O。trace 可包含 query、chat history、rewrite query、keywords、origin docs、ranked docs、prompt/context、citation mapping、final output、workflow graph。
+- `trace_artifacts`：真实 workflow 输入、输出、中间节点和脚本 I/O。trace 可包含 Workflow 原始输入、用户上下文、rewrite query、keywords、origin docs、ranked docs、prompt/context、citation mapping、final output、workflow graph。
 - `judgement_evidence.signals`：评估器压缩摘要，只表达“怀疑哪里坏了”。
 - `query_hint` / `answer_hint`：外部加工文本，仅在 trace 缺失时辅助理解。
 
-真实 query 和 output 优先来自 trace。外部 `query` / `answer` 不得覆盖 trace。
+用户实际问题、评估器问题线索、Workflow 原始输入和预处理输出必须分开看。外部 `query` / `answer` 不得覆盖 trace；`case_input.query` 如果来自表格或评估器，只能作为用户实际问题/评估问题线索。Workflow 原始输入必须从 `raw_artifacts.workflow_span_ios[].input` 读取；`rewrite_query` / `keywords` 是 Workflow 内部预处理节点输出。
 
 ## Artifact 抽象
 
@@ -29,6 +29,20 @@
 | `script_io_artifact?` | 复杂脚本输入输出 |
 
 缺失的 artifact 表示对应阶段 `not_applicable` 或证据不足，不是自动失败。
+
+输入边界优先级：
+
+```text
+用户实际问题 / 评估器用户上下文
+        |
+        v
+Workflow 原始输入
+        |
+        v
+预处理输出 rewrite_query / keywords
+```
+
+如果用户实际问题或评估器用户上下文中的关键场景约束没有进入 Workflow 原始输入，归因到 `workflow_input_loss`；如果 Workflow 原始输入保留了这些约束，但 rewrite / keywords 丢失，才归因到 `query_rewrite_drift` 或 `keyword_loss`。
 
 ## 输出
 
@@ -50,7 +64,7 @@ Agent planning 一次性输出两个对象：
 - `constraint_check`、`citation_check`、`consistency_check`：用于 probe planning，不直接驱动上游归因。
 - `unsupported_claim`：answer 阶段线索，不触发 `suspected_knowledge_missing`。
 
-`expected_required` 可基于 `trace_query`、`chat_history`、`evaluator_reason`、`rewrite_query`、`keywords` 推断，但必须写清 `basis` 和 `why_required`。它是验证靶子，不是事实证据。
+`expected_required` 可基于 `trace_query`、`chat_history`、`evaluator_reason`、`rewrite_query`、`keywords` 推断，但必须写清 `basis` 和 `why_required`。它是验证靶子，不是事实证据。宿主 Agent 可以把“场景约束”和“入口要求”拆成相邻断言交给 CLI；CLI 只会在两条断言构成“场景约束 + 同一入口/路径要求”的包含或细化关系时保守合并，合并后的 `basis` 取并集，原始断言放到 `merged_from` 审计字段，覆盖矩阵只保留合并行。
 
 `answer_claim.text` 必须是命题 X：
 
@@ -95,6 +109,8 @@ Agent planning 一次性输出两个对象：
 `expected_required` 驱动上游覆盖链：
 
 ```text
+用户约束未进入 Workflow 原始输入 -> workflow_input_loss
+Workflow 输入保留约束，但 rewrite / keywords 丢失 -> query_rewrite_drift / keyword_loss
 KB / wide recall 不支撑 -> suspected_knowledge_missing 或 human_review
 KB 支撑，origin 未召回 -> retrieval_miss
 origin 支撑，rank/rerank 丢失 -> rerank_drop

@@ -29,7 +29,7 @@
     {
       "id": "probe_knowledge_detail",
       "command": "probe-knowledge-detail",
-      "description": "Tri-state knowledge existence probe: yes/no/unknown with retry metadata.",
+      "description": "Tri-state knowledge existence probe: trace/provided ids plus optional live doc-record detail via KNOWLEDGE_DETAIL_URL.",
       "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
       "outputs": ["stage_signals.knowledge", "evidence_bundle"]
     },

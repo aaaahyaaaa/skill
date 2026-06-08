@@ -9,6 +9,8 @@
   "WORKFLOW_RDS_DATABASE": "flow_dev_1",
   "WORKFLOW_OPEN_EXEC_BASE_URL": "https://spaceworkflow-open-api.zijieapi.com",
   "WIDE_RECALL_TOPK": "20",
-  "KNOWLEDGE_DETAIL_URL": "",
+  "KNOWLEDGE_DETAIL_URL": "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id",
+  "KNOWLEDGE_DETAIL_TOKEN": "",
+  "KNOWLEDGE_DETAIL_TIMEOUT_SECONDS": "20",
   "FINDREASON_RUN_DB": ""
 }
