@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -559,6 +560,155 @@ def test_cli_ingest_preserves_host_agent_answer_claim_in_case_object(tmp_path: P
     ]
 
 
+def test_cli_ingest_normalizes_answer_hint_when_trace_answer_missing(tmp_path: Path) -> None:
+    case_path = tmp_path / "case.json"
+    case_path.write_text(
+        json.dumps(
+            {
+                "case_input": {
+                    "query": "这里的商品添加是自动添加的吗",
+                    "query_hint": "表格里的用户问题线索",
+                    "workspace_id": "55",
+                    "app_id": "100",
+                    "case_id": "sheet-row-48",
+                },
+                "answer_hint": "表格里的外部答案",
+                "host_agent": {
+                    "answer_claim": [
+                        {
+                            "text": "正确答案应说明商品添加机制。",
+                            "role": "expected_required",
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    empty_trace = {"code": 0, "msg": "", "data": {"spans": [], "has_more": False, "next_page_token": ""}}
+    with TraceServer(empty_trace) as server:
+        result = run_cli(
+            "ingest-fornax-trace",
+            "--workspace-id",
+            "55",
+            "--log-id",
+            "log-1",
+            "--case-file",
+            str(case_path),
+            "--output-dir",
+            str(tmp_path / "case-out"),
+            cwd=SKILL_ROOT,
+            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    request = payload["raw_artifacts"]["attribution_request"]
+    assert request["case_input"]["query_hint"] == "表格里的用户问题线索"
+    assert request["case_input"]["case_id"] == "sheet-row-48"
+    assert payload["raw_artifacts"]["trace_summary"]["log_id"] == "log-1"
+    assert request["qa"]["answer"] == "表格里的外部答案"
+    assert request["raw_host_fields"]["answer_hint"] == "表格里的外部答案"
+
+
+def test_cli_ingest_answer_hint_does_not_override_trace_answer(tmp_path: Path) -> None:
+    case_path = case_file(
+        tmp_path,
+        answer_hint="表格里的外部答案",
+        host_agent={"answer_claim": [{"text": "正确答案应说明云图定义。", "role": "expected_required"}]},
+    )
+    with TraceServer(trace_payload()) as server:
+        result = run_cli(
+            "ingest-fornax-trace",
+            "--workspace-id",
+            "55",
+            "--log-id",
+            "log-1",
+            "--case-file",
+            str(case_path),
+            "--output-dir",
+            str(tmp_path / "case-out"),
+            cwd=SKILL_ROOT,
+            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        )
+
+    assert result.returncode == 0, result.stderr
+    request = json.loads(result.stdout)["raw_artifacts"]["attribution_request"]
+    assert request["qa"]["answer"] == "云图是天气图片。"
+    assert request["raw_host_fields"]["answer_hint"] == "表格里的外部答案"
+
+
+def test_cli_trace_failure_preserves_current_host_fields(tmp_path: Path) -> None:
+    case_path = case_file(
+        tmp_path,
+        answer_hint="表格里的外部答案",
+        query_hint="表格问题线索",
+        case_id="sheet-row-48",
+        host_agent={
+            "answer_claim": [
+                {
+                    "text": "正确答案应说明商品添加机制。",
+                    "role": "expected_required",
+                    "basis": ["query_hint", "evaluator_reason"],
+                }
+            ]
+        },
+        qa={"answer_satisfies_expected": False, "partial_answer": True},
+    )
+    with TraceServer({"code": -512, "msg": "request is limited", "data": {}}) as server:
+        result = run_cli(
+            "ingest-fornax-trace",
+            "--workspace-id",
+            "55",
+            "--log-id",
+            "log-1",
+            "--case-file",
+            str(case_path),
+            "--output-dir",
+            str(tmp_path / "case-out"),
+            cwd=SKILL_ROOT,
+            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "unsupported_claims" not in payload["case"]
+    request = payload["raw_artifacts"]["attribution_request"]
+    assert request["case_input"]["query_hint"] == "表格问题线索"
+    assert request["case_input"]["case_id"] == "sheet-row-48"
+    assert request["qa"]["answer"] == "表格里的外部答案"
+    assert request["qa"]["partial_answer"] is True
+    assert "unsupported_claims" not in request["qa"]
+    assert request["host_agent"]["answer_claim"] == [
+        {
+            "text": "正确答案应说明商品添加机制",
+            "role": "expected_required",
+            "source": "host_agent.answer_claim",
+            "confidence": 0.55,
+            "basis": ["query_hint", "evaluator_reason"],
+        }
+    ]
+
+
+def test_attribution_request_accepts_query_hint_roundtrip() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.models import AttributionRequest
+
+    request = AttributionRequest.model_validate(
+        {
+            "case_input": {
+                "query": "用户实际问题",
+                "query_hint": "表格问题线索",
+                "workspace_id": "55",
+                "app_id": "100",
+            }
+        }
+    )
+
+    assert request.case_input.query_hint == "表格问题线索"
+
+
 def test_report_explains_empty_assertion_matrix_needs_probe_plan() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import orchestrate_v3
@@ -633,25 +783,134 @@ def test_case_report_uses_readable_numbered_sections_and_trace_appendix(tmp_path
 
     expected_order = [
         "## 1. 结论摘要",
-        "## 2. 问题与答案观察",
-        "## 3. 必要断言",
-        "## 4. 断言覆盖矩阵",
-        "## 5. 召回上界与知识判断",
+        "## 2. 现场输入与答案",
+        "## 3. 验证过程：我怎么查的",
+        "## 4. 阶段裁决：问题最早断在哪",
+        "## 5. 关键证据与文档",
         "### 理论召回上界与断言关系",
-        "## 6. 阶段归因链路",
-        "## 7. Probe 结果",
-        "## 8. 下一步",
-        "## 附录：原始 Trace 摘录",
+        "## 6. 下一步建议",
+        "## 7. 审计 JSON 索引",
     ]
     positions = [report.index(heading) for heading in expected_order]
 
     assert positions == sorted(positions)
-    assert "原始答案：可以在计划管理设置。" in report
-    assert report.index("## 附录：原始 Trace 摘录") > report.index("## 8. 下一步")
+    assert "答案摘要：可以在计划管理设置。" in report
+    assert "### Workflow 原始完整输入" in report
+    assert "### Workflow 原始完整输出" in report
+    assert '"query": "随心推铺底计划怎么设置"' in report
+    assert '"answer": "可以在计划管理设置。"' in report
+    assert report.index("## 7. 审计 JSON 索引") > report.index("## 6. 下一步建议")
+    assert "### Workflow 输入摘录" not in report
+    assert "### Workflow 输出摘录" not in report
     assert "### 原始 Workflow 输入输出" not in report
     assert "输入边界判断：用户实际问题中的关键约束已进入 Workflow 原始输入。" in report
     assert "### 理论召回上界与断言关系" in report
     assert "支持该断言：`wide-setup-1` 随心推铺底计划设置指南" in report
+
+
+def test_case_report_renders_validation_as_chinese_process_cards() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3, run_probe_plan
+
+    request = _answer_ready_request(
+        answer="答案只说可以追投直播间画面。",
+        prompt_supports_answer=True,
+        answer_satisfies_expected=False,
+        partial_answer=True,
+    )
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-risk-answer",
+                "display_name": "风险答案覆盖",
+                "exp_kind": "answer-exp",
+                "trigger_source": "evaluator",
+                "trigger_observation": "评估器提示答案遗漏 ROI 波动风险",
+                "hypothesis": "答案未覆盖 ROI 波动风险",
+                "direction": "scope_violation",
+                "role": "expected_required",
+                "target_artifact": "answer_span",
+                "query": "答案应该覆盖「ROI波动」",
+                "expected_hit_pattern": "ROI波动",
+                "if_hit": "answer covers risk",
+                "if_miss": "答案遗漏 ROI 波动风险",
+            }
+        ],
+    }
+
+    probe = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+    report = payload["human_report_markdown"]
+
+    assert "## 3. 验证过程：我怎么查的" in report
+    assert "### 验证 1：风险答案覆盖" in report
+    assert "- 我为什么查这个：评估器提示答案遗漏 ROI 波动风险" in report
+    assert "- 我查了哪里：最终答案" in report
+    assert "- 验证结果：未命中" in report
+    assert "- 这说明什么：答案遗漏 ROI 波动风险" in report
+    assert "### answer-exp" not in report
+    assert "| 验证项 | 方向 | 目标 | hit | 结论 |" not in report
+    assert "target_artifact" not in report
+    assert "converged_direction" not in report
+    assert "P-risk-answer" not in report
+
+
+def test_case_report_matched_docs_show_links_and_support_snippets() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3, run_probe_plan
+
+    request = {
+        "case_input": {"query": "破圈尖货怎么投放", "workspace_id": "55", "app_id": "100"},
+        "retrieval": {
+            "origin_doc_list": [
+                {
+                    "id": "2033060",
+                    "source": "COGNITION",
+                    "title": "巨量千川「破圈尖货」产品手册",
+                    "content": "破圈尖货适合商品成长阶段的冷启动投放，入口在巨量千川商品推广。",
+                },
+                {
+                    "id": "1410454",
+                    "source": "origin_doc_list|doc_search|url=https://support.oceanengine.com/support/content/132671",
+                    "title": "巨量千川商品卡推广/商城广告 完整介绍",
+                    "content": "破圈尖货适合商品成长阶段的冷启动投放，也可以参考商品卡推广入口，登录巨量千川后选择竞价推广、推商品。",
+                }
+            ]
+        },
+        "qa": {"answer": "可在商品推广里投放。"},
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-2033060",
+                "display_name": "破圈尖货文档验证",
+                "exp_kind": "retrieval-exp",
+                "trigger_source": "answer_gap",
+                "trigger_observation": "需要确认召回文档是否真的支撑破圈尖货投放入口",
+                "hypothesis": "线上初召回已有破圈尖货权威文档",
+                "direction": "coverage_gap",
+                "target_artifact": "online_origin_recall",
+                "query": "破圈尖货 投放 入口 商品推广",
+                "expected_hit_pattern": "破圈尖货适合商品成长阶段的冷启动投放",
+                "if_hit": "线上初召回已有权威文档",
+                "if_miss": "线上初召回没有权威文档",
+            }
+        ],
+    }
+
+    probe = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+    report = payload["human_report_markdown"]
+
+    assert "2033060 巨量千川「破圈尖货」产品手册" in report
+    assert "文档链接：[打开文档](https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id?source=COGNITION&identifier=2033060)" in report
+    assert "1410454 巨量千川商品卡推广/商城广告 完整介绍" in report
+    assert "文档链接：[打开文档](https://support.oceanengine.com/support/content/132671)" in report
+    assert "2033060 巨量千川「破圈尖货」产品手册（https://" not in report
+    assert "破圈尖货适合商品成长阶段的冷启动投放" in report
+    assert "matched_docs: 2033060" not in report
 
 
 def test_probe_rerank_bypass_is_auxiliary_without_assertion_gap(tmp_path: Path) -> None:
@@ -698,15 +957,24 @@ def test_probe_rerank_bypass_is_auxiliary_without_assertion_gap(tmp_path: Path) 
     assert payload["app_id"] == "100"
     report = payload["human_report_markdown"]
     assert "# FindReason 归因报告" in report
-    assert "## 6. 阶段归因链路" in report
-    assert "## 附录：原始 Trace 摘录" in report
+    assert "## 4. 阶段裁决：问题最早断在哪" in report
+    assert "## 7. 审计 JSON 索引" in report
     assert "- Workflow 输出：" not in report
+    assert "### Workflow 原始完整输入" in report
+    assert "### Workflow 原始完整输出" in report
+    assert "### Workflow 输入摘录" not in report
+    assert "### Workflow 输出摘录" not in report
     assert '"query": "云图是什么"' in report
     assert '"end": "云图是天气图片。"' in report
     assert "log_id：`log-1`" in report
     assert "app_id：`100`" in report
     assert "主因枚举：`null`" in report
     assert "doc-id-only evidence does not prove the required assertion was lost" in json.dumps(payload["evidence_chain"], ensure_ascii=False)
+    assert "重排生存观察" in report
+    assert "重排观察：关键文档是否在重排后消失" in report
+    assert "rerank bypass" not in report
+    assert "bypass would restore expected docs" not in report
+    assert "curl 重跑实验" not in report
     assert "retrieved_but_reranked_out" not in payload["failure_patterns"]
     evidence_ids = {item["evidence_id"] for item in payload["evidence_bundle"]}
     assert evidence_ids
@@ -1045,6 +1313,32 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
     assert payload["primary_cause"]["cause_code"] == "retrieval_miss"
 
 
+def test_probe_wide_recall_does_not_use_workflow_auth_token_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import build_probe_result
+
+    request = {
+        "case_input": {"query": "铺底计划入口", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "铺底计划入口"},
+        "retrieval": {"origin_doc_list": [], "origin_faq_list": []},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": ""},
+    }
+    with RecallServer() as server:
+        ingest = minimal_ingest(request)
+        ingest["raw_artifacts"]["trace_detail"] = trace_payload_with_recall_template(server.recall_url)
+        monkeypatch.delenv("OPEN_PLAT_ZS_OPEN_TOKEN", raising=False)
+        monkeypatch.setenv("WORKFLOW_AUTH_TOKEN", "wrong-workspace-token")
+        monkeypatch.setenv("OPEN_PLAT_WORKSPACE_INFO_URL", server.workspace_info_url)
+
+        wide_probe = build_probe_result("probe-wide-recall", ingest=ingest, params={"topk": 50}, no_cache=True)
+
+    retrieval = wide_probe["stage_signals"]["retrieval"]
+    assert retrieval["theoretical_recall_status"] == "not_configured"
+    assert retrieval["auth_token_source"] == "not_configured"
+    assert not server.requests
+
+
 def test_knowledge_detail_reference_infers_source_and_identifier_from_links() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     import findreason_core.v3 as v3
@@ -1098,7 +1392,6 @@ def test_probe_knowledge_detail_fetches_live_doc_record(monkeypatch: pytest.Monk
     }
     with KnowledgeDetailServer({("LARK_DOC", "doccnGGktnmTzIBO13yUVzmd8rg"): record}) as server:
         monkeypatch.setenv("KNOWLEDGE_DETAIL_URL", server.url)
-        monkeypatch.setenv("KNOWLEDGE_DETAIL_TOKEN", "detail-token")
         monkeypatch.setenv("HOME", str(tmp_path))
 
         probe = build_probe_result("probe-knowledge-detail", ingest=minimal_ingest(request), no_cache=True)
@@ -1111,7 +1404,7 @@ def test_probe_knowledge_detail_fetches_live_doc_record(monkeypatch: pytest.Monk
             "headers": server.requests[0]["headers"],
         }
     ]
-    assert server.requests[0]["headers"]["Authorization"] == "Bearer detail-token"
+    assert "Authorization" not in server.requests[0]["headers"]
     assert probe["status"] == "ok"
     knowledge = probe["stage_signals"]["knowledge"]
     assert knowledge["knowledge_exists"] == "yes"
@@ -1122,7 +1415,7 @@ def test_probe_knowledge_detail_fetches_live_doc_record(monkeypatch: pytest.Monk
     assert detail["source"] == "LARK_DOC"
     assert detail["identifier"] == "doccnGGktnmTzIBO13yUVzmd8rg"
     assert "首次进入巨量千川首页" in detail["content_excerpt"]
-    assert "detail-token" not in json.dumps(probe, ensure_ascii=False)
+    assert "Authorization" not in json.dumps(probe, ensure_ascii=False)
 
 
 def test_probe_knowledge_detail_uses_raw_trace_doc_links(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1685,7 +1978,7 @@ def test_report_explains_upper_bound_doc_assertion_relationship() -> None:
     }
     payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe, wide_probe], mode="final")
     report = payload["human_report_markdown"]
-    matrix_section = report.split("## 4. 断言覆盖矩阵", 1)[1].split("## 5. 召回上界与知识判断", 1)[0]
+    matrix_section = report.split("### 断言覆盖矩阵", 1)[1].split("### 召回上界与知识判断", 1)[0]
 
     assert "理论召回上界 |" not in matrix_section
     assert "### 理论召回上界与断言关系" in report
@@ -2421,6 +2714,55 @@ def test_run_probe_plan_answer_span_branching_signal() -> None:
     assert result["stage_signals"]["answer"]["branching_unclear"] is True
 
 
+def test_run_probe_plan_transfers_exp_metadata_and_report_groups_without_p_prefix() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3, run_probe_plan
+
+    request = _answer_ready_request(
+        answer="答案只说可以追投直播间画面。",
+        prompt_supports_answer=True,
+        answer_satisfies_expected=False,
+    )
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-risk-answer",
+                "display_name": "风险答案覆盖",
+                "exp_kind": "answer-exp",
+                "trigger_source": "evaluator",
+                "trigger_observation": "评估器提示答案遗漏风险",
+                "hypothesis": "答案未覆盖 ROI 波动风险",
+                "direction": "scope_violation",
+                "role": "expected_required",
+                "target_artifact": "answer_span",
+                "query": "答案应该覆盖「ROI波动」",
+                "expected_hit_pattern": "应包含「ROI波动」",
+                "if_hit": "answer covers risk",
+                "if_miss": "答案遗漏 ROI 波动风险",
+            }
+        ],
+    }
+    probe = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+    executed = probe["content"]["probe_results"][0]
+
+    assert executed["probe_id"] == "P-risk-answer"
+    assert executed["display_name"] == "风险答案覆盖"
+    assert executed["exp_kind"] == "answer-exp"
+    assert executed["trigger_source"] == "evaluator"
+    assert probe["evidence_bundle"][0]["content"]["hypothesis"] == "答案未覆盖 ROI 波动风险"
+
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+    report = payload["human_report_markdown"]
+
+    assert "## 3. 验证过程：我怎么查的" in report
+    assert "### 验证 1：风险答案覆盖" in report
+    assert "答案遗漏 ROI 波动风险" in report
+    assert "### answer-exp" not in report
+    assert "风险答案覆盖" in report
+    assert "P-risk-answer" not in report
+
+
 def test_run_probe_plan_matched_docs_include_support_spans() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import run_probe_plan
@@ -2465,6 +2807,96 @@ def test_run_probe_plan_matched_docs_include_support_spans() -> None:
     assert matched[0]["support_status"] == "full_support"
     assert matched[0]["support_spans"]
     assert "评分会相互影响" in matched[0]["support_spans"][0]
+
+
+def test_chunk_conflict_exp_records_risk_without_selecting_primary() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3, run_probe_plan
+
+    request = {
+        "case_input": {"query": "追投预算规则", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "追投预算规则"},
+        "retrieval": {"knowledge_exists": True, "origin_doc_list": []},
+        "rerank": {
+            "rerank_docs": [],
+            "prompt_docs": [
+                {
+                    "id": "conflict-doc",
+                    "chunkId": "c1",
+                    "title": "追投预算规则",
+                    "content": "同一场景下追投预算规则存在互相冲突说法：一处说预算越高越稳定，另一处说预算越高 ROI 波动越高。",
+                }
+            ],
+        },
+        "qa": {"answer": "使用追投即可。"},
+        "host_agent": {"answer_claim": [{"text": "应说明追投预算风险。", "role": "expected_required"}]},
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-conflict",
+                "direction": "internal_contradiction",
+                "target_artifact": "prompt_context",
+                "query": "追投预算规则存在互相冲突说法",
+                "expected_hit_pattern": "应包含「互相冲突」",
+                "if_hit": "发现 chunk 冲突风险",
+                "if_miss": "未发现 chunk 冲突",
+            }
+        ],
+    }
+    probe = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+
+    assert probe["stage_signals"]["knowledge"]["chunk_internal_conflict"] is True
+    assert probe["stage_signals"]["knowledge"]["chunk_conflicts"][0]["chunk_id"] == "c1"
+    assert payload["secondary_findings"]["chunk_conflict_findings"]
+    assert payload["primary_cause"] is None
+    assert "召回 Chunk 冲突风险" in payload["human_report_markdown"]
+
+
+def test_chunk_conflict_exp_can_escalate_to_knowledge_inconsistency() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3, run_probe_plan
+
+    request = {
+        "case_input": {"query": "追投预算规则", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "追投预算规则"},
+        "retrieval": {"knowledge_exists": True, "origin_doc_list": []},
+        "rerank": {
+            "rerank_docs": [],
+            "prompt_docs": [
+                {
+                    "id": "conflict-doc",
+                    "chunkId": "c1",
+                    "title": "追投预算规则",
+                    "content": "同一场景下追投预算规则存在互相冲突说法：一处说预算越高越稳定，另一处说预算越高 ROI 波动越高。",
+                }
+            ],
+        },
+        "qa": {"answer": "使用追投即可。"},
+        "host_agent": {"answer_claim": [{"text": "应说明追投预算风险。", "role": "expected_required"}]},
+    }
+    plan = {
+        "schema_version": "probe-v1",
+        "probes": [
+            {
+                "probe_id": "P-conflict",
+                "direction": "internal_contradiction",
+                "target_artifact": "prompt_context",
+                "query": "追投预算规则存在互相冲突说法",
+                "expected_hit_pattern": "应包含「互相冲突」",
+                "if_hit": "影响必要断言且没有清晰适用前提",
+                "if_miss": "未发现 chunk 冲突",
+            }
+        ],
+    }
+    probe = run_probe_plan(ingest=minimal_ingest(request), plan=plan, no_cache=True)
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
+
+    assert probe["stage_signals"]["knowledge"]["internal_inconsistency"] is True
+    assert payload["primary_cause"]["stage"] == "knowledge"
+    assert payload["primary_cause"]["cause_code"] == "knowledge_internal_inconsistency"
 
 
 def test_run_probe_plan_does_not_treat_unavailable_wide_recall_as_miss() -> None:
@@ -2594,6 +3026,19 @@ def test_fetch_workflow_nodes_preserves_nodes_edges_and_global_config(monkeypatc
     assert payload["workflow"]["edges"][0]["target"] == "qa"
     assert payload["workflow"]["global_config"]["answer_model"] == "model-x"
     assert (tmp_path / "workflow_nodes.json").exists()
+
+
+def test_workflow_auth_resolver_does_not_use_workflow_auth_token_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    monkeypatch.setenv("FINDREASON_ENV_DISABLE", "true")
+    monkeypatch.delenv("OPEN_PLAT_ZS_OPEN_TOKEN", raising=False)
+    monkeypatch.setenv("WORKFLOW_AUTH_TOKEN", "wrong-workspace-token")
+    from findreason_core.workflow_replay import resolve_workflow_auth_token
+
+    token, source = asyncio.run(resolve_workflow_auth_token("55"))
+
+    assert token is None
+    assert source == "not_configured"
 
 
 def test_static_openplat_token_has_no_bearer_prefix_when_configured() -> None:

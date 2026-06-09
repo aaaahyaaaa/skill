@@ -46,7 +46,7 @@ def _truncate(value: Any, max_chars: int = MAX_REPLAY_VALUE_CHARS) -> Any:
 
 def _safe_error(exc: Exception) -> str:
     text = repr(exc) if not str(exc) else str(exc)
-    token = os.getenv("WORKFLOW_AUTH_TOKEN", "")
+    token = os.getenv("OPEN_PLAT_ZS_OPEN_TOKEN", "")
     if token:
         text = text.replace(token, "[REDACTED]")
     return text[:500]
@@ -896,7 +896,6 @@ async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, st
     if os.getenv("FINDREASON_LIVE", "true").lower() in {"0", "false", "no"}:
         return None, "live_disabled"
     bootstrap_token, bootstrap_source = _openplat_bootstrap_token()
-    env_token = os.getenv("WORKFLOW_AUTH_TOKEN", "").strip()
     if bootstrap_token:
         workspace_info_url = os.getenv("OPEN_PLAT_WORKSPACE_INFO_URL", DEFAULT_OPEN_PLAT_WORKSPACE_INFO_URL)
         async with httpx.AsyncClient(timeout=30) as client:
@@ -909,8 +908,6 @@ async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, st
                 },
             )
         if response.status_code >= 400:
-            if env_token:
-                return env_token, "workflow_auth_token_env_fallback"
             raise WorkflowResolverError(f"workspace info HTTP {response.status_code}: {response.text[:500]}")
         payload = response.json()
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -918,12 +915,8 @@ async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, st
         api_key = auth_info.get("apiKey") if isinstance(auth_info, dict) else None
         if isinstance(api_key, str) and api_key.strip():
             return api_key.strip(), f"workspace_info_api:{bootstrap_source}"
-        if env_token:
-            return env_token, "workflow_auth_token_env_fallback"
         code = payload.get("code") if isinstance(payload, dict) else None
         raise WorkflowResolverError(f"workspace info returned no authInfo.apiKey for workspace_id={workspace_id}; code={code}")
-    if env_token:
-        return env_token, "workflow_auth_token_env"
     return None, "not_configured"
 
 
@@ -1016,7 +1009,7 @@ async def replay_workflow(request: AttributionRequest) -> AttributionRequest:
             endpoint=endpoint,
             request_payload=request_payload,
             auth_token_source=auth_token_source,
-            notes="未配置 OPEN_PLAT_ZS_OPEN_TOKEN 或 WORKFLOW_AUTH_TOKEN，跳过流水线重跑。",
+            notes="未配置 OPEN_PLAT_ZS_OPEN_TOKEN，无法获取当前 workspace 的 authInfo.apiKey，跳过流水线重跑。",
         )
         return _merge_replay_evidence(request, replay)
 

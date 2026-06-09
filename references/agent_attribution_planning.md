@@ -1,6 +1,6 @@
 # Agent Attribution Planning v3.1
 
-本 playbook 描述宿主 Agent 如何把 trace 现场和评估器线索转成可验证的 assertion set 与 `probe-v1` plan。CLI 只负责执行确定性检查、绑定 evidence 和最终 `orchestrate`，不负责语义发明。
+本 playbook 描述宿主 Agent 如何把 trace 现场、评估器线索和执行中发现的异常转成 assertion set 与动态 `{stage}-exp`。CLI 只负责执行确定性检查、绑定 evidence 和最终 `orchestrate`，不负责语义发明。
 
 ## 输入
 
@@ -30,6 +30,32 @@
 
 缺失的 artifact 表示对应阶段 `not_applicable` 或证据不足，不是自动失败。
 
+## 动态诊断 Backlog
+
+Agent attribution planning 是持续发生的。宿主 Agent 在读取输入、评估器、trace、答案、引用和 chunk 时，随时把线索加入动态诊断 backlog。Backlog 的目标是决定要构造哪些 assertion、哪些 `{stage}-exp`、报告重点放在哪里；它不是 `primary_cause`，也不能替代执行后的 evidence。
+
+观察顺序：
+
+1. Workflow input/output：从 trace 的 `workflow_span_ios` 或 Start/End span 读取真实输入输出，和外部 `query_hint` / `answer_hint` 分开。
+2. Preprocess：记录 rewrite query 是否改变语义、keywords 是否保留关键限制。
+3. 文档生存路径：摊平 `origin -> rerank -> prompt`，对每个候选记录 doc id、chunk id、title、source、score、support snippet、阶段存活状态。
+4. 来源风险：标记标题或正文含“停用 / 已升级 / 过期 / deprecated / stale”的来源、重复 chunk、非权威来源、引用链接不可用或引用文档不支撑 claim。
+5. prompt-vs-answer alignment：检查 prompt 中出现但答案遗漏的限制、反例、预算/ROI/适用范围约束；检查答案是否弱化或反向表达 prompt 已有约束。
+
+每个 backlog item 至少包含：
+
+- `trigger_source`：线索来源，例如 evaluator、trace、rewrite、origin、rerank、prompt、answer、citation、chunk。
+- `trigger_observation`：观察到的现象。
+- `hypothesis`：待验证假设。
+- `exp_kind`：`retrieval-exp`、`rerank-exp`、`answer-exp`、`citation-exp`、`chunk-conflict-exp`。
+- `target_stage`：预期影响的阶段。
+- `expected_evidence`：执行后希望看到的证据类型。
+
+输出时把 backlog 转成两类计划输入：
+
+- `expected_required`：正确输出必须覆盖的检查点，通常来自真实 workflow 输入、评估器用户上下文、prompt 中的关键限制和现场观察发现的生存路径断点。
+- `{stage}-exp`：验证召回、重排、答案、引用或 chunk 冲突 hypothesis。兼容 `run-probe-plan` 的静态 artifact 验证项可继续用 `probe-v1` 表达。
+
 输入边界优先级：
 
 ```text
@@ -46,10 +72,10 @@ Workflow 原始输入
 
 ## 输出
 
-Agent planning 一次性输出两个对象：
+Agent planning 输出两个对象，并可在执行过程中增量更新：
 
 1. Assertion set，落到唯一输入字段 `host_agent.answer_claim`。
-2. `probe-v1` plan，交给 `run-probe-plan` 执行。
+2. `{stage}-exp` backlog；其中静态 artifact 验证可合并成兼容 `probe-v1` plan，交给 `run-probe-plan` 执行。
 
 ### Assertion Set
 
@@ -87,21 +113,31 @@ Agent planning 一次性输出两个对象：
 }
 ```
 
-### Probe Plan
+### 验证环节
 
-`probe-v1` plan 把 assertion set 和评估器怀疑点转成可执行检查。Plan 本身不是证据。
+`{stage}-exp` 把 assertion set、评估器怀疑点和 trace 观察转成可执行验证。Backlog / plan 本身不是证据。
 
 常用 mapping：
 
 | 检查目的 | direction | target_artifact |
 |-|-|-|
-| 正确答案要求是否有 KB 上界支撑 | `coverage_gap` | `kb_wide_recall` |
-| KB 支撑是否进入线上初召回 | `coverage_gap` | `online_origin_recall` |
-| 初召回支撑是否经过 rank / rerank | `coverage_gap` | `rerank_output` |
-| 支撑是否进入 prompt/context | `coverage_gap` | `prompt_context` |
-| 输出是否越过用户约束范围 | `scope_violation` | `answer_span` 或 `kb_wide_recall` |
-| 引用是否存在且支撑 claim | `citation_missing` | `online_origin_recall` / `rerank_output` / `prompt_context` |
-| KB 或输出是否存在冲突 | `internal_contradiction` | `kb_wide_recall` / `answer_span` |
+| `retrieval-exp`：正确答案要求是否有 KB 上界支撑 | `coverage_gap` | `kb_wide_recall` |
+| `retrieval-exp`：KB 支撑是否进入线上初召回 | `coverage_gap` | `online_origin_recall` |
+| `rerank-exp`：初召回支撑是否经过 rank / rerank | `coverage_gap` | `rerank_output` |
+| `context-exp`：支撑是否进入 prompt/context | `coverage_gap` | `prompt_context` |
+| `answer-exp`：输出是否越过用户约束范围 | `scope_violation` | `answer_span` 或 `kb_wide_recall` |
+| `citation-exp`：引用是否存在且支撑 claim | `citation_missing` | `online_origin_recall` / `rerank_output` / `prompt_context` |
+| `chunk-conflict-exp`：召回/prompt chunk 是否存在冲突 | `internal_contradiction` | `online_origin_recall` / `rerank_output` / `prompt_context` |
+
+现场观察到的典型分支：
+
+| 观察 | assertion / probe 倾向 |
+|-|-|
+| origin 有支撑、rerank 或 prompt 丢失 | `expected_required` + `rerank-exp` / `context-exp` |
+| prompt 已包含限制但答案遗漏 | `expected_required` + `answer-exp`，必要时 `partial_answer` |
+| 答案引用停用或 stale 文档 | `answer_claim` + `citation-exp`，检查引用是否支撑且是否有更新来源 |
+| prompt 混入冲突材料但答案未区分前提 | `chunk-conflict-exp` 或 `answer-exp` |
+| 文档只标题命中、正文无支撑 | 不计入覆盖；生成更具体的 `expected_required` 或 wide recall 检查 |
 
 ## 归因边界
 

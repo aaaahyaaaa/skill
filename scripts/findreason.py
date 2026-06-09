@@ -13,6 +13,8 @@ from findreason_core.v3 import (
     SCHEMA_VERSION,
     STAGE_ORDER,
     V3Error,
+    _normalize_assertion_inputs,
+    _raise_if_legacy_assertion_inputs,
     build_ingest_output,
     build_probe_result,
     fetch_openplat_trace_detail,
@@ -55,6 +57,7 @@ def _read_case_file(path: str | None) -> dict[str, Any]:
     if isinstance(payload.get("case_input"), dict):
         case = dict(payload["case_input"])
         for key in (
+            "answer_hint",
             "judgement_evidence",
             "host_agent",
             "answer_claims",
@@ -72,17 +75,65 @@ def _read_case_file(path: str | None) -> dict[str, Any]:
 
 
 def _trace_failure_ingest(args: argparse.Namespace, case: dict[str, Any], exc: V3Error) -> dict[str, Any]:
+    _raise_if_legacy_assertion_inputs(case)
+    app_id = str(args.app_id or case.get("app_id") or "unknown")
+    case_input: dict[str, Any] = {
+        "query": case.get("query") or "unknown query",
+        "judgement": case.get("judgement", ""),
+        "workspace_id": str(args.workspace_id),
+        "app_id": app_id,
+        "case_id": case.get("case_id") or args.log_id,
+        "expected_knowledge_ids": case.get("expected_knowledge_ids", []),
+    }
+    for key in ("query_hint", "source_row", "question_scene", "expected_answer", "oracle_skip_self"):
+        if case.get(key) not in (None, ""):
+            case_input[key] = case[key]
+    judgement_evidence = case.get("judgement_evidence") if isinstance(case.get("judgement_evidence"), dict) else {}
+    host_agent = case.get("host_agent") if isinstance(case.get("host_agent"), dict) else {}
+    qa: dict[str, Any] = {"wrong_citation": bool(case.get("wrong_citations"))}
+    raw_host_fields: dict[str, Any] = {}
+    answer_hint = str(case.get("answer_hint") or "").strip()
+    if answer_hint:
+        qa["answer"] = answer_hint
+        raw_host_fields["answer_hint"] = answer_hint
+    host_qa = case.get("qa") if isinstance(case.get("qa"), dict) else {}
+    for key in (
+        "prompt_supports_answer",
+        "answer_satisfies_expected",
+        "wrong_citation",
+        "partial_answer",
+        "hallucination",
+        "grader_or_rubric_issue",
+    ):
+        if key in host_qa:
+            qa[key] = host_qa[key]
+    wrong_citations = case.get("wrong_citations", [])
+    if wrong_citations:
+        raw_host_fields["wrong_citations"] = wrong_citations
+    attribution_request = _normalize_assertion_inputs(
+        {
+            "case_input": case_input,
+            "judgement_evidence": judgement_evidence,
+            "qa": qa,
+            "host_agent": {"answer_claim": host_agent.get("answer_claim", [])},
+            **({"raw_host_fields": raw_host_fields} if raw_host_fields else {}),
+        }
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "trace_lookup_failed",
         "log_id": args.log_id,
         "workspace_id": str(args.workspace_id),
-        "app_id": str(args.app_id or case.get("app_id") or ""),
+        "app_id": app_id,
         "case": {
-            "query": case.get("query", ""),
-            "judgement": case.get("judgement", ""),
-            "expected_knowledge_ids": case.get("expected_knowledge_ids", []),
-            "unsupported_claims": case.get("unsupported_claims", []),
+            "query": case_input.get("query", ""),
+            "judgement": case_input.get("judgement", ""),
+            "expected_knowledge_ids": case_input.get("expected_knowledge_ids", []),
+            "host_agent": {
+                "answer_claim": attribution_request.get("host_agent", {}).get("answer_claim", [])
+                if isinstance(attribution_request.get("host_agent"), dict)
+                else []
+            },
             "wrong_citations": case.get("wrong_citations", []),
         },
         "ingest_summary": {
@@ -99,21 +150,7 @@ def _trace_failure_ingest(args: argparse.Namespace, case: dict[str, Any], exc: V
         },
         "raw_artifacts": {
             "trace_fetch_error": exc.to_payload(),
-            "attribution_request": {
-                "case_input": {
-                    "query": case.get("query") or "unknown query",
-                    "judgement": case.get("judgement", ""),
-                    "workspace_id": str(args.workspace_id),
-                    "app_id": str(args.app_id or case.get("app_id") or "unknown"),
-                    "case_id": args.log_id,
-                    "expected_knowledge_ids": case.get("expected_knowledge_ids", []),
-                },
-                "judgement_evidence": case.get("judgement_evidence", {}),
-                "qa": {
-                    "unsupported_claims": case.get("unsupported_claims", []),
-                    "wrong_citation": bool(case.get("wrong_citations")),
-                },
-            },
+            "attribution_request": attribution_request,
         },
     }
 
@@ -174,6 +211,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
             "workspace_id": payload.get("workspace_id"),
             "app_id": payload.get("app_id"),
             "primary_cause": payload.get("primary_cause"),
+            "secondary_findings": payload.get("secondary_findings", {}),
             "failure_patterns": payload.get("failure_patterns", []),
             "needs_human_review": payload.get("needs_human_review"),
             "human_review_reasons": payload.get("human_review_reasons", []),
@@ -267,6 +305,7 @@ def _cmd_schema(args: argparse.Namespace) -> int:
                 "required": ["plan", "ingest_file or workspace_id+log_id"],
                 "optional": ["output_dir", "no_cache"],
                 "plan_schema_version": "probe-v1",
+                "probe_optional_fields": ["display_name", "exp_kind", "trigger_source", "trigger_observation", "hypothesis"],
             },
             "fetch-workflow-nodes": {"required": ["workspace_id", "app_id"]},
             "replay-workflow": {"required": ["ingest_file or workspace_id+log_id"], "exclusive": True},
@@ -281,6 +320,7 @@ def _cmd_schema(args: argparse.Namespace) -> int:
                 "oracle_status",
                 "case_assessment",
                 "primary_cause",
+                "secondary_findings",
                 "failure_patterns",
                 "needs_human_review",
                 "human_review_reasons",
