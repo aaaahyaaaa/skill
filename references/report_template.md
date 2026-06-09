@@ -1,87 +1,89 @@
-# FindReason v3 报告模板
+# FindReason v3 人读诊断报告模板
 
-`orchestrate --output-dir` 会写入 `final/case_report.md`，内容与 `human_report_markdown` 一致。报告正文优先展示结论、答案观察、必要断言和阶段归因；原始 workflow input/output 只放在附录中做有界摘录。完整 trace、workflow span I/O、probe 原始输出保留在 `attribution_record.json`。
+`orchestrate --output-dir` 默认只写一份人读 Markdown：`final/case_report.md`，内容与 `human_report_markdown` 一致。不要再默认生成 `agent_run_process.md` 或 `diagnostic_timeline.md`；JSON 继续承担审计和机器消费。
+
+报告目标是让用户看懂“Agent 为什么这么查、查了哪里、怎么验证、最终为什么判这个阶段”。避免把 `exp_kind`、`target_artifact`、`hit`、`converged_direction`、probe id 等 runtime tag 直接塞进正文。
 
 ## 1. 结论摘要
 
-- `primary_cause.stage` / `primary_cause.cause_code` / confidence / owner
-- `case_assessment.status` 和一句话原因
-- `needs_human_review` 与人工复核原因
-- 主因选择依据，避免堆叠所有 evidence JSON
+- 主因阶段、主因枚举、confidence、owner。
+- `case_assessment.status` 与一句话原因。
+- `needs_human_review` 与人工复核原因。
+- 主因选择依据，避免堆叠完整 evidence JSON。
 
-## 2. 问题与答案观察
+## 2. 现场输入与答案
 
-- `log_id`、`workspace_id`、`app_id`
-- 真实 query 的短摘要
-- 原始答案和答案状态：已给出答案 / 未给出答案
-- answer-side 检查信号：`prompt_supports_answer`、`answer_satisfies_expected`、`partial_answer`、`wrong_citation`、`scope_violation`、`branching_unclear`
-- trace 是否可用
-- origin / faq / rerank / prompt 文档数量
+- `log_id`、`workspace_id`、`app_id`。
+- 用户问题、答案摘要、答案状态。
+- 答案检查信号用中文标签展示，例如“Prompt 是否支撑答案”“答案是否满足期望”“是否漏答”“是否错引”。
+- trace 是否可用，以及 origin / faq / rerank / prompt 文档数量。
+- Workflow 原始完整输入和 Workflow 原始完整输出，直接放在本节，避免读者跑到报告末尾找现场。
+- 输入边界：用户实际问题、Workflow 原始输入、预处理输出，以及关键约束是否丢失。
 
-### 评估器线索
+## 3. 验证过程：我怎么查的
 
-- 压缩后的 `judgement_evidence.signals`
+每个执行后的验证项渲染为中文卡片，而不是英文表格：
 
-### 输入边界
+- `我为什么查这个`：来自 `trigger_observation`，缺失时用 `hypothesis`。
+- `我查了哪里`：把 artifact 显示为“理论召回上界 / 线上初召回 / 重排结果 / Prompt 上下文 / 最终答案”。
+- `我怎么验证`：说明用哪个 query / pattern 在目标 artifact 中查找。
+- `验证结果`：显示“命中 / 未命中 / 未执行 / 无法判断”。
+- `支撑证据`：若有 `matched_docs`，每个文档单独展示标题、链接和命中片段，链接必须是独立 Markdown 链接，不能和正文片段挤在同一串 URL 中。
+- `这说明什么`：优先使用中文 `if_hit/if_miss`；英文结论必须转成中文解释。
 
-- 用户实际问题/评估问题线索
-- Workflow 原始输入
-- 预处理输出（rewrite query / keywords）
-- 如果用户约束未进入 Workflow 原始输入，报告先写输入边界风险；只有受影响断言在理论召回上界可支撑、但线上初召回缺失时，才写 `workflow_input_loss`
-- 如果同一断言已经进入 online origin / rerank / prompt，报告写“输入差异未证明影响输出”，继续展示下游主因
-- 如果 Workflow 输入完整但预处理输出丢失，报告写 `query_rewrite_drift` 或 `keyword_loss`
+`probe_id` 只留在 JSON。展示名优先用 `display_name`；没有时从 `probe_id` 派生短名，并清理 `P-`、`P_` 和时间戳式前缀。
 
-## 3. 必要断言
+## 4. 阶段裁决：问题最早断在哪
 
-- `expected_required`：正确输出应覆盖的检查点
-- answer / check 观察：`answer_claim`、`unsupported_claim`、`constraint_check`、`citation_check`、`consistency_check`
-- answer / check 观察只用于 answer grounding / scope / citation / consistency 检查，不进入上游覆盖矩阵
+阶段、状态和原因必须中文化：
 
-## 4. 断言覆盖矩阵
+| 内部阶段 | 报告展示 |
+|-|-|
+| `preprocess` | 输入/改写 |
+| `knowledge` | 知识库 |
+| `retrieval` | 初召回 |
+| `rerank` | 重排 |
+| `context` | Prompt 拼接 |
+| `answer` | 答案生成 |
+| `evaluation` | 评估器 |
 
-- 只展示去重后的 `expected_required` 在线上 `origin -> rerank -> prompt` 的支撑状态
-- 如果行内有 `merged_from`，表示多个原始断言已按“场景约束 + 同一入口/路径要求”保守合并，原始断言只作审计不重复计入矩阵
-- 断言级断点：knowledge / retrieval / rerank / context / unavailable
+状态展示为“通过 / 失败 / 证据不足 / 上游阻塞 / 未验证”。阶段裁决里不要直接输出英文 counterfactual reason；常见英文 reason 要映射为中文。
 
-## 5. 召回上界与知识判断
+## 5. 关键证据与文档
 
-- oracle 来源、置信度、冲突状态
-- 理论召回上界状态、范围、topK、query variants、召回数量
-- 理论召回上界与必要断言的关系：doc ID、title、matched terms、support status、support spans
-- 如果理论上界也不能支撑必要断言，更偏向 knowledge missing；如果理论上界能支撑但线上 origin 未命中，更偏向 retrieval miss
+- Answer findings：展示错引、漏答、越界、分支前提不清等伴随发现。
+- 评估器线索：只作为观察，不决定主因。
+- 必要断言：`expected_required` 与 answer/check 观察分开展示。
+- 断言覆盖矩阵：聚焦线上 `origin -> rerank -> prompt`。
+- 理论召回上界与断言关系：doc ID、title、matched terms、support status、support spans。
+- 召回 chunk 冲突风险：列出阶段、doc/chunk、冲突片段；只有影响必要断言且无清晰适用前提时才升级为知识内部不一致。
 
-## 6. 阶段归因链路
+文档证据格式：
 
-| 阶段 | 结论 | 关键依据 |
-|-|-|-|
-| preprocess | pass/fail/indeterminate | rewrite、route、keyword evidence |
-| knowledge | pass/fail/indeterminate | knowledge exists 或必要断言上界支撑 |
-| retrieval | pass/fail/indeterminate | online origin recall 是否覆盖必要断言 |
-| rerank | pass/fail/indeterminate | 必要断言是否从 origin 到 rerank 丢失 |
-| context | pass/fail/indeterminate | 必要断言是否从 rerank 到 prompt 丢失 |
-| answer | pass/fail/indeterminate | prompt support、unsupported claim、citation、scope、consistency |
-| evaluation | observation-only | evaluator signals |
+```markdown
+- 2033060 巨量千川「破圈尖货」产品手册
+  - 文档链接：[打开文档](https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id?source=COGNITION&identifier=2033060)
+  - 命中片段：...
+```
 
-## 7. Probe 结果
+优先使用 doc 自带 `url/link/doc_url/source_url`；没有链接但 doc id 是数字时，用知识详情接口 URL 作为可核对链接。
 
-- `run-probe-plan` 每个 probe 的 direction、target artifact、hit、converged direction
-- plan 本身不是证据；只展示执行后的 hit/miss 和 matched support
+## 6. 下一步建议
 
-## 8. 下一步
+- owner。
+- P0/P1 action。
+- 如果主因为 `null`，说明还缺哪类 evidence。
 
-- owner
-- P0/P1 action
-- 如果主因为 null，说明还缺哪类 evidence
+## 7. 审计 JSON 索引
 
-## 附录：原始 Trace 摘录
+- `final/case_report.md`：唯一人读报告。
+- `final/short_summary.json`：结构化摘要。
+- `final/attribution_record.json`：完整审计。
+- `final/attribution_record.json.raw_artifacts.probe_outputs`：验证原始输出。
+- `final/attribution_record.json.raw_artifacts.workflow_span_ios`：Workflow input/output 完整值。
 
-- selected workflow span id / node id
-- workflow input 摘录
-- workflow output 摘录
-- 如内容被截断，报告应指向 `final/attribution_record.json.raw_artifacts.workflow_span_ios`
+本节只放审计入口，不再重复展示 Workflow 输入/输出；完整现场已经在第 2 节展示。
 
-## 边界
+## Rerank 边界
 
-- 不把 evaluator reason 当最终事实裁判。
-- 不把 `answer_claim` 反推为 `expected_required`。
-- 不因 doc ID 没进 rerank / prompt 直接判 `rerank_drop` / `context_assembly_error`；必须证明必要断言支撑在对应阶段丢失。
+`probe-rerank-bypass` 只比较关键 doc ID 是否从初召回进入重排/Prompt，是“重排生存观察”，不是 curl 重跑 rerank，也不是线上 rerank 参数实验。报告中写“重排观察：关键文档是否在重排后消失”，并明确这只是 doc ID 生存观察。不能单凭该观察选择 `rerank_drop`。

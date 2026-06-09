@@ -38,4 +38,5 @@ Evaluation 在 v3 中只作为观察层，没有官方 cause code。
 | `coverage_gap` | kb_wide_recall / online_origin_recall / rerank_output / prompt_context | 进入确定性的断言级覆盖链路；只有 required assertion 的 hit/miss 可驱动 knowledge / retrieval / rerank / context。 |
 | `scope_violation` | kb_wide_recall | miss → `answer_scope_violation`。 |
 | `citation_missing` | online_origin_recall / rerank_output | hit → `wrong_citation`；miss → `suspected_knowledge_missing`（缺少权威来源）。 |
-| `internal_contradiction` | answer_span / kb_wide_recall | hit → `answer_branching_unclear`；miss → `knowledge_internal_inconsistency`。 |
+| `internal_contradiction` | answer_span | hit → `answer_branching_unclear`。 |
+| `internal_contradiction` | online_origin_recall / rerank_output / prompt_context / kb_wide_recall | hit → `chunk_internal_conflict` 风险；只有影响 `expected_required` 且没有清晰适用前提时才升级为 `knowledge_internal_inconsistency`。 |

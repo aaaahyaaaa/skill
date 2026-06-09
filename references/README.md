@@ -4,22 +4,23 @@
 
 ```text
 trace hydration
+  -> 动态诊断 backlog
   -> evaluator compression
-  -> Agent attribution planning
-  -> CLI/probe evidence execution
+  -> selected {stage}-exp execution
   -> orchestrate
 ```
 
 ## 核心口径
 
 - Trace artifacts 是 workflow 现场的权威来源。外部 `query` / `answer` 只作为用户实际问题/评估问题线索或 hint；Workflow 原始输入/输出必须从 trace 的 `workflow_span_ios` 读取。
+- 宿主 Agent 先做动态诊断 backlog，读取 workflow input/output、rewrite/keywords、`origin -> rerank -> prompt` 文档生存路径、停用或 stale 来源、引用支撑、prompt-vs-answer alignment 和 chunk 冲突风险；backlog 只用于选择 assertion、`{stage}-exp` 和报告重点，不直接决定 `primary_cause`。
 - 输入边界先于 RAG 链路归因，但不能只凭 query 差异判主因：只有用户约束未进入 Workflow 原始输入，且受影响的 `expected_required` 在理论召回上界可支撑、线上初召回缺失时，才判 `workflow_input_loss`。如果同一断言已经进入线上 origin / rerank / prompt，输入差异只作为风险信号，继续判断下游。
 - 评估器输出只压缩为 `judgement_evidence.signals`，用于说明“怀疑哪里坏了”；它不直接决定 `primary_cause`。
 - 字段契约只保留最新约定字段，不为旧字段、旧 role、旧 env var 或旧 schema alias 做自动映射；过时断言字段应 fail fast。
 - `host_agent.answer_claim` 是宿主 Agent 产出的唯一 assertion set 输入字段。
 - 主设计只使用 `expected_required` 和 `answer_claim` 两个核心 role。
 - `expected_required` 驱动 knowledge / retrieval / rerank / context 覆盖链路；`answer_claim` 用于 output grounding、scope、citation 和 consistency 检查。
-- `probe-v1` plan 是实验计划，不是证据。只有 `run-probe-plan` 执行后的 hit/miss、matched docs、support spans 和 evidence IDs 才能进入 `orchestrate`。
+- 未执行的 hypothesis / backlog item 不是证据。只有 `{stage}-exp` 执行后的 hit/miss、matched docs、support spans、实验结果和 evidence IDs 才能进入 `orchestrate`。
 
 ## 当前正式入口
 
@@ -30,9 +31,9 @@ trace hydration
 
 ## 主要文档
 
-- `agent_attribution_planning.md`：宿主 Agent 如何从 trace artifacts 和评估器信号生成 assertion set 与 `probe-v1` plan。
+- `agent_attribution_planning.md`：宿主 Agent 如何从 trace artifacts、动态 backlog 和评估器信号生成 assertion set 与 `{stage}-exp`。
 - `field_contract.md`：case 输入、ingest 输出和 orchestrate 输出字段契约。
-- `probe-spec.md`：probe 输出格式、缓存、失败语义和 `run-probe-plan` 契约。
+- `probe-spec.md`：验证环节输出格式、缓存、失败语义和 `run-probe-plan` 兼容契约。
 - `cause-codes.md`：v3 cause enum、owner 和边界。
 - `orchestrator-rules.md`：counterfactual 与 primary cause 选择规则。
 - `host_agent_playbook.md`：端到端宿主 Agent 操作流程。
@@ -41,4 +42,4 @@ trace hydration
 
 ## 已移除旧能力
 
-`probe-by-judgement`、`probe-by-claim`、`probe-by-doc-title`、`probe-rerank-tune` 已从 CLI 和 capability manifest 中移除。语义判断、问题拆解和探针规划由宿主 Agent 按 `agent_attribution_planning.md` 完成，并交给 `run-probe-plan` 执行确定性检查。
+`probe-by-judgement`、`probe-by-claim`、`probe-by-doc-title`、`probe-rerank-tune` 已从 CLI 和 capability manifest 中移除。语义判断、问题拆解和动态验证规划由宿主 Agent 按 `agent_attribution_planning.md` 完成，并交给对应 `{stage}-exp` 或兼容 `run-probe-plan` 执行确定性检查。

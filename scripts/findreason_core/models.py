@@ -34,6 +34,7 @@ class CaseInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(..., min_length=1)
+    query_hint: Optional[str] = None
     judgement: str = ""
     workspace_id: str = Field(..., min_length=1)
     app_id: str = Field(..., min_length=1)

@@ -18,13 +18,15 @@
 - `judgement_evidence.signals`
 - `wrong_citations`
 - `host_agent.answer_claim`
-- `answer` / `answer_hint`
+- `answer_hint`
 - `qa.prompt_supports_answer`
 - `qa.answer_satisfies_expected`
 
 `judgement_evidence.signals` 序列化后必须小于等于 2KB。
 
-外部 `query` / `answer` 只作为 hint。`case_input.query` 优先表示用户实际问题或评估器问题线索，不得被当作 Workflow 原始输入；真实 Workflow 原始输入/输出以 `raw_artifacts.workflow_span_ios[].input/output` 为权威。`rewrite_query`、`keywords` 是 Workflow 内部预处理节点输出，用于判断预处理是否丢语义，不能覆盖 Workflow 原始输入。
+外部 `query_hint` / `answer_hint` 只作为 hint。外部表格或评估器答案统一写 `answer_hint`；ingest 只在 trace 没有 workflow output 时把它规范化到内部 `qa.answer`，不得用外部答案覆盖真实 Workflow 输出。`case_input.query` 优先表示用户实际问题或评估器问题线索，不得被当作 Workflow 原始输入；真实 Workflow 原始输入/输出以 `raw_artifacts.workflow_span_ios[].input/output` 为权威。`rewrite_query`、`keywords` 是 Workflow 内部预处理节点输出，用于判断预处理是否丢语义，不能覆盖 Workflow 原始输入。
+
+`log_id` 是 Fornax trace 查询和 `trace_summary.log_id` 的唯一链路标识。`case_id` / `source_row` 只表示外部样本或表格行，不能覆盖或回填为 `log_id`。
 
 当用户实际问题或评估器用户上下文线索与 Workflow 原始输入存在关键约束差异时，orchestrate 应先记录输入边界风险，但不能直接输出 `workflow_input_loss`。只有受影响的 `expected_required` 已绑定到 `point_coverage`，且该断言在理论召回上界可支撑、online origin recall 缺失时，才能把该风险升级为 `workflow_input_loss` 主因。如果同一断言已被 online origin / rerank / prompt 支撑，说明输入差异没有切断正确证据链，应继续比较 `rewrite_query` / `keywords` 或下游阶段。
 
@@ -62,6 +64,7 @@
 - `log_id`
 - `workspace_id`
 - `primary_cause`
+- `secondary_findings`
 - `oracle_status`
 - `case_assessment`
 - `failure_patterns`
@@ -75,3 +78,5 @@
 - `raw_artifacts`
 
 `primary_cause` 要么是包含 `stage`、`cause_code`、`confidence`、`owner`、`selection_rationale` 的对象，要么在归因被阻塞时为 `null`。
+
+`secondary_findings` 是只读补充发现，不参与主因选择；可包含 `answer_findings` 和 `chunk_conflict_findings`。

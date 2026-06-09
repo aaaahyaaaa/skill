@@ -9,6 +9,7 @@
     "oracle_status",
     "case_assessment",
     "primary_cause",
+    "secondary_findings",
     "failure_patterns",
     "needs_human_review",
     "human_review_reasons",
@@ -69,6 +70,13 @@
         "confidence": {"type": "number"},
         "owner": {"type": "string"},
         "selection_rationale": {"type": "string"}
+      }
+    },
+    "secondary_findings": {
+      "type": "object",
+      "properties": {
+        "answer_findings": {"type": "array"},
+        "chunk_conflict_findings": {"type": "array"}
       }
     },
     "failure_patterns": {"type": "array", "items": {"type": "string"}},

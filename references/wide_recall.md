@@ -9,7 +9,7 @@
 - 设置 `maxCount=max(50, original maxCount)`
 - 将阈值类参数（`score`、`精选`、`内容中台`、`min_score`）降为 `0`
 
-探针通过 `get-workspace-info?workspaceId=<id>` 获取 workspace apiKey，并只使用 `OPEN_PLAT_ZS_OPEN_TOKEN` 作为 bootstrap token。apiKey 只在内存中使用，不能写入报告或 JSON。
+`retrieval-exp` 通过 `get-workspace-info?workspaceId=<id>` 获取当前 workspace 的 `authInfo.apiKey`，并只使用 `OPEN_PLAT_ZS_OPEN_TOKEN` 作为 bootstrap token。apiKey 只在内存中使用，不能写入报告或 JSON；获取失败时不得 fallback 到跨空间 token。
 
 探针输出的解释方式：
 

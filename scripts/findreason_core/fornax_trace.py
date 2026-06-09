@@ -47,6 +47,7 @@ class FornaxTraceIngestRequest(BaseModel):
     app_id: str = ""
     query: str = ""
     judgement: str = ""
+    log_id: str = ""
     case_id: Optional[str] = None
     source_row: Optional[str] = None
     fornax_space_id: str = ""
@@ -740,7 +741,7 @@ def ingest_fornax_trace(payload: Any, request: FornaxTraceIngestRequest) -> Forn
         (workflow_in.get("sys") or {}).get("query") if isinstance(workflow_in.get("sys"), dict) else "",
     )
     answer = _first_nonempty(qa_out.get("answer"), workflow_out.get("end"), end_output if isinstance(end_output, str) else "")
-    log_id = _first_nonempty(request.case_id, *(span.get("logid") for span in spans))
+    log_id = _first_nonempty(request.log_id, *(span.get("logid") for span in spans), request.case_id)
     case_id = request.case_id or log_id or "fornax-trace"
     fornax_space_id = _first_nonempty(request.fornax_space_id, _first_tag(spans, "fornax_space_id"))
 

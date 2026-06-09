@@ -211,6 +211,7 @@ def _case_payload(case_file: str | None) -> dict[str, Any]:
     if isinstance(payload, dict) and isinstance(payload.get("case_input"), dict):
         case = dict(payload["case_input"])
         for key in (
+            "answer_hint",
             "judgement_evidence",
             "host_agent",
             "answer_claims",
@@ -357,9 +358,6 @@ def _deep_find_api_key(value: Any) -> str:
 
 def _resolve_workspace_api_key(workspace_id: str, *, timeout_seconds: int = 30) -> tuple[str, str]:
     load_runtime_env()
-    direct_token = os.getenv("WORKFLOW_AUTH_TOKEN", "").strip()
-    if direct_token:
-        return direct_token, "WORKFLOW_AUTH_TOKEN"
     bootstrap_token, bootstrap_source = _openplat_token()
     if not bootstrap_token:
         return "", "not_configured"
@@ -611,7 +609,7 @@ def _run_sirius_open_label_wide_recall(
         return {
             "status": "not_configured",
             "error": "",
-            "notes": "未配置 OPEN_PLAT_ZS_OPEN_TOKEN 或 WORKFLOW_AUTH_TOKEN，跳过 Sirius 宽召回。",
+            "notes": "未配置 OPEN_PLAT_ZS_OPEN_TOKEN，无法获取当前 workspace 的 authInfo.apiKey，跳过 Sirius 宽召回。",
             "query_variants": query_variants,
             "upper_bound_scope": "open_label",
             "auth_token_source": auth_source,
@@ -756,9 +754,19 @@ def _apply_host_case_fields(request_dict: dict[str, Any], case: dict[str, Any], 
     case_input = request_dict.setdefault("case_input", {})
     if app_id:
         case_input["app_id"] = app_id
-    if log_id:
-        case_input["case_id"] = case_input.get("case_id") or log_id
-    for key in ("query", "judgement", "workspace_id", "expected_answer", "source_row", "question_scene", "oracle_skip_self"):
+    case_id = _text(case.get("case_id"))
+    if case_id or log_id:
+        case_input["case_id"] = case_id or case_input.get("case_id") or log_id
+    for key in (
+        "query",
+        "query_hint",
+        "judgement",
+        "workspace_id",
+        "expected_answer",
+        "source_row",
+        "question_scene",
+        "oracle_skip_self",
+    ):
         if case.get(key) not in (None, ""):
             case_input[key] = case[key]
     if "is_knowledge_qa" in case:
@@ -787,6 +795,11 @@ def _apply_host_case_fields(request_dict: dict[str, Any], case: dict[str, Any], 
         request_dict.setdefault("host_agent", {})["answer_claim"] = answer_claim
 
     qa = request_dict.setdefault("qa", {})
+    answer_hint = _text(case.get("answer_hint"))
+    if answer_hint:
+        request_dict.setdefault("raw_host_fields", {})["answer_hint"] = answer_hint
+        if not qa.get("answer"):
+            qa["answer"] = answer_hint
     host_qa = case.get("qa") if isinstance(case.get("qa"), dict) else {}
     for key in (
         "prompt_supports_answer",
@@ -953,6 +966,7 @@ def build_ingest_output(
         app_id=str(resolved_app_id or ""),
         query=_text(case.get("query")),
         judgement=_text(case.get("judgement")),
+        log_id=log_id,
         case_id=_text(case.get("case_id")) or log_id,
         source_row=_text(case.get("source_row")) or None,
         fornax_space_id=_text(case.get("fornax_space_id")),
@@ -1428,6 +1442,13 @@ def _merge_probe_signals(request_dict: dict[str, Any], probes: list[dict[str, An
             merged.setdefault("retrieval", {})["lacks_authoritative_source"] = True
         if knowledge.get("internal_inconsistency") is True:
             merged.setdefault("retrieval", {})["knowledge_internal_inconsistency"] = True
+        if knowledge.get("chunk_internal_conflict") is True:
+            merged.setdefault("retrieval", {})["chunk_internal_conflict"] = True
+            conflicts = knowledge.get("chunk_conflicts")
+            if isinstance(conflicts, list):
+                existing = merged.setdefault("retrieval", {}).setdefault("chunk_conflicts", [])
+                if isinstance(existing, list):
+                    existing.extend(conflicts)
         if answer.get("prompt_supports_answer") is not None:
             merged.setdefault("qa", {})["prompt_supports_answer"] = answer.get("prompt_supports_answer")
         if answer.get("answer_satisfies_expected") is not None:
@@ -1698,6 +1719,8 @@ def _infer_verdicts(
             "probe_state": probe_state.get("knowledge_exists_state"),
             "oracle_status": probe_state.get("oracle_status"),
             "knowledge_gap_points": retrieval.get("knowledge_gap_points", []),
+            "chunk_internal_conflict": retrieval.get("chunk_internal_conflict"),
+            "chunk_conflicts": retrieval.get("chunk_conflicts", []),
         },
     )
     knowledge_gap_points = _string_list(retrieval.get("knowledge_gap_points"))
@@ -2259,6 +2282,7 @@ def orchestrate_v3(
         human_review_reasons.append("当前为 preliminary 模式，仍需补充探针证据")
     human_review_reasons = list(dict.fromkeys(human_review_reasons))
     next_actions = _next_actions(primary, verdicts, case_assessment)
+    secondary_findings = _secondary_findings(request_dict)
     telemetry = {
         "probes_invoked": [probe.get("probe_name") for probe in probes if probe.get("probe_name")],
         "probe_latencies_ms": {
@@ -2277,6 +2301,7 @@ def orchestrate_v3(
         "oracle_status": oracle_status,
         "case_assessment": case_assessment,
         "primary_cause": primary,
+        "secondary_findings": secondary_findings,
         "failure_patterns": patterns,
         "needs_human_review": bool(human_review_reasons),
         "human_review_reasons": human_review_reasons,
@@ -2302,21 +2327,21 @@ def _report_json(value: Any) -> str:
 
 
 STAGE_DISPLAY = {
-    "preprocess": "输入改写",
-    "knowledge": "知识是否存在",
+    "preprocess": "输入/改写",
+    "knowledge": "知识库",
     "retrieval": "初召回",
     "rerank": "重排",
-    "context": "Prompt 组装",
+    "context": "Prompt 拼接",
     "answer": "答案生成",
-    "evaluation": "评估器信号",
+    "evaluation": "评估器",
 }
 
 STATUS_DISPLAY = {
     "pass": "通过",
     "fail": "失败",
-    "indeterminate": "无法判定",
-    "blocked": "被阻塞",
-    "not_probed": "未探测",
+    "indeterminate": "证据不足",
+    "blocked": "上游阻塞",
+    "not_probed": "未验证",
 }
 
 CAUSE_DISPLAY = {
@@ -2334,10 +2359,19 @@ CAUSE_DISPLAY = {
     "unsupported_claim": "答案存在未支撑断言",
     "wrong_citation": "引用错误",
     "partial_answer": "回答不完整",
+    "answer_scope_violation": "答案越界",
+    "answer_branching_unclear": "答案分支前提不清",
 }
 
 OWNER_DISPLAY = {
     "manual_review": "人工复核",
+    "agent_router_owner": "路由负责人",
+    "rag_preprocess_or_workflow_owner": "输入改写负责人",
+    "kb_owner": "知识库负责人",
+    "retrieval_strategy_owner": "召回负责人",
+    "knowledge_permission_owner": "权限负责人",
+    "workflow_or_prompt_context_owner": "Prompt 拼接负责人",
+    "prompt_or_model_owner": "答案生成负责人",
     "workflow_input_owner": "Workflow 输入负责人",
     "preprocess_owner": "输入改写负责人",
     "knowledge_owner": "知识库负责人",
@@ -2362,12 +2396,19 @@ REASON_DISPLAY = {
     "knowledge exists": "已确认相关知识存在。",
     "knowledge existence unknown after retry": "没有期望知识 ID 或知识探针仍无法确认知识是否存在，因此不能判断是知识缺失还是后续链路问题。",
     "retrieval hit expected evidence": "初召回命中了期望知识。",
+    "required assertions are covered in the online evidence chain; doc-id-only retrieval mismatch ignored": "必要断言已经被线上证据链覆盖；单纯 doc ID 不一致不作为召回失败。",
     "retrieval hit evidence missing": "缺少“是否命中期望知识”的证据。",
     "rerank survival evidence missing": "缺少“期望知识是否通过重排”的证据。",
+    "required assertions survived into prompt; doc-id-only rerank drop ignored": "必要断言已经进入 Prompt；单纯 doc ID 在重排阶段变化不作为重排失败。",
+    "expected doc survived rerank": "期望文档通过了重排。",
     "prompt_docs evidence present": "Prompt 中已有可用文档。",
+    "required assertions reached prompt; doc-id-only prompt mismatch ignored": "必要断言已经进入 Prompt；单纯 doc ID 未进入 Prompt 不作为上下文组装失败。",
     "prompt_docs/context evidence missing": "缺少 Prompt 组装后的文档证据。",
     "answer alignment evidence missing": "缺少答案与 Prompt 文档的支撑关系判断。",
     "answer satisfies expected output": "答案满足期望。",
+    "answer would change if generation/citation behavior were fixed": "如果修正答案生成、引用选择或范围控制，下游答案会变化。",
+    "regenerate with faithful use of prompt_docs and citation mapping": "基于 Prompt 文档和引用映射重新生成答案。",
+    "answer flags exist but prompt_supports_answer/answer_satisfies_expected precondition is not proven": "已有答案侧风险标记，但还缺少 Prompt 支撑和答案满足性前提，暂不能自动下结论。",
     "evaluation is observation-only in v3": "评估器结果只作为问题线索，不单独决定主因。",
     "rewrite_query/keywords evidence missing": "缺少改写 query 或关键词证据。",
     "stage excluded by --only-stages": "该阶段本次未纳入探测。",
@@ -2377,17 +2418,28 @@ REASON_DISPLAY = {
     "rerank kept candidate docs without expected knowledge labels": "重排后仍有候选文档；由于未提供期望知识 ID，不能判断是否误杀了正确知识。",
     "rerank dropped all recalled candidates": "重排把初召回候选全部过滤掉了。",
     "reranked candidates did not enter prompt_docs": "重排后有候选文档，但最终没有进入 Prompt 文档。",
+    "expected assertions missing; host Agent must supply fact assertions": "缺少宿主 Agent 提供的必要事实断言，无法判断知识库阶段。",
+    "expected assertions missing; retrieval cannot be judged against a target": "缺少必要事实断言，初召回没有可验证目标。",
+    "expected assertions missing; rerank cannot be judged against a target": "缺少必要事实断言，重排没有可验证目标。",
+    "expected assertions missing; prompt assembly cannot be judged against a target": "缺少必要事实断言，Prompt 拼接没有可验证目标。",
+    "retrieval returned no candidate docs": "初召回没有返回候选文档。",
+    "rerank dropped all recalled candidates, but no required assertion target is proven": "重排丢掉了初召回候选，但还没有证明必要断言在这里丢失。",
+    "expected doc ID did not survive rerank, but doc-id-only evidence does not prove the required assertion was lost": "期望 doc ID 没有通过重排；但只有 doc ID 变化，不能证明必要断言在重排阶段丢失。",
+    "expected doc ID did not enter prompt, but doc-id-only evidence does not prove the required assertion was lost": "期望 doc ID 没有进入 Prompt；但只有 doc ID 变化，不能证明必要断言在 Prompt 拼接阶段丢失。",
     "self-oracle expected docs missed online retrieval": "self-oracle 推断的期望知识没有进入线上初召回。",
     "self-oracle expected docs were recalled but dropped by rerank": "self-oracle 推断的期望知识已被召回，但重排后丢失。",
     "self-oracle expected docs survived upstream but did not enter prompt": "self-oracle 推断的期望知识通过了上游，但没有进入最终 Prompt。",
     "adding the missing knowledge would change downstream recall": "补齐缺失知识后，下游召回预期会变化。",
+    "affected required assertions were already supported by online origin/rerank/prompt evidence": "受影响的必要断言已经被线上初召回、重排或 Prompt 证据支撑，因此输入差异没有切断正确证据链。",
+    "affected required assertions are unsupported by the theoretical recall upper bound; do not blame workflow input": "受影响的必要断言在理论召回上界也没有支撑，不能把主因归到 Workflow 输入。",
+    "affected required assertions are recoverable in the theoretical upper bound but absent from online origin recall": "受影响的必要断言在理论召回上界可恢复，但线上初召回缺失，需要检查输入到召回链路的影响。",
 }
 
 
 def _display_stage(stage: Any) -> str:
     value = str(stage or "")
     label = STAGE_DISPLAY.get(value, value or "unknown")
-    return f"{label}（{value}）" if value and label != value else label
+    return label
 
 
 def _display_status(status: Any) -> str:
@@ -2450,6 +2502,38 @@ def _display_reason(reason: Any) -> str:
     prefix = "self-oracle expected docs survived upstream but did not enter prompt: "
     if text.startswith(prefix):
         return f"self-oracle 推断的期望知识通过上游，但没有进入最终 Prompt：{text[len(prefix):]}"
+    prefix = "required assertions are covered in the online evidence chain; "
+    if text.startswith(prefix):
+        return f"必要断言已经被线上证据链覆盖；{text[len(prefix):]}"
+    prefix = "required assertions survived into prompt; "
+    if text.startswith(prefix):
+        return f"必要断言已经进入 Prompt；{text[len(prefix):]}"
+    prefix = "self-oracle inferred doc IDs did not survive rerank, but no required assertion gap is proven: "
+    if text.startswith(prefix):
+        return f"self-oracle 推断的 doc ID 未通过重排，但还没有证明必要断言在重排阶段丢失：{text[len(prefix):]}"
+    prefix = "self-oracle inferred doc IDs did not enter prompt, but no required assertion gap is proven: "
+    if text.startswith(prefix):
+        return f"self-oracle 推断的 doc ID 未进入 Prompt，但还没有证明必要断言在 Prompt 拼接阶段丢失：{text[len(prefix):]}"
+    return text
+
+
+def _display_selection_rationale(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for stage in STAGE_ORDER:
+        text = text.replace(f"阶段 [{stage}]", f"阶段 {_display_stage(stage)}")
+    text = text.replace("counterfactual.downstream_would_change=true", "修复该阶段后下游结果会变化")
+    text = text.replace("evidence", "证据")
+    text = text.replace("stage", "阶段")
+    text = text.replace("该阶段 修复该阶段后下游结果会变化", "修复该阶段后下游结果会变化")
+    return text
+
+
+def _display_case_reason(value: Any) -> str:
+    text = str(value or "").strip()
+    for cause, label in CAUSE_DISPLAY.items():
+        text = text.replace(cause, f"{label}（{cause}）")
     return text
 
 
@@ -2945,7 +3029,7 @@ def _format_input_boundary_summary(input_signal: dict[str, Any], preprocess_sign
         if impact.get("causal") is True:
             lines.append(f"- 输入边界判断：Workflow 原始输入丢失用户实际问题中的关键约束，且影响线上证据链：{missing}")
         else:
-            reason = _report_short_text(impact.get("reason"), limit=180)
+            reason = _report_short_text(_display_reason(impact.get("reason")), limit=180)
             lines.append(f"- 输入边界判断：Workflow 原始输入存在关键约束差异：{missing}；但当前证据未证明该差异影响输出，原因：{reason}")
     elif preprocess_signal.get("status") == "fail":
         missing = "、".join(_string_list(preprocess_signal.get("missing_terms"))[:8])
@@ -2972,34 +3056,307 @@ def _format_assertion_items(items: list[dict[str, Any]], *, roles: set[str], lim
     return lines
 
 
-def _format_probe_plan_summary(result: dict[str, Any], *, limit: int = 8) -> list[str]:
+def _probe_display_name(item: dict[str, Any]) -> str:
+    display_name = str(item.get("display_name") or "").strip()
+    if display_name:
+        return display_name
+    probe_id = str(item.get("probe_id") or "").strip()
+    cleaned = re.sub(r"^(?:P|p)[-_]?", "", probe_id)
+    cleaned = re.sub(r"^\d+[-_]*", "", cleaned)
+    return cleaned or probe_id
+
+
+EXP_KIND_DISPLAY = {
+    "retrieval-exp": "召回验证",
+    "rerank-exp": "重排观察",
+    "context-exp": "Prompt 拼接验证",
+    "answer-exp": "答案验证",
+    "citation-exp": "引用验证",
+    "chunk-conflict-exp": "Chunk 冲突验证",
+    "artifact-exp": "证据验证",
+}
+
+TARGET_ARTIFACT_DISPLAY = {
+    "kb_wide_recall": "理论召回上界",
+    "online_origin_recall": "线上初召回",
+    "rerank_output": "重排结果",
+    "prompt_context": "Prompt 上下文",
+    "answer_span": "最终答案",
+}
+
+DIRECTION_DISPLAY = {
+    "relevance_gap": "相关性缺口",
+    "coverage_gap": "覆盖缺口",
+    "scope_violation": "范围越界",
+    "citation_missing": "引用缺失或错配",
+    "internal_contradiction": "内部矛盾",
+    "open_label_recall": "开放标签召回",
+    "permission": "权限/空间",
+    "bypass": "重排生存观察",
+}
+
+
+def _contains_cjk(text: Any) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", str(text or "")))
+
+
+def _display_exp_kind(exp_kind: Any) -> str:
+    value = str(exp_kind or "").strip()
+    return EXP_KIND_DISPLAY.get(value, "证据验证")
+
+
+def _display_target_artifact(target_artifact: Any) -> str:
+    value = str(target_artifact or "").strip()
+    return TARGET_ARTIFACT_DISPLAY.get(value, value or "未指定")
+
+
+def _display_direction(direction: Any) -> str:
+    value = str(direction or "").strip()
+    return DIRECTION_DISPLAY.get(value, value or "未指定")
+
+
+def _validation_hit_text(item: dict[str, Any]) -> str:
+    if item.get("executed") is False:
+        reason = _report_short_text(item.get("skip_reason"), limit=100)
+        return f"未执行（{reason}）" if reason != "未提供" else "未执行"
+    hit = item.get("hit")
+    if hit is True:
+        return "命中"
+    if hit is False:
+        return "未命中"
+    return "无法判断"
+
+
+def _doc_detail_link(doc: dict[str, Any]) -> str:
+    for key in ("url", "link", "doc_url", "source_url"):
+        value = str(doc.get(key) or "").strip()
+        if value:
+            return value
+    source_text = str(doc.get("source") or "").strip()
+    match = re.search(r"(?:^|[|;,])url=(https?://[^|;,\s]+)", source_text)
+    if match:
+        return match.group(1)
+    doc_id = str(doc.get("identifier") or doc.get("id") or "").strip()
+    if not doc_id or not re.fullmatch(r"\d+", doc_id):
+        return ""
+    source = source_text if source_text in KNOWLEDGE_DETAIL_SOURCES else "COGNITION"
+    return f"https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id?source={source}&identifier={doc_id}"
+
+
+def _markdown_link_url(url: str) -> str:
+    return str(url or "").replace(")", "%29")
+
+
+def _format_doc_evidence_lines(doc: dict[str, Any]) -> list[str]:
+    doc_id = str(doc.get("id") or "").strip()
+    title = _report_short_text(doc.get("title"), limit=90)
+    label = " ".join(part for part in [doc_id, title if title != "未提供" else ""] if part).strip() or "未命名文档"
+    lines = [f"  - {label}"]
+    link = _doc_detail_link(doc)
+    if link:
+        lines.append(f"    - 文档链接：[打开文档]({_markdown_link_url(link)})")
+    spans = _string_list(doc.get("support_spans"))
+    if spans:
+        lines.append(f"    - 命中片段：{_report_short_text(spans[0], limit=180)}")
+    elif doc.get("support_status"):
+        lines.append(f"    - 支撑状态：{doc.get('support_status')}")
+    if doc.get("matched_terms"):
+        lines.append("    - 命中词：" + "、".join(_string_list(doc.get("matched_terms"))[:5]))
+    return lines
+
+
+def _format_validation_evidence(item: dict[str, Any], *, doc_limit: int = 3) -> list[str]:
+    docs = item.get("matched_docs") if isinstance(item.get("matched_docs"), list) else []
+    if docs:
+        lines = ["- 支撑证据："]
+        for doc in docs[:doc_limit]:
+            if isinstance(doc, dict):
+                lines.extend(_format_doc_evidence_lines(doc))
+        if len(docs) > doc_limit:
+            lines.append(f"  - 另有 {len(docs) - doc_limit} 条命中文档未展开，完整结果见审计 JSON。")
+        return lines
+    if str(item.get("target_artifact") or "") == "answer_span":
+        return [f"- 支撑证据：最终答案片段：{_report_short_text(item.get('query') or item.get('expected_hit_pattern'), limit=160)}"]
+    return ["- 支撑证据：本项没有返回命中文档；完整 hit/miss 见审计 JSON。"]
+
+
+def _validation_conclusion(item: dict[str, Any]) -> str:
+    probe_id = str(item.get("probe_id") or "")
+    hit = item.get("hit")
+    if probe_id == "probe-rerank-bypass":
+        if hit is True:
+            return "重排观察：关键文档是否在重排后消失：是；关键文档在初召回出现但未通过重排。这只是 doc ID 生存观察，不是线上重跑结果。"
+        return "重排观察：关键文档是否在重排后消失：未发现；没有表现出“绕过重排即可恢复”的信号。这不是线上重跑结果。"
+    if probe_id == "probe-wide-recall":
+        return "理论召回上界可用，可以作为判断知识/召回缺口的上界证据。" if hit else "理论召回上界不可用或没有命中，不能把它当成召回缺失证据。"
+    if probe_id == "probe-permission-check":
+        return "未发现权限/空间阻断信号。" if hit else "存在权限/空间阻断风险，需要检查 workspace、namespace 或知识状态。"
+    raw = str(item.get("converged_direction") or "").strip()
+    if raw and _contains_cjk(raw):
+        return raw
+    direction = _display_direction(item.get("direction"))
+    if hit is True:
+        return f"{direction}验证已命中，说明该线索在目标证据中可被找到。"
+    if hit is False:
+        return f"{direction}验证未命中，说明该线索没有在目标证据中找到。"
+    return f"{direction}验证没有形成确定 hit/miss，需要结合其他证据复核。"
+
+
+def _validation_reason(item: dict[str, Any]) -> str:
+    for key in ("trigger_observation", "hypothesis"):
+        value = _report_short_text(item.get(key), limit=180)
+        if value != "未提供":
+            return value
+    return f"需要验证{_display_direction(item.get('direction'))}是否影响本 case。"
+
+
+def _validation_method(item: dict[str, Any]) -> str:
+    target = _display_target_artifact(item.get("target_artifact"))
+    query = _report_short_text(item.get("query") or item.get("expected_hit_pattern"), limit=160)
+    if query == "未提供":
+        return f"检查{target}中的确定性信号。"
+    return f"在{target}中查找“{query}”相关支撑。"
+
+
+def _standard_validation_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    outputs = (result.get("raw_artifacts") or {}).get("probe_outputs")
+    if not isinstance(outputs, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    wide = outputs.get("probe-wide-recall")
+    if isinstance(wide, dict):
+        retrieval = (wide.get("stage_signals") or {}).get("retrieval") if isinstance(wide.get("stage_signals"), dict) else {}
+        if isinstance(retrieval, dict):
+            rows.append(
+                {
+                    "probe_id": "probe-wide-recall",
+                    "display_name": "理论召回验证",
+                    "exp_kind": "retrieval-exp",
+                    "direction": "open_label_recall",
+                    "target_artifact": "kb_wide_recall",
+                    "hit": retrieval.get("theoretical_recall_status") == "ok",
+                    "converged_direction": retrieval.get("theoretical_notes") or retrieval.get("theoretical_recall_status"),
+                    "trigger_observation": "需要确认理论召回上界是否可用于判断知识或召回缺口。",
+                }
+            )
+    permission = outputs.get("probe-permission-check")
+    if isinstance(permission, dict):
+        retrieval = (permission.get("stage_signals") or {}).get("retrieval") if isinstance(permission.get("stage_signals"), dict) else {}
+        if isinstance(retrieval, dict):
+            rows.append(
+                {
+                    "probe_id": "probe-permission-check",
+                    "display_name": "权限/空间验证",
+                    "exp_kind": "retrieval-exp",
+                    "direction": "permission",
+                    "target_artifact": "online_origin_recall",
+                    "hit": retrieval.get("permission_miss") is False,
+                    "converged_direction": "permission_miss=true" if retrieval.get("permission_miss") else "no permission miss signal",
+                    "trigger_observation": "需要确认是否因为 workspace、namespace 或知识权限导致召回不可见。",
+                }
+            )
+    rerank = outputs.get("probe-rerank-bypass")
+    if isinstance(rerank, dict):
+        signal = (rerank.get("stage_signals") or {}).get("rerank") if isinstance(rerank.get("stage_signals"), dict) else {}
+        if isinstance(signal, dict):
+            rows.append(
+                {
+                    "probe_id": "probe-rerank-bypass",
+                    "display_name": "重排生存观察",
+                    "exp_kind": "rerank-exp",
+                    "direction": "bypass",
+                    "target_artifact": "rerank_output",
+                    "hit": signal.get("bypass_would_restore"),
+                    "converged_direction": "bypass would restore expected docs" if signal.get("bypass_would_restore") else "bypass did not restore expected docs",
+                    "trigger_observation": "需要观察关键文档是否从初召回进入重排结果。",
+                }
+            )
+    return rows
+
+
+def _format_probe_plan_summary(result: dict[str, Any], *, limit: int = 12) -> list[str]:
     probes = ((result.get("raw_artifacts") or {}).get("probe_outputs") or {}).get("run-probe-plan")
     content = probes.get("content") if isinstance(probes, dict) else {}
     probe_results = content.get("probe_results") if isinstance(content, dict) else []
-    if not isinstance(probe_results, list) or not probe_results:
-        return ["- 未执行 `run-probe-plan`，或没有 probe-v1 结果"]
-    lines = [
-        "| probe | 方向 | 目标 | hit | 结论 |",
-        "|---|---|---|---|---|",
-    ]
-    for item in probe_results[:limit]:
+    if not isinstance(probe_results, list):
+        probe_results = []
+    validation_rows = [*probe_results, *_standard_validation_rows(result)]
+    if not validation_rows:
+        return ["- 未执行验证环节，或没有可展示的验证结果。"]
+    lines: list[str] = []
+    shown = 0
+    for item in validation_rows:
         if not isinstance(item, dict):
             continue
-        lines.append(
-            "| "
-            + " | ".join(
-                [
-                    str(item.get("probe_id") or "").replace("|", "\\|"),
-                    str(item.get("direction") or "").replace("|", "\\|"),
-                    str(item.get("target_artifact") or "").replace("|", "\\|"),
-                    str(item.get("hit")).replace("|", "\\|"),
-                    _report_short_text(item.get("converged_direction"), limit=120).replace("|", "\\|"),
-                ]
-            )
-            + " |"
+        if shown >= limit:
+            break
+        shown += 1
+        name = _probe_display_name(item)
+        lines.extend(
+            [
+                f"### 验证 {shown}：{name}",
+                "",
+                f"- 验证类型：{_display_exp_kind(item.get('exp_kind') or _infer_exp_kind(item))}",
+                f"- 我为什么查这个：{_validation_reason(item)}",
+                f"- 我查了哪里：{_display_target_artifact(item.get('target_artifact'))}",
+                f"- 我怎么验证：{_validation_method(item)}",
+                f"- 验证结果：{_validation_hit_text(item)}",
+                *_format_validation_evidence(item),
+                f"- 这说明什么：{_validation_conclusion(item)}",
+                "",
+            ]
         )
-    if len(probe_results) > limit:
-        lines.append(f"\n仅展示前 {limit} 条，完整结果见 `raw_artifacts.probe_outputs.run-probe-plan.content.probe_results`。")
+    if shown == 0:
+        return ["- 未执行验证环节，或没有可展示的验证结果。"]
+    if len(validation_rows) > limit:
+        lines.append(f"仅展示前 {limit} 条，完整结果见 `final/attribution_record.json.raw_artifacts.probe_outputs`。")
+    return lines
+
+
+def _secondary_findings(request_dict: dict[str, Any]) -> dict[str, Any]:
+    qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
+    answer_findings: list[dict[str, Any]] = []
+    answer_labels = {
+        "wrong_citation": "答案引用错误或引用不支撑 claim",
+        "partial_answer": "答案遗漏必要方面",
+        "scope_violation": "答案超出或偏离问题约束",
+        "branching_unclear": "答案混用分支且未区分前提",
+        "hallucination": "答案存在未支撑内容",
+    }
+    for key, label in answer_labels.items():
+        if qa.get(key) is True:
+            answer_findings.append({"type": key, "label": label})
+    retrieval = request_dict.get("retrieval") if isinstance(request_dict.get("retrieval"), dict) else {}
+    chunk_conflicts = retrieval.get("chunk_conflicts") if isinstance(retrieval.get("chunk_conflicts"), list) else []
+    return {
+        "answer_findings": answer_findings,
+        "chunk_conflict_findings": chunk_conflicts,
+    }
+
+
+def _format_answer_findings(findings: dict[str, Any]) -> list[str]:
+    items = findings.get("answer_findings") if isinstance(findings.get("answer_findings"), list) else []
+    if not items:
+        return ["- 未发现额外答案层伴随问题"]
+    return [f"- {item.get('label')}" for item in items if isinstance(item, dict) and item.get("label")]
+
+
+def _format_chunk_conflict_findings(findings: dict[str, Any], *, limit: int = 4) -> list[str]:
+    items = findings.get("chunk_conflict_findings") if isinstance(findings.get("chunk_conflict_findings"), list) else []
+    if not items:
+        return ["- 未发现召回 chunk 内部冲突风险"]
+    lines: list[str] = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        title = _report_short_text(item.get("title"), limit=80)
+        snippet = _report_short_text("；".join(_string_list(item.get("support_spans"))), limit=120)
+        stage = _display_target_artifact(item.get("target_artifact"))
+        lines.append(
+            f"- {stage}，文档 `{item.get('doc_id') or ''}`，chunk `{item.get('chunk_id') or ''}`，{title}：{snippet or _report_short_text(item.get('hypothesis'), limit=120)}"
+        )
+    if len(items) > limit:
+        lines.append(f"- 另有 {len(items) - limit} 条 chunk 冲突风险未展开")
     return lines
 
 
@@ -3054,15 +3411,15 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         actions = actions + "\n" + "\n".join(action_extras)
     primary_lines = (
         [
-            f"- 主因阶段：`{primary.get('stage')}`",
-            f"- 主因枚举：`{primary.get('cause_code')}`",
+            f"- 主因阶段：`{_display_stage(primary.get('stage'))}`",
+            f"- 主因枚举：`{CAUSE_DISPLAY.get(str(primary.get('cause_code') or ''), str(primary.get('cause_code') or ''))}`（{primary.get('cause_code')}）",
             f"- 置信度：`{primary.get('confidence')}`",
-            f"- 建议负责人：`{primary.get('owner')}`",
+            f"- 建议负责人：`{_display_owner(primary.get('owner'))}`",
         ]
         if primary
         else ["- 主因枚举：`null`", "- 建议负责人：人工复核（`manual_review`）"]
     )
-    rationale = primary.get("selection_rationale", "") if primary else "; ".join(result.get("human_review_reasons") or [])
+    rationale = _display_selection_rationale(primary.get("selection_rationale", "")) if primary else "; ".join(result.get("human_review_reasons") or [])
     human_review = "是" if result.get("needs_human_review") else "否"
     case_assessment = result.get("case_assessment") if isinstance(result.get("case_assessment"), dict) else {}
     assessment_status = case_assessment.get("status", "indeterminate")
@@ -3097,14 +3454,15 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     )
     answer_status = "已给出答案" if str(answer_text or "").strip() else "未给出答案"
     answer_signal_pairs = [
-        ("prompt_supports_answer", qa.get("prompt_supports_answer")),
-        ("answer_satisfies_expected", qa.get("answer_satisfies_expected")),
-        ("partial_answer", qa.get("partial_answer")),
-        ("wrong_citation", qa.get("wrong_citation")),
-        ("scope_violation", qa.get("scope_violation")),
-        ("branching_unclear", qa.get("branching_unclear")),
+        ("Prompt 是否支撑答案", qa.get("prompt_supports_answer")),
+        ("答案是否满足期望", qa.get("answer_satisfies_expected")),
+        ("是否漏答", qa.get("partial_answer")),
+        ("是否错引", qa.get("wrong_citation")),
+        ("是否越界", qa.get("scope_violation")),
+        ("是否混用分支", qa.get("branching_unclear")),
     ]
-    answer_signal_text = "，".join(f"{key}=`{value}`" for key, value in answer_signal_pairs if value is not None) or "无结构化答案检查信号"
+    answer_signal_text = "，".join(f"{key}：`{value}`" for key, value in answer_signal_pairs if value is not None) or "无结构化答案检查信号"
+    secondary_findings = result.get("secondary_findings") if isinstance(result.get("secondary_findings"), dict) else _secondary_findings(request_dict)
     breakpoint_lines: list[str] = []
     if missing_point_rows:
         breakpoint_lines.append("- 知识缺口：" + "；".join(_report_short_text(row.get("text"), limit=120) for row in missing_point_rows[:4]))
@@ -3118,6 +3476,7 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         breakpoint_lines.append("- 待复核断言：" + "；".join(_report_short_text(row.get("text"), limit=120) for row in unavailable_point_rows[:4]))
     if not breakpoint_lines:
         breakpoint_lines.append("- 未发现断言级上游断点")
+    stage_summary = _report_short_text(rationale or assessment_reason or "证据不足，需要补充验证或人工复核。", limit=260)
     report = [
         "# FindReason 归因报告",
         "",
@@ -3125,52 +3484,84 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         "",
         *primary_lines,
         f"- Case 判定：{_display_assessment(assessment_status)}",
-        f"- 一句话原因：{_report_short_text(assessment_reason, limit=260)}",
+        f"- 一句话原因：{_report_short_text(_display_case_reason(assessment_reason), limit=260)}",
         f"- 是否需要人工复核：`{human_review}`",
         f"- 失败模式：`{', '.join(result.get('failure_patterns') or []) or '无'}`",
         f"- 选择依据：{_report_short_text(rationale or '证据不足，需要补充探针或人工复核。', limit=320)}",
         "",
-        "## 2. 问题与答案观察",
+        "## 2. 现场输入与答案",
         "",
         f"- log_id：`{result.get('log_id') or ingest.get('log_id') or ''}`",
         f"- workspace_id：`{result.get('workspace_id') or ingest.get('workspace_id') or ''}`",
         f"- app_id：`{result.get('app_id') or ingest.get('app_id') or case_input.get('app_id') or ''}`",
         f"- 用户问题：{_report_short_text(case_input.get('query'), limit=260)}",
         f"- 答案状态：{answer_status}",
-        f"- 原始答案：{_report_short_text(answer_text, limit=360)}",
+        f"- 答案摘要：{_report_short_text(answer_text, limit=360)}",
         f"- 答案检查信号：{answer_signal_text}",
         f"- 证据来源：{'fornax_trace' if trace_summary.get('has_middle_node_trace') else 'trace_or_replay_incomplete'}",
         f"- 线上文档数量：origin=`{counts.get('origin_doc_list', 0)}`，faq=`{counts.get('origin_faq_list', 0)}`，rerank=`{counts.get('rerank_docs', 0)}`，prompt=`{counts.get('prompt_docs', 0)}`",
+        f"- workflow_span_id：`{workflow_io.get('span_id') or ''}`",
+        f"- workflow_node_id：`{workflow_io.get('node_id') or ''}`",
         "",
-        "### 评估器线索",
+        "### Workflow 原始完整输入",
         "",
-        *_format_judgement_signals(request_dict),
+        "```json",
+        _report_json(workflow_io.get("input")),
+        "```",
+        "",
+        "### Workflow 原始完整输出",
+        "",
+        "```json",
+        _report_json(workflow_io.get("output")),
+        "```",
         "",
         "### 输入边界",
         "",
         *input_boundary_rows,
         "",
-        "## 3. 必要断言",
+        "## 3. 验证过程：我怎么查的",
         "",
-        "### 正确答案必须覆盖",
+        *_format_probe_plan_summary(result),
+        "",
+        "## 4. 阶段裁决：问题最早断在哪",
+        "",
+        f"- 裁决摘要：{stage_summary}",
+        "",
+        "| 阶段 | 结论 | 我为什么这么判 |",
+        "|---|---|---|",
+        *(stage_rows or ["| 未知 | 证据不足 | 没有 evidence_chain |"]),
+        "",
+        "## 5. 关键证据与文档",
+        "",
+        "### Answer Findings",
+        "",
+        *_format_answer_findings(secondary_findings),
+        "",
+        "### 评估器线索",
+        "",
+        *_format_judgement_signals(request_dict),
+        "",
+        "### 必要断言",
+        "",
+        "正确答案必须覆盖：",
         "",
         *_format_assertion_items(all_assertions, roles=REQUIRED_ASSERTION_ROLES),
         "",
-        "### 当前答案/检查观察",
+        "当前答案/检查观察：",
         "",
         *_format_assertion_items(all_assertions, roles={"answer_claim", "unsupported_claim", "constraint_check", "citation_check", "consistency_check"}),
         "",
         "> 这些观察项只用于 answer grounding / scope / citation / consistency 检查，不进入 origin -> rerank -> prompt 的上游断言覆盖矩阵。",
         "",
-        "## 4. 断言覆盖矩阵",
+        "### 断言覆盖矩阵",
         "",
         *point_rows,
         "",
-        "### 断言级断点",
+        "断言级断点：",
         "",
         *breakpoint_lines,
         "",
-        "## 5. 召回上界与知识判断",
+        "### 召回上界与知识判断",
         "",
         f"- Oracle 来源：`{oracle_status.get('source', 'unknown')}`，置信度：`{oracle_status.get('confidence', 0)}`，冲突：`{oracle_status.get('conflict_detected', False)}`",
         f"- 理论召回上界状态：`{retrieval_state.get('theoretical_recall_status', 'not_configured')}`",
@@ -3184,37 +3575,21 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         "",
         *upper_bound_relation_rows,
         "",
-        "## 6. 阶段归因链路",
+        "### 召回 Chunk 冲突风险",
         "",
-        "| 阶段 | 结论 | 关键依据 |",
-        "|---|---|---|",
-        *(stage_rows or ["| unknown | indeterminate | no evidence_chain |"]),
+        *_format_chunk_conflict_findings(secondary_findings),
         "",
-        "## 7. Probe 结果",
-        "",
-        *_format_probe_plan_summary(result),
-        "",
-        "## 8. 下一步",
+        "## 6. 下一步建议",
         "",
         actions,
         "",
-        "## 附录：原始 Trace 摘录",
+        "## 7. 审计 JSON 索引",
         "",
-        "- 以下为 workflow input/output 有界摘录；完整值见 `final/attribution_record.json.raw_artifacts.workflow_span_ios`。",
-        f"- workflow_span_id：`{workflow_io.get('span_id') or ''}`",
-        f"- workflow_node_id：`{workflow_io.get('node_id') or ''}`",
-        "",
-        "### Workflow 输入",
-        "",
-        "```json",
-        _report_json_excerpt(workflow_io.get("input")),
-        "```",
-        "",
-        "### Workflow 输出",
-        "",
-        "```json",
-        _report_json_excerpt(workflow_io.get("output")),
-        "```",
+        "- 人读报告：`final/case_report.md`",
+        "- 结构化摘要：`final/short_summary.json`",
+        "- 完整审计：`final/attribution_record.json`",
+        "- 验证原始输出：`final/attribution_record.json.raw_artifacts.probe_outputs`",
+        "- Workflow input/output 完整值：`final/attribution_record.json.raw_artifacts.workflow_span_ios`",
     ]
     return "\n".join(report).rstrip() + "\n"
 
@@ -3315,6 +3690,46 @@ def build_probe_result(
 def _answer_text_from_request(request_dict: dict[str, Any]) -> str:
     qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
     return str(qa.get("answer") or "")
+
+
+EXP_KIND_ORDER = [
+    "retrieval-exp",
+    "rerank-exp",
+    "context-exp",
+    "answer-exp",
+    "citation-exp",
+    "chunk-conflict-exp",
+]
+
+
+def _infer_exp_kind(probe: dict[str, Any]) -> str:
+    explicit = str(probe.get("exp_kind") or "").strip()
+    if explicit:
+        return explicit
+    direction = str(probe.get("direction") or "")
+    target_artifact = str(probe.get("target_artifact") or "")
+    if direction == "citation_missing":
+        return "citation-exp"
+    if direction == "internal_contradiction":
+        return "answer-exp" if target_artifact == "answer_span" else "chunk-conflict-exp"
+    if target_artifact == "answer_span":
+        return "answer-exp"
+    if target_artifact in {"kb_wide_recall", "online_origin_recall"}:
+        return "retrieval-exp"
+    if target_artifact == "rerank_output":
+        return "rerank-exp"
+    if target_artifact == "prompt_context":
+        return "context-exp"
+    return "artifact-exp"
+
+
+def _probe_plan_metadata(probe: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"exp_kind": _infer_exp_kind(probe)}
+    for key in ("display_name", "trigger_source", "trigger_observation", "hypothesis"):
+        value = probe.get(key)
+        if value not in (None, "", []):
+            metadata[key] = value
+    return metadata
 
 
 def _probe_target_docs(request_dict: dict[str, Any], target_artifact: str, wide_docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3435,6 +3850,7 @@ def run_probe_plan(
         target_artifact = str(probe.get("target_artifact") or "")
         query = str(probe.get("query") or "")
         expected_pattern = str(probe.get("expected_hit_pattern") or "")
+        metadata = _probe_plan_metadata(probe)
         if target_artifact == "answer_span":
             hit, matched_terms = _answer_span_hit(query, expected_pattern, answer_text)
             matched_docs: list[dict[str, Any]] = []
@@ -3468,6 +3884,7 @@ def run_probe_plan(
                 "matched_terms": matched_terms,
                 "converged_direction": converged,
                 "evidence_id": f"run-probe-plan:{probe_id}",
+                **metadata,
                 **({"skip_reason": skip_reason} if skip_reason else {}),
             }
         )
@@ -3486,6 +3903,11 @@ def run_probe_plan(
             "source_stage": "plan",
             "source": {"probe_name": "run-probe-plan", "probe_id": probe["probe_id"], "direction": probe["direction"]},
             "content": {
+                "display_name": probe.get("display_name"),
+                "exp_kind": probe.get("exp_kind"),
+                "trigger_source": probe.get("trigger_source"),
+                "trigger_observation": probe.get("trigger_observation"),
+                "hypothesis": probe.get("hypothesis"),
                 "query": probe["query"],
                 "target_artifact": probe["target_artifact"],
                 "hit": probe["hit"],
@@ -3542,8 +3964,60 @@ def _probe_plan_problem_text(text: Any) -> bool:
     return any(marker in value for marker in markers)
 
 
+def _probe_plan_conflict_escalates(text: Any) -> bool:
+    value = str(text or "").lower()
+    markers = (
+        "without clear",
+        "no clear",
+        "no disambiguation",
+        "impacts required",
+        "affects required",
+        "无消歧",
+        "无清晰",
+        "没有清晰",
+        "影响必要",
+        "影响正确",
+        "无法区分",
+    )
+    return any(marker in value for marker in markers)
+
+
 def _probe_plan_point_text(probe: dict[str, Any]) -> str:
     return _clean_point_text(probe.get("query") or probe.get("expected_hit_pattern") or probe.get("probe_id"))
+
+
+def _chunk_conflict_records(probe: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for doc in probe.get("matched_docs") or []:
+        if not isinstance(doc, dict):
+            continue
+        records.append(
+            {
+                "probe_id": probe.get("probe_id"),
+                "display_name": probe.get("display_name"),
+                "exp_kind": probe.get("exp_kind"),
+                "target_artifact": probe.get("target_artifact"),
+                "query": probe.get("query"),
+                "doc_id": doc.get("id"),
+                "chunk_id": doc.get("chunk_id") or doc.get("chunkId"),
+                "title": doc.get("title"),
+                "support_status": doc.get("support_status"),
+                "support_spans": doc.get("support_spans") or [],
+                "hypothesis": probe.get("hypothesis"),
+            }
+        )
+    if not records:
+        records.append(
+            {
+                "probe_id": probe.get("probe_id"),
+                "display_name": probe.get("display_name"),
+                "exp_kind": probe.get("exp_kind"),
+                "target_artifact": probe.get("target_artifact"),
+                "query": probe.get("query"),
+                "hypothesis": probe.get("hypothesis"),
+            }
+        )
+    return records
 
 
 def _probe_plan_stage_signals(
@@ -3597,9 +4071,15 @@ def _probe_plan_stage_signals(
             else:
                 knowledge_signal["lacks_authoritative_source"] = True
         elif direction == "internal_contradiction":
-            if hit:
+            target_artifact = str(probe.get("target_artifact") or "")
+            if hit and target_artifact == "answer_span":
                 # KB clarifies the branch premises but the answer did not distinguish them.
                 answer_signal["branching_unclear"] = True
+            elif hit:
+                knowledge_signal["chunk_internal_conflict"] = True
+                knowledge_signal.setdefault("chunk_conflicts", []).extend(_chunk_conflict_records(probe))
+                if _probe_plan_conflict_escalates(probe.get("converged_direction")):
+                    knowledge_signal["internal_inconsistency"] = True
             else:
                 knowledge_signal["internal_inconsistency"] = True
     knowledge_gap_points: list[str] = []
@@ -3853,14 +4333,6 @@ def _infer_knowledge_detail_reference(doc: dict[str, Any]) -> dict[str, str] | N
     return None
 
 
-def _knowledge_detail_auth_token() -> tuple[str, str]:
-    for name in ("KNOWLEDGE_DETAIL_TOKEN", "OPEN_PLAT_ZS_OPEN_TOKEN"):
-        value = os.getenv(name, "").strip()
-        if value:
-            return value, name
-    return "", "not_configured"
-
-
 def _knowledge_detail_endpoint(source: str, identifier: str) -> tuple[str, dict[str, str]]:
     endpoint = os.getenv("KNOWLEDGE_DETAIL_URL", "").strip()
     if not endpoint:
@@ -3945,9 +4417,7 @@ def _fetch_knowledge_doc_record(doc: dict[str, Any], reference: dict[str, str]) 
     if not endpoint:
         return {"status": "not_configured", "doc_id": _doc_id(doc), "reference": reference}
     headers = {"Accept": "application/json"}
-    token, token_source = _knowledge_detail_auth_token()
-    if token:
-        headers["Authorization"] = _authorization_header(token)
+    token_source = "not_required"
     timeout = int(os.getenv("KNOWLEDGE_DETAIL_TIMEOUT_SECONDS") or DEFAULT_KNOWLEDGE_DETAIL_TIMEOUT_SECONDS)
     try:
         with httpx.Client(timeout=max(timeout, 1)) as client:
@@ -4673,10 +5143,14 @@ def _doc_brief(
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": _doc_id(doc),
+        "chunk_id": str(doc.get("chunkId") or doc.get("chunk_id") or ""),
         "title": _doc_title(doc),
         "rank": doc.get("rank"),
         "source": doc.get("source"),
     }
+    for key in ("identifier", "url", "link", "doc_url", "source_url"):
+        if doc.get(key) not in (None, "", []):
+            item[key] = doc.get(key)
     if score is not None:
         item["score"] = round(float(score), 4)
     if matched_terms:

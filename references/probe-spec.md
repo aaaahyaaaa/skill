@@ -1,4 +1,18 @@
-# v3 探针规范
+# v3 验证环节规范
+
+宿主 Agent 可以在执行中动态维护诊断 backlog。每个 backlog item 至少记录 `trigger_source`、`trigger_observation`、`hypothesis`、`exp_kind`、`target_stage` 和 `expected_evidence`。未执行的 backlog item 不是证据；只有执行后的 `{stage}-exp` 结果才能进入 `orchestrate`。
+
+用户可见验证环节统一使用 `{stage}-exp`：
+
+| exp_kind | 作用 |
+|-|-|
+| `retrieval-exp` | query / rewrite / keyword / query variant / topK / open-label / permission 等召回链路验证 |
+| `rerank-exp` | 重排生存观察、阈值、参数或排序恢复信号；第一版只覆盖 rerank |
+| `answer-exp` | prompt 已有约束是否被 answer 覆盖，是否漏答、越界或弱化 |
+| `citation-exp` | 引用是否存在、可用、未停用，并支撑 answer claim |
+| `chunk-conflict-exp` | origin/rerank/prompt chunk 是否内部矛盾、是否影响必要断言、是否有清晰适用前提 |
+
+`run-probe-plan` 保留为兼容执行器，用于静态 artifact 命中验证；它不是覆盖所有场景的通用 probe。
 
 所有 probes 都输出 JSON，包含：
 
@@ -17,7 +31,7 @@ Probe 缓存位于 `~/.findreason/cache/<workspace_id>/<log_id>/`。传入 `--no
 | `probe-knowledge-detail` | knowledge | `knowledge_exists: yes/no/unknown`、`retry_count`、`detail_provider`、`detail_status`、`content_available_doc_ids` |
 | `probe-permission-check` | retrieval | `permission_miss`、`permission_available` |
 | `probe-wide-recall` | retrieval | `theoretical_recall_status`、`theoretical_query_variants`、`wide_recall_docs`、`matched_expected_ids`、`retrieval_gap_detected` |
-| `probe-rerank-bypass` | rerank | `bypass_would_restore`、`expected_doc_survived_rerank`；仅作 doc-id 观察，不能单独触发 `rerank_drop` |
+| `probe-rerank-bypass` | rerank | `bypass_would_restore`、`expected_doc_survived_rerank`；仅作 doc-id 生存观察，不是 curl 重跑 rerank，不能单独触发 `rerank_drop` |
 | `probe-context-assembly` | context | `expected_doc_in_prompt`、`context_assembly_error` |
 
 `probe-self-oracle` 默认先于其他 probes 运行。只有宿主 Agent 提供必要断言或 expected IDs 时，它才会推断期望文档。它使用以下信号：
@@ -28,7 +42,7 @@ Probe 缓存位于 `~/.findreason/cache/<workspace_id>/<log_id>/`。传入 `--no
 
 当前 P0 实现会在 trace-local candidate docs 中匹配这些信号，并输出 `evidence_type=inferred_oracle`。输出契约预留后续接入实时 KB recall 后端。
 
-`probe-knowledge-detail` 默认只使用 trace/provided id 做三态判断；如果配置了 `KNOWLEDGE_DETAIL_URL`，会尝试把 trace docs 中的飞书 / OceanEngine 链接解析为 `source + identifier`，调用 `GET /api/sirius_knowledge/v1/data/doc/record_id?source=...&identifier=...` 形态的详情接口，并在 `raw_artifacts.knowledge_detail.fetched_docs` 中记录 title/link/content excerpt/split count 等有界摘要。接口错误、鉴权失败或链接无法解析时保持 `knowledge_exists=unknown` 或沿用 trace id 证据，不直接判 `suspected_knowledge_missing`。
+`probe-knowledge-detail` 默认只使用 trace/provided id 做三态判断；如果配置了 `KNOWLEDGE_DETAIL_URL`，会尝试把 trace docs 中的飞书 / OceanEngine 链接解析为 `source + identifier`，调用不需要 token 的 `GET /api/sirius_knowledge/v1/data/doc/record_id?source=...&identifier=...` 形态详情接口，并在 `raw_artifacts.knowledge_detail.fetched_docs` 中记录 title/link/content excerpt/split count 等有界摘要。接口错误或链接无法解析时保持 `knowledge_exists=unknown` 或沿用 trace id 证据，不直接判 `suspected_knowledge_missing`。
 
 它会与 `probe-wide-recall` 一起构建断言覆盖矩阵：
 
@@ -48,11 +62,13 @@ Probe 缓存位于 `~/.findreason/cache/<workspace_id>/<log_id>/`。传入 `--no
 
 `rerank_drop` 和 `context_assembly_error` 必须以必要断言覆盖断点为准。召回文档、self-oracle inferred doc ID 或 expected doc ID 未进入 rerank / prompt，只能说明链路存在观察信号；如果没有 `missing_expected_points_from_rerank` 或 `missing_expected_points_from_prompt`，`orchestrate` 不应仅凭 doc-id survival 选择主因。
 
+当前实现没有真正的线上 rerank 重跑实验。`probe-rerank-bypass` 只观察历史 trace/ingest 中的关键 doc ID 是否从初召回进入 rerank 或 prompt；它不能证明“修改 rerank 参数后线上会恢复”，也不能替代 curl 重跑。若后续新增真实 `rerank-live-exp`，必须从 trace 还原 rerank 请求体，使用当前 workspace 的 `authInfo.apiKey` 鉴权调用 rerank 接口，并把结果标记为“当前版本反事实实验”，不得覆盖原始 trace。
+
 `replay-workflow` 不具备并行安全性。只有 ingest 表明 trace 查询失败或缺少中间节点证据时才运行。
 
-## 运行探针计划（run-probe-plan / probe-v1）
+## 运行验证计划（run-probe-plan / probe-v1 兼容）
 
-`run-probe-plan` 是宿主 Agent probe plan 的执行器。宿主 Agent 负责反向构造 probe queries（它拥有语义意图）；CLI 只负责确定性执行，绝不决定主因。如果 plan 包含 `expected_required` probes，宿主 Agent 还必须把这些必要断言复制到 `host_agent.answer_claim`，并在最终 orchestration 前重新 ingest；否则断言覆盖矩阵会有意保持为空。
+`run-probe-plan` 是宿主 Agent 静态 artifact 验证计划的兼容执行器。宿主 Agent 负责构造验证项（它拥有语义意图）；CLI 只负责确定性执行，绝不决定主因。如果 plan 包含 `expected_required` 验证项，宿主 Agent 还必须把这些必要断言复制到 `host_agent.answer_claim`，并在最终 orchestration 前重新 ingest；否则断言覆盖矩阵会有意保持为空。
 
 Plan 输入（`--plan @file` 或 JSON 字符串）使用 `schema_version: "probe-v1"`：
 
@@ -64,6 +80,11 @@ Plan 输入（`--plan @file` 或 JSON 字符串）使用 `schema_version: "probe
   "probes": [
     {
       "probe_id": "P-1",
+      "display_name": "铺底计划引用检查",
+      "exp_kind": "citation-exp",
+      "trigger_source": "answer_citation",
+      "trigger_observation": "答案引用未覆盖铺底计划入口 claim",
+      "hypothesis": "存在权威来源但答案没有正确引用",
       "direction": "citation_missing",
       "role": "citation_check",
       "target_artifact": "online_origin_recall",
@@ -78,8 +99,9 @@ Plan 输入（`--plan @file` 或 JSON 字符串）使用 `schema_version: "probe
 
 - `direction` ∈ `relevance_gap`、`coverage_gap`、`scope_violation`、`citation_missing`、`internal_contradiction`；否则报 `E_PROBE_DIRECTION_INVALID`。
 - `target_artifact` ∈ `kb_wide_recall`、`online_origin_recall`、`rerank_output`、`prompt_context`、`answer_span`；否则报 `E_PROBE_TARGET_INVALID`。
+- 可选字段 `display_name`、`exp_kind`、`trigger_source`、`trigger_observation`、`hypothesis` 会透传到 `content.probe_results[]` 和 evidence content，但不会直接决定主因。
 - `kb_wide_recall` 在所有 probes 间共享，只执行一次，并复用 `probe-wide-recall` 的 open-label 上界。
 - 如果 `kb_wide_recall` 不可用（`theoretical_recall_status != "ok"`），相关 probes 标记为 `executed=false`、`hit=null`，不得产生由 hit/miss 派生的归因信号。
 - 非 `probe-v1` schema 报 `E_PROBE_PLAN_SCHEMA`；非对象 plan 或缺少 `probes` list 报 `E_PROBE_PLAN_INVALID`。
 
-执行器输出标准 probe envelope（`schema_version=v3`、`probe_name=run-probe-plan`、`stage_signals`、`evidence_bundle`、`raw_artifacts`），并在 `content.probe_results` 中包含每个 probe 的 `hit`、`matched_docs`、`converged_direction` 和 `evidence_id`。`matched_docs` 不是原始召回列表，只包含正文对 probe query / pattern 有 `full_support` 或 `partial_support` 片段的召回文档，并带上 `support_spans` 供审计。`direction` 到 signal / cause 的映射见 `references/cause-codes.md`。
+执行器输出标准 envelope（`schema_version=v3`、`probe_name=run-probe-plan`、`stage_signals`、`evidence_bundle`、`raw_artifacts`），并在 `content.probe_results` 中包含每个验证项的 `hit`、`matched_docs`、`converged_direction`、`evidence_id` 和可选元数据。`matched_docs` 不是原始召回列表，只包含正文对 query / pattern 有 `full_support` 或 `partial_support` 片段的召回文档，并带上 `support_spans` 供审计。`direction` 到 signal / cause 的映射见 `references/cause-codes.md`。
