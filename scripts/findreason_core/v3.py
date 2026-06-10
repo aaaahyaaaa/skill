@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 from copy import deepcopy
 from pathlib import Path
 import re
@@ -13,7 +12,6 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 
-from .env import load_runtime_env
 from .fornax_trace import (
     FornaxTraceIngestRequest,
     _root_tag,
@@ -25,10 +23,12 @@ from .workflow_replay import replay_workflow, resolve_workflow
 
 
 SCHEMA_VERSION = "v3"
-DEFAULT_OPEN_PLAT_TRACE_DETAIL_URL = "http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail"
-DEFAULT_OPEN_PLAT_WORKSPACE_INFO_URL = "https://zhishang.bytedance.net/open-plat/api/workspace/get-workspace-info"
+OPEN_PLAT_ZS_OPEN_TOKEN = "37160d0535224506965a54e58e0685c4"
+OPEN_PLAT_TRACE_DETAIL_URL = "http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail"
+OPEN_PLAT_WORKSPACE_INFO_URL = "https://zhishang.bytedance.net/open-plat/api/workspace/get-workspace-info"
 DEFAULT_SIRIUS_RECALL_URL = "https://ad-sirius.bytedance.net/api/sirius_plugin/v1/recall"
-DEFAULT_KNOWLEDGE_DETAIL_TIMEOUT_SECONDS = 20
+KNOWLEDGE_DETAIL_URL = "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id"
+KNOWLEDGE_DETAIL_TIMEOUT_SECONDS = 20
 SIRIUS_RECALL_PATH = "/api/sirius_plugin/v1/recall"
 RECALL_THRESHOLD_KEYS = {"score", "精选", "内容中台", "min_score"}
 JUDGEMENT_SIGNALS_LIMIT_BYTES = 2048
@@ -43,61 +43,25 @@ KNOWLEDGE_DETAIL_SOURCES = {
 
 STAGE_ORDER = ["preprocess", "knowledge", "retrieval", "rerank", "context", "answer", "evaluation"]
 CAUSE_ENUM = {
-    "non_rag_route_boundary",
     "workflow_input_loss",
-    "query_rewrite_drift",
-    "keyword_loss",
     "suspected_knowledge_missing",
-    "knowledge_topic_mismatch",
-    "knowledge_internal_inconsistency",
     "retrieval_miss",
-    "permission_miss",
     "rerank_drop",
-    "rerank_tunable",
-    "context_assembly_error",
-    "unsupported_claim",
-    "wrong_citation",
-    "partial_answer",
-    "answer_scope_violation",
-    "answer_branching_unclear",
+    "answer_failure",
 }
 CAUSE_OWNER = {
-    "non_rag_route_boundary": "agent_router_owner",
     "workflow_input_loss": "workflow_input_owner",
-    "query_rewrite_drift": "rag_preprocess_or_workflow_owner",
-    "keyword_loss": "rag_preprocess_or_workflow_owner",
     "suspected_knowledge_missing": "kb_owner",
-    "knowledge_topic_mismatch": "kb_owner",
-    "knowledge_internal_inconsistency": "kb_owner",
     "retrieval_miss": "retrieval_strategy_owner",
-    "permission_miss": "knowledge_permission_owner",
     "rerank_drop": "rerank_strategy_owner",
-    "rerank_tunable": "rerank_strategy_owner",
-    "context_assembly_error": "workflow_or_prompt_context_owner",
-    "unsupported_claim": "prompt_or_model_owner",
-    "wrong_citation": "prompt_or_model_owner",
-    "partial_answer": "prompt_or_model_owner",
-    "answer_scope_violation": "prompt_or_model_owner",
-    "answer_branching_unclear": "prompt_or_model_owner",
+    "answer_failure": "answer_owner",
 }
 CAUSE_PATTERN = {
-    "non_rag_route_boundary": "query_understanding_break",
     "workflow_input_loss": "query_understanding_break",
-    "query_rewrite_drift": "query_understanding_break",
-    "keyword_loss": "query_understanding_break",
     "suspected_knowledge_missing": "knowledge_gap_in_kb",
-    "knowledge_topic_mismatch": "knowledge_topic_drift",
-    "knowledge_internal_inconsistency": "knowledge_internal_inconsistency",
     "retrieval_miss": "near_miss_retrieval",
-    "permission_miss": "permission_or_namespace_block",
     "rerank_drop": "retrieved_but_reranked_out",
-    "rerank_tunable": "retrieved_but_reranked_out",
-    "context_assembly_error": "retrieved_but_not_in_prompt",
-    "unsupported_claim": "retrieved_but_not_used",
-    "wrong_citation": "citation_misalignment",
-    "partial_answer": "partial_coverage_answered_as_complete",
-    "answer_scope_violation": "answer_scope_overreach",
-    "answer_branching_unclear": "answer_branching_ambiguous",
+    "answer_failure": "answer_generation_failure",
 }
 
 
@@ -246,10 +210,7 @@ def validate_judgement_signals(case: dict[str, Any]) -> None:
 
 
 def _openplat_token() -> tuple[str, str]:
-    value = os.getenv("OPEN_PLAT_ZS_OPEN_TOKEN", "").strip()
-    if value:
-        return value, "OPEN_PLAT_ZS_OPEN_TOKEN"
-    return "", "not_configured"
+    return OPEN_PLAT_ZS_OPEN_TOKEN, "fixed_source_constant"
 
 
 def fetch_openplat_trace_detail(
@@ -259,16 +220,15 @@ def fetch_openplat_trace_detail(
     limit: int = 1000,
     timeout_seconds: int = 90,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    load_runtime_env()
     token, token_source = _openplat_token()
     if not token:
         raise V3Error(
             "E_TRACE_AUTH_REQUIRED",
-            "Missing OpenPlat trace token. Configure OPEN_PLAT_ZS_OPEN_TOKEN without the Bearer prefix.",
+            "Missing fixed OpenPlat trace token in source constants.",
             status_code=2,
             details={"token_source": token_source},
         )
-    endpoint = os.getenv("OPEN_PLAT_TRACE_DETAIL_URL", DEFAULT_OPEN_PLAT_TRACE_DETAIL_URL)
+    endpoint = OPEN_PLAT_TRACE_DETAIL_URL
     request_payload = {"workspaceId": _numeric_if_possible(workspace_id), "logId": log_id, "limit": int(limit or 1000)}
     authorization = token if token.lower().startswith("bearer ") else f"Bearer {token}"
     try:
@@ -324,7 +284,7 @@ def _authorization_header(token: str) -> str:
 
 
 def _workspace_info_url(workspace_id: str) -> str:
-    endpoint = os.getenv("OPEN_PLAT_WORKSPACE_INFO_URL", DEFAULT_OPEN_PLAT_WORKSPACE_INFO_URL).strip()
+    endpoint = OPEN_PLAT_WORKSPACE_INFO_URL.strip()
     if "{workspaceId}" in endpoint:
         return endpoint.replace("{workspaceId}", str(workspace_id))
     separator = "&" if "?" in endpoint else "?"
@@ -357,7 +317,6 @@ def _deep_find_api_key(value: Any) -> str:
 
 
 def _resolve_workspace_api_key(workspace_id: str, *, timeout_seconds: int = 30) -> tuple[str, str]:
-    load_runtime_env()
     bootstrap_token, bootstrap_source = _openplat_token()
     if not bootstrap_token:
         return "", "not_configured"
@@ -609,7 +568,7 @@ def _run_sirius_open_label_wide_recall(
         return {
             "status": "not_configured",
             "error": "",
-            "notes": "未配置 OPEN_PLAT_ZS_OPEN_TOKEN，无法获取当前 workspace 的 authInfo.apiKey，跳过 Sirius 宽召回。",
+            "notes": "源码固定 OpenPlat token 不可用，无法获取当前 workspace 的 authInfo.apiKey，跳过 Sirius 宽召回。",
             "query_variants": query_variants,
             "upper_bound_scope": "open_label",
             "auth_token_source": auth_source,
@@ -876,9 +835,8 @@ def _suggest_probes(request_dict: dict[str, Any], completeness: dict[str, str], 
             suggested.append(name)
 
     expected_ids = _string_list(case_input.get("expected_knowledge_ids"))
-    oracle_skip_self = bool(case_input.get("oracle_skip_self")) and bool(expected_ids)
-    if not oracle_skip_self:
-        add("probe-self-oracle")
+    required_points = _required_assertion_points(_expected_knowledge_points(request_dict))
+    if expected_ids or required_points:
         add("probe-wide-recall")
     if not trace_summary.get("has_middle_node_trace"):
         host_actions.append({"action": "replay-workflow", "reason": "fornax trace lacks middle-node evidence", "priority": "P0"})
@@ -911,7 +869,6 @@ def _suggest_probes(request_dict: dict[str, Any], completeness: dict[str, str], 
         "probe-wide-recall",
         "probe-rerank-bypass",
         "probe-context-assembly",
-        "probe-self-oracle",
         "run-probe-plan",
         "fetch-workflow-nodes",
         "replay-workflow",
@@ -1087,7 +1044,6 @@ class EvidenceBuilder:
         source_stage: str,
         source: dict[str, Any],
         content: Any,
-        confidence: float = 0.7,
         evidence_id: str | None = None,
     ) -> str:
         evidence_id = evidence_id or f"ev_{self.counter:03d}"
@@ -1116,7 +1072,6 @@ class EvidenceBuilder:
                 "quality": {
                     "freshness": "valid",
                     "permission_available": None,
-                    "confidence": confidence,
                 },
             }
         )
@@ -1133,13 +1088,12 @@ class EvidenceBuilder:
                 source_stage=str(item.get("source_stage") or _stage_from_probe(str(probe.get("probe_name") or ""))),
                 source=item.get("source") if isinstance(item.get("source"), dict) else {"probe_name": probe.get("probe_name")},
                 content=item.get("content"),
-                confidence=float(((item.get("quality") or {}).get("confidence") if isinstance(item.get("quality"), dict) else 0.7) or 0.7),
             )
 
     def ids_for(self, stage: str) -> list[str]:
         return [item["evidence_id"] for item in self.items if item.get("source_stage") == stage]
 
-    def ensure_stage_evidence(self, stage: str, content: Any, confidence: float = 0.6) -> list[str]:
+    def ensure_stage_evidence(self, stage: str, content: Any) -> list[str]:
         existing = self.ids_for(stage)
         if existing:
             return existing[:3]
@@ -1149,7 +1103,6 @@ class EvidenceBuilder:
                 source_stage=stage,
                 source={"name": "orchestrate"},
                 content=content,
-                confidence=confidence,
             )
         ]
 
@@ -1165,7 +1118,6 @@ def _base_evidence(request_dict: dict[str, Any], ingest: dict[str, Any], builder
             "span_count": raw.get("span_count"),
             "workflow_node_order": raw.get("workflow_node_order", []),
         },
-        confidence=0.82,
     )
     if raw.get("workflow_span_ios"):
         builder.add(
@@ -1173,7 +1125,6 @@ def _base_evidence(request_dict: dict[str, Any], ingest: dict[str, Any], builder
             source_stage="context",
             source={"span_type": "workflow"},
             content={"workflow_span_ios": raw.get("workflow_span_ios")},
-            confidence=0.86,
         )
     counts = _counts_from_request(request_dict)
     if counts["origin_doc_list"] or counts["origin_faq_list"]:
@@ -1186,7 +1137,6 @@ def _base_evidence(request_dict: dict[str, Any], ingest: dict[str, Any], builder
                 "doc_ids": sorted(_doc_ids(_docs_from_request(request_dict, "retrieval", "origin_doc_list"))),
                 "faq_ids": sorted(_doc_ids(_docs_from_request(request_dict, "retrieval", "origin_faq_list"))),
             },
-            confidence=0.86,
         )
     if counts["rerank_docs"]:
         builder.add(
@@ -1198,7 +1148,6 @@ def _base_evidence(request_dict: dict[str, Any], ingest: dict[str, Any], builder
                 "doc_ids": sorted(_doc_ids(_docs_from_request(request_dict, "rerank", "rerank_docs"))),
                 "expected_doc_survived_rerank": request_dict.get("rerank", {}).get("expected_doc_survived_rerank"),
             },
-            confidence=0.86,
         )
     if counts["prompt_docs"]:
         builder.add(
@@ -1210,7 +1159,6 @@ def _base_evidence(request_dict: dict[str, Any], ingest: dict[str, Any], builder
                 "doc_ids": sorted(_doc_ids(_docs_from_request(request_dict, "rerank", "prompt_docs"))),
                 "expected_doc_in_prompt": request_dict.get("rerank", {}).get("expected_doc_in_prompt"),
             },
-            confidence=0.86,
         )
     qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
     answer_claims = _expected_knowledge_points(request_dict)
@@ -1229,7 +1177,6 @@ def _base_evidence(request_dict: dict[str, Any], ingest: dict[str, Any], builder
                 "wrong_citation": qa.get("wrong_citation"),
                 "partial_answer": qa.get("partial_answer"),
             },
-            confidence=0.78,
         )
     judgement = request_dict.get("judgement_evidence") if isinstance(request_dict.get("judgement_evidence"), dict) else {}
     if judgement.get("signals"):
@@ -1238,7 +1185,6 @@ def _base_evidence(request_dict: dict[str, Any], ingest: dict[str, Any], builder
             source_stage="evaluation",
             source={"field": "judgement_evidence.signals"},
             content={"signals": judgement.get("signals")},
-            confidence=0.65,
         )
 
 
@@ -1249,7 +1195,6 @@ def _stage_from_probe(probe_name: str) -> str:
         "probe-wide-recall": "retrieval",
         "probe-rerank-bypass": "rerank",
         "probe-context-assembly": "context",
-        "probe-self-oracle": "knowledge",
         "fetch-workflow-nodes": "preprocess",
         "replay-workflow": "context",
     }
@@ -1345,18 +1290,9 @@ def _merge_probe_signals(request_dict: dict[str, Any], probes: list[dict[str, An
         answer = signals.get("answer") if isinstance(signals.get("answer"), dict) else {}
         if isinstance(oracle_status, dict):
             state["oracle_status"] = oracle_status
-            state["oracle_confidence"] = oracle_status.get("confidence", 0.0)
         if knowledge:
             state["knowledge_exists_state"] = knowledge.get("knowledge_exists")
             state["knowledge_retry_count"] = knowledge.get("retry_count", 0)
-            inferred_ids = _string_list(knowledge.get("inferred_expected_ids"))
-            if inferred_ids:
-                state["inferred_expected_ids"] = inferred_ids
-                merged.setdefault("case_input", {})["inferred_expected_knowledge_ids"] = inferred_ids
-                existing = _string_list(merged.setdefault("case_input", {}).get("expected_knowledge_ids"))
-                merged["case_input"]["expected_knowledge_ids"] = list(dict.fromkeys([*existing, *inferred_ids]))
-                merged.setdefault("raw_oracle_fields", {})["inferred_expected_docs"] = knowledge.get("inferred_expected_docs", [])
-                merged["raw_oracle_fields"]["oracle_confidence"] = knowledge.get("oracle_confidence")
             if knowledge.get("expected_knowledge_points") is not None:
                 merged.setdefault("raw_oracle_fields", {})["expected_knowledge_points"] = knowledge.get("expected_knowledge_points", [])
             if knowledge.get("point_coverage") is not None:
@@ -1374,6 +1310,16 @@ def _merge_probe_signals(request_dict: dict[str, Any], probes: list[dict[str, An
             merged.setdefault("retrieval", {})["permission_miss"] = True
         if retrieval.get("online_retrieval_hit") is not None:
             merged.setdefault("retrieval", {})["online_retrieval_hit"] = retrieval.get("online_retrieval_hit")
+        if retrieval.get("expected_knowledge_hit") is not None:
+            merged.setdefault("retrieval", {})["expected_knowledge_hit"] = retrieval.get("expected_knowledge_hit")
+        if retrieval.get("knowledge_exists") is not None:
+            merged.setdefault("retrieval", {})["knowledge_exists"] = retrieval.get("knowledge_exists")
+        if retrieval.get("origin_doc_list"):
+            merged.setdefault("retrieval", {})["origin_doc_list"] = retrieval.get("origin_doc_list")
+            merged.setdefault("retrieval", {})["knowledge_exists"] = True
+        if retrieval.get("origin_faq_list"):
+            merged.setdefault("retrieval", {})["origin_faq_list"] = retrieval.get("origin_faq_list")
+            merged.setdefault("retrieval", {})["knowledge_exists"] = True
         if retrieval.get("wide_recall_docs"):
             merged.setdefault("retrieval", {})["wide_recall_docs"] = retrieval.get("wide_recall_docs")
             merged.setdefault("retrieval", {})["knowledge_exists"] = True
@@ -1393,10 +1339,6 @@ def _merge_probe_signals(request_dict: dict[str, Any], probes: list[dict[str, An
         if retrieval.get("retrieval_gap_detected") is not None:
             merged.setdefault("contrastive_probe", {})["retrieval_gap_detected"] = retrieval.get("retrieval_gap_detected")
         for key in (
-            "inferred_expected_ids",
-            "oracle_origin_hit_ids",
-            "oracle_missing_from_origin_ids",
-            "partial_retrieval_miss",
             "knowledge_gap_points",
             "partial_knowledge_missing",
             "point_retrieval_gap_points",
@@ -1405,11 +1347,13 @@ def _merge_probe_signals(request_dict: dict[str, Any], probes: list[dict[str, An
                 merged.setdefault("retrieval", {})[key] = retrieval.get(key)
         if rerank.get("expected_doc_survived_rerank") is not None:
             merged.setdefault("rerank", {})["expected_doc_survived_rerank"] = rerank.get("expected_doc_survived_rerank")
+        if rerank.get("expected_doc_in_prompt") is not None:
+            merged.setdefault("rerank", {})["expected_doc_in_prompt"] = rerank.get("expected_doc_in_prompt")
+        if rerank.get("rerank_docs"):
+            merged.setdefault("rerank", {})["rerank_docs"] = rerank.get("rerank_docs")
+        if rerank.get("prompt_docs"):
+            merged.setdefault("rerank", {})["prompt_docs"] = rerank.get("prompt_docs")
         for key in (
-            "inferred_expected_ids",
-            "oracle_rerank_hit_ids",
-            "oracle_missing_from_rerank_ids",
-            "partial_rerank_drop",
             "missing_expected_points_from_rerank",
         ):
             if key in rerank:
@@ -1420,10 +1364,6 @@ def _merge_probe_signals(request_dict: dict[str, Any], probes: list[dict[str, An
         if context.get("expected_doc_in_prompt") is not None:
             merged.setdefault("rerank", {})["expected_doc_in_prompt"] = context.get("expected_doc_in_prompt")
         for key in (
-            "inferred_expected_ids",
-            "oracle_prompt_hit_ids",
-            "oracle_missing_from_prompt_ids",
-            "partial_context_miss",
             "missing_expected_points_from_prompt",
         ):
             if key in context:
@@ -1438,6 +1378,8 @@ def _merge_probe_signals(request_dict: dict[str, Any], probes: list[dict[str, An
             merged.setdefault("qa", {})["scope_violation"] = True
         if answer.get("branching_unclear") is True:
             merged.setdefault("qa", {})["branching_unclear"] = True
+        if answer.get("answer"):
+            merged.setdefault("qa", {})["answer"] = answer.get("answer")
         if knowledge.get("lacks_authoritative_source") is True:
             merged.setdefault("retrieval", {})["lacks_authoritative_source"] = True
         if knowledge.get("internal_inconsistency") is True:
@@ -1476,7 +1418,6 @@ def _verdict(
     evidence_ids: list[str],
     counterfactual: dict[str, Any],
     candidate_cause: str | None = None,
-    confidence: float | None = None,
     upstream_blocked_by: str | None = None,
     block_downstream: bool = True,
 ) -> dict[str, Any]:
@@ -1492,7 +1433,6 @@ def _verdict(
     }
     if candidate_cause:
         item["candidate_cause"] = candidate_cause
-        item["confidence"] = confidence if confidence is not None else 0.6
         item["owner"] = CAUSE_OWNER[candidate_cause]
     return item
 
@@ -1506,16 +1446,6 @@ def _first_upstream_block(verdicts: list[dict[str, Any]], stage: str) -> str | N
     return None
 
 
-def _oracle_adjusted_confidence(base: float, probe_state: dict[str, Any]) -> float:
-    oracle_confidence = probe_state.get("oracle_confidence")
-    if oracle_confidence in (None, ""):
-        return base
-    try:
-        return round(base * float(oracle_confidence), 4)
-    except (TypeError, ValueError):
-        return base
-
-
 def _required_assertions_all_covered(request_dict: dict[str, Any], probe_state: dict[str, Any]) -> bool:
     rows = _point_coverage_rows(request_dict, probe_state)
     if not rows:
@@ -1526,6 +1456,18 @@ def _required_assertions_all_covered(request_dict: dict[str, Any], probe_state: 
         if isinstance(row, dict) and str(row.get("role") or "expected_required") in REQUIRED_ASSERTION_ROLES
     ]
     return bool(required_rows) and all(row.get("missing_stage") == "covered" for row in required_rows)
+
+
+def _required_assertions_available_after_rerank(request_dict: dict[str, Any], probe_state: dict[str, Any]) -> bool:
+    rows = _point_coverage_rows(request_dict, probe_state)
+    if not rows:
+        return False
+    required_rows = [
+        row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("role") or "expected_required") in REQUIRED_ASSERTION_ROLES
+    ]
+    return bool(required_rows) and all(row.get("missing_stage") in {"covered", "context"} for row in required_rows)
 
 
 def _point_coverage_rows(request_dict: dict[str, Any], probe_state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1616,7 +1558,6 @@ def _infer_verdicts(
     qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
     completeness = (ingest.get("ingest_summary") or {}).get("trace_completeness") or {}
     expected_ids = _string_list(case_input.get("expected_knowledge_ids"))
-    inferred_expected_ids = _string_list(case_input.get("inferred_expected_knowledge_ids"))
     counts = _counts_from_request(request_dict)
     recall_count = counts["origin_doc_list"] + counts["origin_faq_list"]
     oracle_state = probe_state.get("oracle_status") if isinstance(probe_state.get("oracle_status"), dict) else {}
@@ -1655,7 +1596,7 @@ def _infer_verdicts(
     if only_stages is not None and "preprocess" not in only_stages:
         verdicts.append(_verdict(stage="preprocess", status="not_probed", evidence_ids=ev, counterfactual=_counterfactual(False, "stage excluded by --only-stages")))
     elif case_input.get("is_knowledge_qa") is False:
-        verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="non_rag_route_boundary", confidence=0.86, evidence_ids=ev, counterfactual=_counterfactual(True, "route would switch to non-RAG path", "route to the correct non-RAG/tool workflow", True, ev)))
+        verdicts.append(_verdict(stage="preprocess", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, "case should route outside RAG attribution"), block_downstream=True))
     elif workflow_input_signal.get("status") == "fail" and (workflow_input_signal.get("impact") or {}).get("causal") is True:
         detail = "、".join(_string_list(workflow_input_signal.get("missing_terms"))[:5])
         verdicts.append(
@@ -1663,7 +1604,6 @@ def _infer_verdicts(
                 stage="preprocess",
                 status="fail",
                 candidate_cause="workflow_input_loss",
-                confidence=float(workflow_input_signal.get("confidence") or 0.78),
                 evidence_ids=ev,
                 counterfactual=_counterfactual(
                     True,
@@ -1688,9 +1628,9 @@ def _infer_verdicts(
             )
         )
     elif preprocess.get("rewrite_drift"):
-        verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="query_rewrite_drift", confidence=0.8, evidence_ids=ev, counterfactual=_counterfactual(True, "rewrite drift changes retrieval input", "preserve the original user intent in rewrite_query", True, ev)))
+        verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="workflow_input_loss", evidence_ids=ev, counterfactual=_counterfactual(True, "rewrite drift changes retrieval input", "preserve the original user intent in rewrite_query", True, ev)))
     elif preprocess.get("keyword_loss"):
-        verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="keyword_loss", confidence=0.8, evidence_ids=ev, counterfactual=_counterfactual(True, "keyword loss changes retrieval candidates", "preserve key entities before retrieval", True, ev)))
+        verdicts.append(_verdict(stage="preprocess", status="fail", candidate_cause="workflow_input_loss", evidence_ids=ev, counterfactual=_counterfactual(True, "keyword loss changes retrieval candidates", "preserve key entities before retrieval", True, ev)))
     elif preprocess_output_signal.get("status") == "fail":
         detail = "、".join(_string_list(preprocess_output_signal.get("missing_terms"))[:5])
         cause = str(preprocess_output_signal.get("cause") or "query_rewrite_drift")
@@ -1700,8 +1640,7 @@ def _infer_verdicts(
             _verdict(
                 stage="preprocess",
                 status="fail",
-                candidate_cause=cause,
-                confidence=float(preprocess_output_signal.get("confidence") or 0.76),
+                candidate_cause="workflow_input_loss",
                 evidence_ids=ev,
                 counterfactual=_counterfactual(True, f"{reason}: {detail}", fix, True, ev),
             )
@@ -1726,7 +1665,7 @@ def _infer_verdicts(
     knowledge_gap_points = _string_list(retrieval.get("knowledge_gap_points"))
     if only_stages is not None and "knowledge" not in only_stages:
         verdicts.append(_verdict(stage="knowledge", status="not_probed", evidence_ids=ev, counterfactual=_counterfactual(False, "stage excluded by --only-stages")))
-    elif assertion_insufficient and not expected_ids and not inferred_expected_ids:
+    elif assertion_insufficient and not expected_ids:
         verdicts.append(
             _verdict(
                 stage="knowledge",
@@ -1737,9 +1676,9 @@ def _infer_verdicts(
             )
         )
     elif retrieval.get("topic_mismatch"):
-        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="knowledge_topic_mismatch", confidence=0.72, evidence_ids=ev, counterfactual=_counterfactual(True, "correct topic document would unblock retrieval and answer", "add or retitle the exact-topic knowledge", True, ev)))
+        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="suspected_knowledge_missing", evidence_ids=ev, counterfactual=_counterfactual(True, "correct topic document would unblock retrieval and answer", "add or retitle the exact-topic knowledge", True, ev)))
     elif retrieval.get("knowledge_internal_inconsistency"):
-        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="knowledge_internal_inconsistency", confidence=0.7, evidence_ids=ev, counterfactual=_counterfactual(True, "KB contains conflicting statements without clear applicable premises", "deduplicate or disambiguate the conflicting KB entries", True, ev)))
+        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="suspected_knowledge_missing", evidence_ids=ev, counterfactual=_counterfactual(True, "KB contains conflicting statements without clear applicable premises", "deduplicate or disambiguate the conflicting KB entries", True, ev)))
     elif retrieval.get("partial_knowledge_missing") and knowledge_gap_points:
         detail = join_short(knowledge_gap_points)
         verdicts.append(
@@ -1747,7 +1686,6 @@ def _infer_verdicts(
                 stage="knowledge",
                 status="fail",
                 candidate_cause="suspected_knowledge_missing",
-                confidence=_oracle_adjusted_confidence(0.84, probe_state),
                 evidence_ids=ev,
                 counterfactual=_counterfactual(
                     True,
@@ -1773,12 +1711,12 @@ def _infer_verdicts(
             )
         )
     elif retrieval.get("lacks_authoritative_source"):
-        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="suspected_knowledge_missing", confidence=0.7, evidence_ids=ev, counterfactual=_counterfactual(True, "no authoritative/citable KB source backs the required extended references", "add an authoritative KB entry that can be cited for the required references", True, ev)))
+        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="suspected_knowledge_missing", evidence_ids=ev, counterfactual=_counterfactual(True, "no authoritative/citable KB source backs the required extended references", "add an authoritative KB entry that can be cited for the required references", True, ev)))
     elif retrieval.get("knowledge_exists") is False:
-        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="suspected_knowledge_missing", confidence=_oracle_adjusted_confidence(0.82, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, "adding the missing knowledge would change downstream recall", "add the missing knowledge to the target workspace KB", True, ev)))
+        verdicts.append(_verdict(stage="knowledge", status="fail", candidate_cause="suspected_knowledge_missing", evidence_ids=ev, counterfactual=_counterfactual(True, "adding the missing knowledge would change downstream recall", "add the missing knowledge to the target workspace KB", True, ev)))
     elif retrieval.get("knowledge_exists") is True:
         verdicts.append(_verdict(stage="knowledge", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "knowledge exists")))
-    elif not expected_ids and not inferred_expected_ids:
+    elif not expected_ids:
         verdicts.append(
             _verdict(
                 stage="knowledge",
@@ -1796,10 +1734,10 @@ def _infer_verdicts(
     ev = builder.ensure_stage_evidence("retrieval", {"retrieval": retrieval, "oracle_status": probe_state.get("oracle_status")})
     if block:
         verdicts.append(_verdict(stage="retrieval", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, f"blocked by upstream stage {block}"), upstream_blocked_by=block))
-    elif assertion_insufficient and not expected_ids and not inferred_expected_ids:
+    elif assertion_insufficient and not expected_ids:
         verdicts.append(_verdict(stage="retrieval", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, "expected assertions missing; retrieval cannot be judged against a target"), block_downstream=False))
     elif retrieval.get("permission_miss"):
-        verdicts.append(_verdict(stage="retrieval", status="fail", candidate_cause="permission_miss", confidence=0.84, evidence_ids=ev, counterfactual=_counterfactual(True, "fixing ACL/namespace would expose correct docs to online retrieval", "make the expected knowledge visible to this workspace/app/user path", True, ev)))
+        verdicts.append(_verdict(stage="retrieval", status="fail", candidate_cause="retrieval_miss", evidence_ids=ev, counterfactual=_counterfactual(True, "fixing ACL/namespace would expose correct docs to online retrieval", "make the expected knowledge visible to this workspace/app/user path", True, ev)))
     elif _string_list(retrieval.get("point_retrieval_gap_points")):
         detail = join_short(_string_list(retrieval.get("point_retrieval_gap_points")))
         verdicts.append(
@@ -1807,7 +1745,6 @@ def _infer_verdicts(
                 stage="retrieval",
                 status="fail",
                 candidate_cause="retrieval_miss",
-                confidence=_oracle_adjusted_confidence(0.84, probe_state),
                 evidence_ids=ev,
                 counterfactual=_counterfactual(
                     True,
@@ -1820,11 +1757,8 @@ def _infer_verdicts(
         )
     elif required_assertions_all_covered:
         verdicts.append(_verdict(stage="retrieval", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "required assertions are covered in the online evidence chain; doc-id-only retrieval mismatch ignored")))
-    elif retrieval.get("oracle_missing_from_origin_ids"):
-        missing_ids = _string_list(retrieval.get("oracle_missing_from_origin_ids"))
-        verdicts.append(_verdict(stage="retrieval", status="fail", candidate_cause="retrieval_miss", confidence=_oracle_adjusted_confidence(0.84, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"self-oracle expected docs missed online retrieval: {', '.join(missing_ids[:10])}", "fix query/index/filter/topK so inferred expected docs enter recall", True, ev)))
     elif retrieval.get("online_retrieval_hit") is False or retrieval.get("expected_knowledge_hit") is False or request_dict.get("contrastive_probe", {}).get("retrieval_gap_detected"):
-        verdicts.append(_verdict(stage="retrieval", status="fail", candidate_cause="retrieval_miss", confidence=0.84, evidence_ids=ev, counterfactual=_counterfactual(True, "correct knowledge exists but online topK missed it", "fix query/index/filter/topK so the expected doc enters recall", True, ev)))
+        verdicts.append(_verdict(stage="retrieval", status="fail", candidate_cause="retrieval_miss", evidence_ids=ev, counterfactual=_counterfactual(True, "correct knowledge exists but online topK missed it", "fix query/index/filter/topK so the expected doc enters recall", True, ev)))
     elif retrieval.get("online_retrieval_hit") is True or retrieval.get("expected_knowledge_hit") is True:
         verdicts.append(_verdict(stage="retrieval", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "retrieval hit expected evidence")))
     elif not expected_ids and recall_count > 0:
@@ -1842,7 +1776,6 @@ def _infer_verdicts(
                 stage="retrieval",
                 status="fail",
                 candidate_cause="retrieval_miss",
-                confidence=0.72,
                 evidence_ids=ev,
                 counterfactual=_counterfactual(True, "online retrieval returned no candidate docs", "fix query/index/filter/topK so relevant docs enter recall", True, ev),
             )
@@ -1855,26 +1788,15 @@ def _infer_verdicts(
     ev = builder.ensure_stage_evidence("rerank", {"rerank": rerank, "rerank_tunable": probe_state.get("rerank_tunable"), "oracle_status": probe_state.get("oracle_status")})
     if block:
         verdicts.append(_verdict(stage="rerank", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, f"blocked by upstream stage {block}"), upstream_blocked_by=block))
-    elif assertion_insufficient and not expected_ids and not inferred_expected_ids:
+    elif assertion_insufficient and not expected_ids:
         verdicts.append(_verdict(stage="rerank", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, "expected assertions missing; rerank cannot be judged against a target"), block_downstream=False))
     elif probe_state.get("rerank_tunable"):
-        verdicts.append(_verdict(stage="rerank", status="fail", candidate_cause="rerank_tunable", confidence=0.78, evidence_ids=ev, counterfactual=_counterfactual(True, "rerank parameter change can recover target docs", "tune threshold/features and verify on regression set", True, ev)))
+        verdicts.append(_verdict(stage="rerank", status="fail", candidate_cause="rerank_drop", evidence_ids=ev, counterfactual=_counterfactual(True, "rerank parameter change can recover target docs", "tune threshold/features and verify on regression set", True, ev)))
     elif _string_list(rerank.get("missing_expected_points_from_rerank")):
         detail = join_short(_string_list(rerank.get("missing_expected_points_from_rerank")))
-        verdicts.append(_verdict(stage="rerank", status="fail", candidate_cause="rerank_drop", confidence=_oracle_adjusted_confidence(0.86, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"required assertions were covered by origin recall but dropped by rerank: {detail}", f"fix rerank scoring/dedup/topK for: {detail}", True, ev)))
+        verdicts.append(_verdict(stage="rerank", status="fail", candidate_cause="rerank_drop", evidence_ids=ev, counterfactual=_counterfactual(True, f"required assertions were covered by origin recall but dropped by rerank: {detail}", f"fix rerank scoring/dedup/topK for: {detail}", True, ev)))
     elif required_assertions_all_covered:
         verdicts.append(_verdict(stage="rerank", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "required assertions survived into prompt; doc-id-only rerank drop ignored")))
-    elif rerank.get("oracle_missing_from_rerank_ids"):
-        missing_ids = _string_list(rerank.get("oracle_missing_from_rerank_ids"))
-        verdicts.append(
-            _verdict(
-                stage="rerank",
-                status="indeterminate",
-                evidence_ids=ev,
-                counterfactual=_counterfactual(False, f"self-oracle inferred doc IDs did not survive rerank, but no required assertion gap is proven: {', '.join(missing_ids[:10])}"),
-                block_downstream=False,
-            )
-        )
     elif rerank.get("expected_doc_survived_rerank") is False:
         verdicts.append(
             _verdict(
@@ -1914,26 +1836,15 @@ def _infer_verdicts(
     ev = builder.ensure_stage_evidence("context", {"rerank": rerank, "oracle_status": probe_state.get("oracle_status")})
     if block:
         verdicts.append(_verdict(stage="context", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, f"blocked by upstream stage {block}"), upstream_blocked_by=block))
-    elif assertion_insufficient and not expected_ids and not inferred_expected_ids:
+    elif assertion_insufficient and not expected_ids:
         verdicts.append(_verdict(stage="context", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, "expected assertions missing; prompt assembly cannot be judged against a target"), block_downstream=False))
     elif _string_list(rerank.get("missing_expected_points_from_prompt")):
         detail = join_short(_string_list(rerank.get("missing_expected_points_from_prompt")))
-        verdicts.append(_verdict(stage="context", status="fail", candidate_cause="context_assembly_error", confidence=_oracle_adjusted_confidence(0.82, probe_state), evidence_ids=ev, counterfactual=_counterfactual(True, f"required assertions survived rerank but did not enter prompt: {detail}", f"fix prompt_docs assembly/truncation/noise budget for: {detail}", True, ev)))
+        verdicts.append(_verdict(stage="context", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, f"required assertions survived rerank but did not enter prompt: {detail}"), block_downstream=False))
     elif required_assertions_all_covered:
         verdicts.append(_verdict(stage="context", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "required assertions reached prompt; doc-id-only prompt mismatch ignored")))
-    elif rerank.get("oracle_missing_from_prompt_ids"):
-        missing_ids = _string_list(rerank.get("oracle_missing_from_prompt_ids"))
-        verdicts.append(
-            _verdict(
-                stage="context",
-                status="indeterminate",
-                evidence_ids=ev,
-                counterfactual=_counterfactual(False, f"self-oracle inferred doc IDs did not enter prompt, but no required assertion gap is proven: {', '.join(missing_ids[:10])}"),
-                block_downstream=False,
-            )
-        )
     elif rerank.get("prompt_truncation") or rerank.get("noise_overload"):
-        verdicts.append(_verdict(stage="context", status="fail", candidate_cause="context_assembly_error", confidence=0.82, evidence_ids=ev, counterfactual=_counterfactual(True, "prompt would contain expected evidence after context assembly fix", "fix prompt_docs assembly, truncation, and noise budget", True, ev)))
+        verdicts.append(_verdict(stage="context", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, "prompt/context observation exists, but prompt assembly is not a primary cause in the compressed taxonomy"), block_downstream=False))
     elif rerank.get("expected_doc_in_prompt") is False or rerank.get("context_assembly_error"):
         verdicts.append(
             _verdict(
@@ -1957,30 +1868,25 @@ def _infer_verdicts(
             )
         )
     else:
-        verdicts.append(_verdict(stage="context", status=missing_status("context"), evidence_ids=ev, counterfactual=_counterfactual(False, "prompt_docs/context evidence missing")))
+        verdicts.append(_verdict(stage="context", status=missing_status("context"), evidence_ids=ev, counterfactual=_counterfactual(False, "prompt_docs/context evidence missing"), block_downstream=False))
 
     # answer
     block = _first_upstream_block(verdicts, "answer")
     ev = builder.ensure_stage_evidence("answer", {"qa": qa})
-    answer_ready = (qa.get("prompt_supports_answer") is True or required_assertions_all_covered) and qa.get("answer_satisfies_expected") is False
-    has_unsupported_answer_claim = _has_answer_claim_role(request_dict, "unsupported_claim")
+    answer_issue_types = _answer_issue_types(request_dict)
+    answer_ready = (
+        qa.get("prompt_supports_answer") is True
+        or required_assertions_all_covered
+        or _required_assertions_available_after_rerank(request_dict, probe_state)
+    ) and qa.get("answer_satisfies_expected") is False
     if block and not answer_ready:
         verdicts.append(_verdict(stage="answer", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, f"blocked by upstream stage {block}"), upstream_blocked_by=block))
     elif answer_ready:
-        if qa.get("wrong_citation"):
-            cause = "wrong_citation"
-        elif qa.get("scope_violation"):
-            cause = "answer_scope_violation"
-        elif qa.get("branching_unclear"):
-            cause = "answer_branching_unclear"
-        elif qa.get("partial_answer"):
-            cause = "partial_answer"
-        else:
-            cause = "unsupported_claim"
-        verdicts.append(_verdict(stage="answer", status="fail", candidate_cause=cause, confidence=0.86, evidence_ids=ev, counterfactual=_counterfactual(True, "answer would change if generation/citation behavior were fixed", "regenerate with faithful use of prompt_docs and citation mapping", True, ev)))
+        issue_text = ", ".join(answer_issue_types) if answer_issue_types else "answer_satisfies_expected=false"
+        verdicts.append(_verdict(stage="answer", status="fail", candidate_cause="answer_failure", evidence_ids=ev, counterfactual=_counterfactual(True, f"answer symptoms remain after upstream evidence passed: {issue_text}", "regenerate with faithful use of rerank evidence and citation mapping", True, ev)))
     elif qa.get("answer_satisfies_expected") is True:
         verdicts.append(_verdict(stage="answer", status="pass", evidence_ids=ev, counterfactual=_counterfactual(False, "answer satisfies expected output")))
-    elif has_unsupported_answer_claim or qa.get("wrong_citation") or qa.get("partial_answer") or qa.get("scope_violation") or qa.get("branching_unclear"):
+    elif answer_issue_types:
         verdicts.append(_verdict(stage="answer", status="indeterminate", evidence_ids=ev, counterfactual=_counterfactual(False, "answer flags exist but prompt_supports_answer/answer_satisfies_expected precondition is not proven")))
     else:
         verdicts.append(_verdict(stage="answer", status=missing_status("answer"), evidence_ids=ev, counterfactual=_counterfactual(False, "answer alignment evidence missing")))
@@ -2037,7 +1943,6 @@ def _select_primary(verdicts: list[dict[str, Any]]) -> tuple[dict[str, Any] | No
         return {
             "stage": verdict["stage"],
             "cause_code": cause,
-            "confidence": verdict.get("confidence", 0.0),
             "owner": CAUSE_OWNER[cause],
             "selection_rationale": rationale,
         }, rationale
@@ -2076,7 +1981,7 @@ def _case_assessment(
     qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
     judgement = request_dict.get("judgement_evidence") if isinstance(request_dict.get("judgement_evidence"), dict) else {}
     signals = judgement.get("signals") if isinstance(judgement.get("signals"), list) else []
-    has_unsupported_answer_claim = _has_answer_claim_role(request_dict, "unsupported_claim")
+    answer_issue_types = _answer_issue_types(request_dict)
     answer_verdict = next((item for item in verdicts if item.get("stage") == "answer"), {})
     if qa.get("answer_satisfies_expected") is True:
         return {
@@ -2090,7 +1995,7 @@ def _case_assessment(
             "reason": f"已定位到主因：{primary.get('cause_code')}，可按归因链路修复。",
             "evidence_ids": answer_verdict.get("evidence_ids") or [],
         }
-    if qa.get("answer_satisfies_expected") is False or signals or has_unsupported_answer_claim or qa.get("wrong_citation") or qa.get("partial_answer"):
+    if qa.get("answer_satisfies_expected") is False or signals or answer_issue_types:
         return {
             "status": "badcase_needs_review",
             "reason": f"存在评估失败或答案问题信号，但当前证据不足以选择唯一主因：{primary_reason}",
@@ -2112,7 +2017,6 @@ def _case_assessment(
 def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[str, Any]) -> dict[str, Any]:
     case_input = request_dict.get("case_input") if isinstance(request_dict.get("case_input"), dict) else {}
     provided_ids = _string_list(case_input.get("expected_knowledge_ids"))
-    inferred_ids = _string_list(case_input.get("inferred_expected_knowledge_ids"))
     raw_oracle = request_dict.get("raw_oracle_fields") if isinstance(request_dict.get("raw_oracle_fields"), dict) else {}
     raw_points = _canonicalize_assertion_records(raw_oracle.get("expected_knowledge_points"))
     raw_coverage = _canonicalize_assertion_records(raw_oracle.get("point_coverage"))
@@ -2136,22 +2040,6 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
             "inferred_doc_count": 0,
             "inferred_doc_ids": [],
             "provided_doc_ids": provided_ids,
-            "confidence": 1.0,
-            "conflict_detected": False,
-            "provided_conflict_detected": False,
-            "expected_knowledge_points": expected_points,
-            "point_coverage": raw_coverage,
-        }
-    if inferred_ids:
-        return {
-            "source": "self_inferred",
-            "signals_used": ["unknown"],
-            "signals_attempted": ["unknown"],
-            "signals_failed": {},
-            "inferred_doc_count": len(inferred_ids),
-            "inferred_doc_ids": inferred_ids,
-            "provided_doc_ids": [],
-            "confidence": probe_state.get("oracle_confidence", 0.0),
             "conflict_detected": False,
             "provided_conflict_detected": False,
             "expected_knowledge_points": expected_points,
@@ -2166,7 +2054,6 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
             "inferred_doc_count": 0,
             "inferred_doc_ids": [],
             "provided_doc_ids": [],
-            "confidence": 0.0,
             "conflict_detected": False,
             "provided_conflict_detected": False,
             "expected_knowledge_points": expected_points,
@@ -2182,7 +2069,6 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
             "inferred_doc_count": 0,
             "inferred_doc_ids": [],
             "provided_doc_ids": provided_ids,
-            "confidence": max([float(point.get("confidence") or 0.0) for point in required_points] or [0.0]),
             "conflict_detected": False,
             "provided_conflict_detected": False,
             "expected_knowledge_points": expected_points,
@@ -2193,11 +2079,10 @@ def _orchestrate_oracle_status(request_dict: dict[str, Any], probe_state: dict[s
         "source": "insufficient",
         "signals_used": [],
         "signals_attempted": [],
-        "signals_failed": {"probe-self-oracle": "not run or produced no oracle status"},
+        "signals_failed": {"coverage": "required assertions exist but no point_coverage has been computed"},
         "inferred_doc_count": 0,
         "inferred_doc_ids": [],
         "provided_doc_ids": [],
-        "confidence": 0.0,
         "conflict_detected": False,
         "provided_conflict_detected": False,
         "expected_knowledge_points": expected_points,
@@ -2255,8 +2140,6 @@ def orchestrate_v3(
         and not (primary and primary.get("stage") == "answer")
     ):
         human_review_reasons.append("知识是否存在仍无法确认")
-    if primary and float(primary.get("confidence") or 0.0) < 0.6:
-        human_review_reasons.append(f"主因置信度较低：{primary.get('confidence')}")
     if "trace_incomplete_blocking_attribution" in patterns:
         human_review_reasons.append("trace 不完整阻塞归因")
     retrieval_state = request_dict.get("retrieval") if isinstance(request_dict.get("retrieval"), dict) else {}
@@ -2271,13 +2154,13 @@ def orchestrate_v3(
                 human_review_reasons.append("缺少 expected_required 断言；宿主 Agent 需通过 Agent attribution planning 从 trace artifacts、judgement signals 和 workflow output 补充 assertion set")
         if oracle_status.get("source") == "insufficient":
             if _required_assertion_points(_expected_knowledge_points(request_dict)):
-                human_review_reasons.append("oracle insufficient: required assertions exist but self-oracle/wide recall could not infer supporting documents or recall template")
+                human_review_reasons.append("coverage insufficient: required assertions exist but trace/wide recall did not compute supporting documents")
             else:
                 human_review_reasons.append("oracle insufficient: no required assertions or recall evidence available")
         if oracle_status.get("conflict_detected"):
             human_review_reasons.append(f"oracle signals contradictory: jaccard={oracle_status.get('jaccard')}")
         if oracle_status.get("provided_conflict_detected"):
-            human_review_reasons.append("provided expected knowledge contradicts self-oracle inference")
+            human_review_reasons.append("provided expected knowledge contradicts assertion coverage evidence")
     if mode == "preliminary":
         human_review_reasons.append("当前为 preliminary 模式，仍需补充探针证据")
     human_review_reasons = list(dict.fromkeys(human_review_reasons))
@@ -2345,22 +2228,11 @@ STATUS_DISPLAY = {
 }
 
 CAUSE_DISPLAY = {
-    "non_rag_route_boundary": "非 RAG 路由边界",
     "workflow_input_loss": "Workflow 输入丢失",
-    "query_rewrite_drift": "Query 改写偏移",
-    "keyword_loss": "关键词丢失",
     "suspected_knowledge_missing": "疑似知识缺失",
-    "knowledge_topic_mismatch": "知识主题不匹配",
     "retrieval_miss": "召回缺失",
-    "permission_miss": "权限缺失",
     "rerank_drop": "重排误杀",
-    "rerank_tunable": "重排参数可调",
-    "context_assembly_error": "上下文组装错误",
-    "unsupported_claim": "答案存在未支撑断言",
-    "wrong_citation": "引用错误",
-    "partial_answer": "回答不完整",
-    "answer_scope_violation": "答案越界",
-    "answer_branching_unclear": "答案分支前提不清",
+    "answer_failure": "答案生成失败",
 }
 
 OWNER_DISPLAY = {
@@ -2394,7 +2266,7 @@ ASSESSMENT_DISPLAY = {
 REASON_DISPLAY = {
     "stage healthy": "该阶段有可用证据，暂未发现异常。",
     "knowledge exists": "已确认相关知识存在。",
-    "knowledge existence unknown after retry": "没有期望知识 ID 或知识探针仍无法确认知识是否存在，因此不能判断是知识缺失还是后续链路问题。",
+    "knowledge existence unknown after retry": "没有人工 expected doc ID，或知识探针仍无法确认知识是否存在，因此不能判断是知识缺失还是后续链路问题。",
     "retrieval hit expected evidence": "初召回命中了期望知识。",
     "required assertions are covered in the online evidence chain; doc-id-only retrieval mismatch ignored": "必要断言已经被线上证据链覆盖；单纯 doc ID 不一致不作为召回失败。",
     "retrieval hit evidence missing": "缺少“是否命中期望知识”的证据。",
@@ -2406,16 +2278,15 @@ REASON_DISPLAY = {
     "prompt_docs/context evidence missing": "缺少 Prompt 组装后的文档证据。",
     "answer alignment evidence missing": "缺少答案与 Prompt 文档的支撑关系判断。",
     "answer satisfies expected output": "答案满足期望。",
-    "answer would change if generation/citation behavior were fixed": "如果修正答案生成、引用选择或范围控制，下游答案会变化。",
-    "regenerate with faithful use of prompt_docs and citation mapping": "基于 Prompt 文档和引用映射重新生成答案。",
+    "regenerate with faithful use of rerank evidence and citation mapping": "基于重排后已保留证据和引用映射重新生成答案。",
     "answer flags exist but prompt_supports_answer/answer_satisfies_expected precondition is not proven": "已有答案侧风险标记，但还缺少 Prompt 支撑和答案满足性前提，暂不能自动下结论。",
     "evaluation is observation-only in v3": "评估器结果只作为问题线索，不单独决定主因。",
     "rewrite_query/keywords evidence missing": "缺少改写 query 或关键词证据。",
     "stage excluded by --only-stages": "该阶段本次未纳入探测。",
-    "knowledge unlabeled; continue with downstream trace evidence": "未提供期望知识 ID，因此不把知识阶段作为硬阻塞，继续查看下游 trace 证据。",
-    "retrieval returned candidates without expected knowledge labels": "初召回有候选文档；由于未提供期望知识 ID，只能说明召回链路有结果，不能证明命中了正确知识。",
+    "knowledge unlabeled; continue with downstream trace evidence": "未提供人工 expected doc ID，因此不把知识阶段作为硬阻塞，继续查看下游 trace 证据。",
+    "retrieval returned candidates without expected knowledge labels": "初召回有候选文档；由于未提供人工 expected doc ID，只能说明召回链路有结果，不能证明命中了正确知识。",
     "online retrieval returned no candidate docs": "初召回没有返回任何候选文档。",
-    "rerank kept candidate docs without expected knowledge labels": "重排后仍有候选文档；由于未提供期望知识 ID，不能判断是否误杀了正确知识。",
+    "rerank kept candidate docs without expected knowledge labels": "重排后仍有候选文档；由于未提供人工 expected doc ID，不能判断是否误杀了正确知识。",
     "rerank dropped all recalled candidates": "重排把初召回候选全部过滤掉了。",
     "reranked candidates did not enter prompt_docs": "重排后有候选文档，但最终没有进入 Prompt 文档。",
     "expected assertions missing; host Agent must supply fact assertions": "缺少宿主 Agent 提供的必要事实断言，无法判断知识库阶段。",
@@ -2426,9 +2297,6 @@ REASON_DISPLAY = {
     "rerank dropped all recalled candidates, but no required assertion target is proven": "重排丢掉了初召回候选，但还没有证明必要断言在这里丢失。",
     "expected doc ID did not survive rerank, but doc-id-only evidence does not prove the required assertion was lost": "期望 doc ID 没有通过重排；但只有 doc ID 变化，不能证明必要断言在重排阶段丢失。",
     "expected doc ID did not enter prompt, but doc-id-only evidence does not prove the required assertion was lost": "期望 doc ID 没有进入 Prompt；但只有 doc ID 变化，不能证明必要断言在 Prompt 拼接阶段丢失。",
-    "self-oracle expected docs missed online retrieval": "self-oracle 推断的期望知识没有进入线上初召回。",
-    "self-oracle expected docs were recalled but dropped by rerank": "self-oracle 推断的期望知识已被召回，但重排后丢失。",
-    "self-oracle expected docs survived upstream but did not enter prompt": "self-oracle 推断的期望知识通过了上游，但没有进入最终 Prompt。",
     "adding the missing knowledge would change downstream recall": "补齐缺失知识后，下游召回预期会变化。",
     "affected required assertions were already supported by online origin/rerank/prompt evidence": "受影响的必要断言已经被线上初召回、重排或 Prompt 证据支撑，因此输入差异没有切断正确证据链。",
     "affected required assertions are unsupported by the theoretical recall upper bound; do not blame workflow input": "受影响的必要断言在理论召回上界也没有支撑，不能把主因归到 Workflow 输入。",
@@ -2492,28 +2360,16 @@ def _display_reason(reason: Any) -> str:
         return f"这些必要断言已被线上初召回覆盖，但重排后丢失：{text[len(prefix):]}"
     prefix = "required assertions survived rerank but did not enter prompt: "
     if text.startswith(prefix):
-        return f"这些必要断言通过了重排，但没有进入最终 Prompt：{text[len(prefix):]}"
-    prefix = "self-oracle expected docs missed online retrieval: "
+        return f"Prompt 观察：这些必要断言通过了重排，但没有进入最终 Prompt；当前压缩 taxonomy 不把它作为独立主因：{text[len(prefix):]}"
+    prefix = "answer symptoms remain after upstream evidence passed: "
     if text.startswith(prefix):
-        return f"self-oracle 推断的期望知识 ID 未进入线上初召回：{text[len(prefix):]}"
-    prefix = "self-oracle expected docs were recalled but dropped by rerank: "
-    if text.startswith(prefix):
-        return f"self-oracle 推断的期望知识已被初召回，但重排后丢失：{text[len(prefix):]}"
-    prefix = "self-oracle expected docs survived upstream but did not enter prompt: "
-    if text.startswith(prefix):
-        return f"self-oracle 推断的期望知识通过上游，但没有进入最终 Prompt：{text[len(prefix):]}"
+        return f"上游证据链已通过或重排后已有必要支撑，但答案仍未满足期望；答案症状：{text[len(prefix):]}"
     prefix = "required assertions are covered in the online evidence chain; "
     if text.startswith(prefix):
         return f"必要断言已经被线上证据链覆盖；{text[len(prefix):]}"
     prefix = "required assertions survived into prompt; "
     if text.startswith(prefix):
         return f"必要断言已经进入 Prompt；{text[len(prefix):]}"
-    prefix = "self-oracle inferred doc IDs did not survive rerank, but no required assertion gap is proven: "
-    if text.startswith(prefix):
-        return f"self-oracle 推断的 doc ID 未通过重排，但还没有证明必要断言在重排阶段丢失：{text[len(prefix):]}"
-    prefix = "self-oracle inferred doc IDs did not enter prompt, but no required assertion gap is proven: "
-    if text.startswith(prefix):
-        return f"self-oracle 推断的 doc ID 未进入 Prompt，但还没有证明必要断言在 Prompt 拼接阶段丢失：{text[len(prefix):]}"
     return text
 
 
@@ -2751,7 +2607,6 @@ def _workflow_input_boundary_signal(request_dict: dict[str, Any], ingest: dict[s
         "workflow_input_query": workflow_query,
         "missing_terms": missing_terms[:8],
         "affected_assertions": affected_assertions[:5],
-        "confidence": 0.82 if status == "fail" else 0.7,
     }
 
 
@@ -2792,7 +2647,6 @@ def _preprocess_output_boundary_signal(request_dict: dict[str, Any], ingest: dic
         "preprocess_output": preprocess_text,
         "missing_terms": missing_terms[:8],
         "affected_assertions": affected_assertions[:5],
-        "confidence": 0.78,
     }
 
 
@@ -2809,6 +2663,55 @@ def _stage_key_basis(verdict: dict[str, Any]) -> str:
     return _display_reason(cf.get("reason") or "")
 
 
+def _table_cell(value: Any) -> str:
+    return str(value or "").replace("|", "\\|").replace("\n", " ")
+
+
+def _format_stage_decision_rows(verdicts: list[dict[str, Any]]) -> list[str]:
+    rows: list[str] = []
+    blocked_by: dict[str, list[str]] = {}
+    for verdict in verdicts:
+        if not isinstance(verdict, dict):
+            continue
+        stage = str(verdict.get("stage") or "")
+        status = str(verdict.get("status") or "")
+        blocked = str(verdict.get("upstream_blocked_by") or "")
+        if blocked:
+            blocked_by.setdefault(blocked, []).append(_display_stage(stage))
+            continue
+        if stage == "context" and not verdict.get("candidate_cause"):
+            continue
+        if stage == "evaluation" and status == "indeterminate" and not verdict.get("candidate_cause"):
+            continue
+        if status == "not_probed":
+            continue
+        rows.append(
+            "| "
+            + " | ".join(
+                [
+                    _table_cell(_display_stage(stage)),
+                    _table_cell(_display_status(status)),
+                    _table_cell(_stage_key_basis(verdict)),
+                ]
+            )
+            + " |"
+        )
+    for block, stages in blocked_by.items():
+        unique_stages = list(dict.fromkeys(stages))
+        rows.append(
+            "| "
+            + " | ".join(
+                [
+                    "下游阶段",
+                    "暂不下钻",
+                    _table_cell(f"被上游阶段 {_display_stage(block)} 阻塞，未展开重复裁决：{'、'.join(unique_stages)}。"),
+                ]
+            )
+            + " |"
+        )
+    return rows or ["| 未知 | 证据不足 | 没有 evidence_chain |"]
+
+
 def _doc_presence_summary(request_dict: dict[str, Any]) -> dict[str, Any]:
     case_input = request_dict.get("case_input") if isinstance(request_dict.get("case_input"), dict) else {}
     raw_oracle = request_dict.get("raw_oracle_fields") if isinstance(request_dict.get("raw_oracle_fields"), dict) else {}
@@ -2821,17 +2724,6 @@ def _doc_presence_summary(request_dict: dict[str, Any]) -> dict[str, Any]:
         doc_id = _doc_id(doc)
         if doc_id and doc_id not in doc_map:
             doc_map[doc_id] = _doc_brief(doc)
-    for doc in raw_oracle.get("inferred_expected_docs") or []:
-        if not isinstance(doc, dict):
-            continue
-        doc_id = str(doc.get("doc_id") or doc.get("id") or "").strip()
-        if doc_id and doc_id not in doc_map:
-            doc_map[doc_id] = {
-                "id": doc_id,
-                "title": str(doc.get("title") or ""),
-                "rank": doc.get("rank"),
-                "source": "self-oracle",
-            }
     origin_ids = _doc_ids(origin)
     rerank_ids = _doc_ids(rerank)
     prompt_ids = _doc_ids(prompt)
@@ -2981,11 +2873,49 @@ def _format_point_coverage_table(rows: list[dict[str, Any]], *, limit: int = 8) 
     return lines
 
 
+REPORT_URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+")
+
+
+def _append_visible_limited(parts: list[str], text: str, visible_count: int, limit: int) -> tuple[int, bool]:
+    if not text:
+        return visible_count, False
+    remaining = limit - visible_count
+    if remaining <= 0:
+        return visible_count, True
+    if len(text) <= remaining:
+        parts.append(text)
+        return visible_count + len(text), False
+    parts.append(text[:remaining])
+    return limit, True
+
+
+def _linkify_report_urls(text: str, *, limit: int) -> tuple[str, bool]:
+    parts: list[str] = []
+    visible_count = 0
+    pos = 0
+    truncated = False
+    for match in REPORT_URL_RE.finditer(text):
+        visible_count, truncated = _append_visible_limited(parts, text[pos : match.start()], visible_count, limit)
+        if truncated:
+            break
+        url = match.group(0)
+        if visible_count >= limit:
+            truncated = True
+            break
+        parts.append(f"[链接]({_markdown_link_url(url)})")
+        visible_count += len("链接")
+        pos = match.end()
+    if not truncated:
+        visible_count, truncated = _append_visible_limited(parts, text[pos:], visible_count, limit)
+    return "".join(parts), truncated
+
+
 def _report_short_text(value: Any, *, limit: int = 360) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
         return "未提供"
-    return text[:limit] + ("..." if len(text) > limit else "")
+    rendered, truncated = _linkify_report_urls(text, limit=limit)
+    return rendered + ("..." if truncated else "")
 
 
 def _report_json_excerpt(value: Any, *, limit: int = 2400) -> str:
@@ -3054,6 +2984,22 @@ def _format_assertion_items(items: list[dict[str, Any]], *, roles: set[str], lim
     if len(rows) > limit:
         lines.append(f"- 另有 {len(rows) - limit} 条未展开")
     return lines
+
+
+ORACLE_SOURCE_DISPLAY = {
+    "provided": "人工指定",
+    "host_assertions": "宿主断言",
+    "insufficient_assertions": "缺少必要断言",
+    "insufficient": "证据不足",
+}
+
+
+def _format_id_list(ids: list[str], *, limit: int = 12) -> str:
+    if not ids:
+        return "无"
+    shown = ids[:limit]
+    suffix = f"，另有 {len(ids) - limit} 个未展开" if len(ids) > limit else ""
+    return "，".join(shown) + suffix
 
 
 def _probe_display_name(item: dict[str, Any]) -> str:
@@ -3127,20 +3073,63 @@ def _validation_hit_text(item: dict[str, Any]) -> str:
     return "无法判断"
 
 
-def _doc_detail_link(doc: dict[str, Any]) -> str:
+def _knowledge_detail_url(source: str, doc_id: str) -> str:
+    return f"https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id?source={source}&identifier={doc_id}"
+
+
+def _detail_source_from_doc(doc: dict[str, Any], source_text: str) -> str:
+    direct = _first_doc_value(doc, "knowledge_source", "detail_source", "doc_source", "document_source", "sourceType", "source_type")
+    source = str(direct or "").strip().upper()
+    if source in KNOWLEDGE_DETAIL_SOURCES:
+        return source
+    for part in re.split(r"[|,;\s]+", source_text.upper()):
+        if part in KNOWLEDGE_DETAIL_SOURCES:
+            return part
+    return ""
+
+
+def _doc_is_faq_like(doc: dict[str, Any], source_text: str) -> bool:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            source_text,
+            doc.get("recall_source"),
+            doc.get("recallSource"),
+            doc.get("source_type"),
+            doc.get("sourceType"),
+            doc.get("type"),
+        )
+    ).lower()
+    return "faq" in text or "featured_search" in text or str(doc.get("type")) == "4"
+
+
+def _doc_detail_links(doc: dict[str, Any]) -> list[dict[str, Any]]:
     for key in ("url", "link", "doc_url", "source_url"):
         value = str(doc.get(key) or "").strip()
         if value:
-            return value
+            return [{"label": "打开文档", "url": value, "candidate": False}]
     source_text = str(doc.get("source") or "").strip()
     match = re.search(r"(?:^|[|;,])url=(https?://[^|;,\s]+)", source_text)
     if match:
-        return match.group(1)
+        return [{"label": "打开文档", "url": match.group(1), "candidate": False}]
     doc_id = str(doc.get("identifier") or doc.get("id") or "").strip()
     if not doc_id or not re.fullmatch(r"\d+", doc_id):
-        return ""
-    source = source_text if source_text in KNOWLEDGE_DETAIL_SOURCES else "COGNITION"
-    return f"https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id?source={source}&identifier={doc_id}"
+        return []
+    source = _detail_source_from_doc(doc, source_text)
+    if source:
+        return [{"label": "打开文档", "url": _knowledge_detail_url(source, doc_id), "candidate": False}]
+    if _doc_is_faq_like(doc, source_text):
+        return [
+            {"label": "知识详情", "url": _knowledge_detail_url("COGNITION", doc_id), "candidate": True},
+            {"label": "FAQ详情", "url": _knowledge_detail_url("FAQ", doc_id), "candidate": True},
+            {"label": "FAQ详情（COGNITION_FAQ）", "url": _knowledge_detail_url("COGNITION_FAQ", doc_id), "candidate": True},
+        ]
+    return [{"label": "打开文档", "url": _knowledge_detail_url("COGNITION", doc_id), "candidate": False}]
+
+
+def _doc_detail_link(doc: dict[str, Any]) -> str:
+    links = _doc_detail_links(doc)
+    return str(links[0].get("url") or "") if links else ""
 
 
 def _markdown_link_url(url: str) -> str:
@@ -3152,9 +3141,14 @@ def _format_doc_evidence_lines(doc: dict[str, Any]) -> list[str]:
     title = _report_short_text(doc.get("title"), limit=90)
     label = " ".join(part for part in [doc_id, title if title != "未提供" else ""] if part).strip() or "未命名文档"
     lines = [f"  - {label}"]
-    link = _doc_detail_link(doc)
-    if link:
-        lines.append(f"    - 文档链接：[打开文档]({_markdown_link_url(link)})")
+    links = _doc_detail_links(doc)
+    if len(links) == 1:
+        link = links[0]
+        lines.append(f"    - 文档链接：[{link.get('label') or '打开文档'}]({_markdown_link_url(str(link.get('url') or ''))})")
+    elif links:
+        lines.append("    - 候选详情链接：trace 只有内部知识/FAQ ID，未提供外部文档 URL；若知识详情打不开，再按 FAQ source 复核。")
+        for link in links:
+            lines.append(f"      - [{link.get('label') or '详情'}]({_markdown_link_url(str(link.get('url') or ''))})")
     spans = _string_list(doc.get("support_spans"))
     if spans:
         lines.append(f"    - 命中片段：{_report_short_text(spans[0], limit=180)}")
@@ -3223,26 +3217,10 @@ def _standard_validation_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(outputs, dict):
         return []
     rows: list[dict[str, Any]] = []
-    wide = outputs.get("probe-wide-recall")
-    if isinstance(wide, dict):
-        retrieval = (wide.get("stage_signals") or {}).get("retrieval") if isinstance(wide.get("stage_signals"), dict) else {}
-        if isinstance(retrieval, dict):
-            rows.append(
-                {
-                    "probe_id": "probe-wide-recall",
-                    "display_name": "理论召回验证",
-                    "exp_kind": "retrieval-exp",
-                    "direction": "open_label_recall",
-                    "target_artifact": "kb_wide_recall",
-                    "hit": retrieval.get("theoretical_recall_status") == "ok",
-                    "converged_direction": retrieval.get("theoretical_notes") or retrieval.get("theoretical_recall_status"),
-                    "trigger_observation": "需要确认理论召回上界是否可用于判断知识或召回缺口。",
-                }
-            )
     permission = outputs.get("probe-permission-check")
     if isinstance(permission, dict):
         retrieval = (permission.get("stage_signals") or {}).get("retrieval") if isinstance(permission.get("stage_signals"), dict) else {}
-        if isinstance(retrieval, dict):
+        if isinstance(retrieval, dict) and retrieval.get("permission_miss") is True:
             rows.append(
                 {
                     "probe_id": "probe-permission-check",
@@ -3282,7 +3260,7 @@ def _format_probe_plan_summary(result: dict[str, Any], *, limit: int = 12) -> li
         probe_results = []
     validation_rows = [*probe_results, *_standard_validation_rows(result)]
     if not validation_rows:
-        return ["- 未执行验证环节，或没有可展示的验证结果。"]
+        return ["- 本 case 未执行额外 `{stage}-exp` 验证项；本报告主要依据 trace artifact、理论召回上界与断言覆盖矩阵裁决。"]
     lines: list[str] = []
     shown = 0
     for item in validation_rows:
@@ -3307,28 +3285,27 @@ def _format_probe_plan_summary(result: dict[str, Any], *, limit: int = 12) -> li
             ]
         )
     if shown == 0:
-        return ["- 未执行验证环节，或没有可展示的验证结果。"]
+        return ["- 本 case 未执行额外 `{stage}-exp` 验证项；本报告主要依据 trace artifact、理论召回上界与断言覆盖矩阵裁决。"]
     if len(validation_rows) > limit:
         lines.append(f"仅展示前 {limit} 条，完整结果见 `final/attribution_record.json.raw_artifacts.probe_outputs`。")
     return lines
 
 
 def _secondary_findings(request_dict: dict[str, Any]) -> dict[str, Any]:
-    qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
+    issue_types = _answer_issue_types(request_dict)
     answer_findings: list[dict[str, Any]] = []
     answer_labels = {
-        "wrong_citation": "答案引用错误或引用不支撑 claim",
-        "partial_answer": "答案遗漏必要方面",
-        "scope_violation": "答案超出或偏离问题约束",
-        "branching_unclear": "答案混用分支且未区分前提",
-        "hallucination": "答案存在未支撑内容",
+        "unsupported_claim": "答案存在未支撑断言，或把弱证据写成强结论",
+        "wrong_citation": "答案引用错误或引用不支撑结论",
+        "missing_aspect": "答案遗漏用户问题要求的必要方面",
+        "scope_violation": "答案超出问题约束、扩大适用范围或混用分支前提",
     }
-    for key, label in answer_labels.items():
-        if qa.get(key) is True:
-            answer_findings.append({"type": key, "label": label})
+    for issue_type in issue_types:
+        answer_findings.append({"type": issue_type, "label": answer_labels.get(issue_type, issue_type)})
     retrieval = request_dict.get("retrieval") if isinstance(request_dict.get("retrieval"), dict) else {}
     chunk_conflicts = retrieval.get("chunk_conflicts") if isinstance(retrieval.get("chunk_conflicts"), list) else []
     return {
+        "answer_issue_types": issue_types,
         "answer_findings": answer_findings,
         "chunk_conflict_findings": chunk_conflicts,
     }
@@ -3364,7 +3341,9 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     case_input = request_dict.get("case_input") if isinstance(request_dict.get("case_input"), dict) else {}
     primary = result.get("primary_cause") if isinstance(result.get("primary_cause"), dict) else None
     trace_summary = (ingest.get("raw_artifacts") or {}).get("trace_summary") if isinstance((ingest.get("raw_artifacts") or {}).get("trace_summary"), dict) else {}
-    counts = trace_summary.get("counts") if isinstance(trace_summary.get("counts"), dict) else _counts_from_request(request_dict)
+    request_counts = _counts_from_request(request_dict)
+    trace_counts = trace_summary.get("counts") if isinstance(trace_summary.get("counts"), dict) else {}
+    counts = request_counts if any(request_counts.values()) else trace_counts
     workflow_io = _selected_workflow_io(ingest)
     doc_presence = _doc_presence_summary(request_dict)
     point_coverage = doc_presence.get("point_coverage") if isinstance(doc_presence.get("point_coverage"), list) else []
@@ -3381,13 +3360,8 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     rerank_point_rows = [row for row in point_coverage if isinstance(row, dict) and row.get("missing_stage") == "rerank"]
     context_point_rows = [row for row in point_coverage if isinstance(row, dict) and row.get("missing_stage") == "context"]
     unavailable_point_rows = [row for row in point_coverage if isinstance(row, dict) and row.get("missing_stage") == "upper_bound_unavailable"]
-    stage_rows = []
-    for verdict in result.get("evidence_chain") or []:
-        if not isinstance(verdict, dict):
-            continue
-        stage_rows.append(
-            f"| {_display_stage(verdict.get('stage'))} | {_display_status(verdict.get('status'))} | {_stage_key_basis(verdict)} |"
-        )
+    evidence_chain = result.get("evidence_chain") if isinstance(result.get("evidence_chain"), list) else []
+    stage_rows = _format_stage_decision_rows(evidence_chain)
     next_actions = result.get("next_actions") if isinstance(result.get("next_actions"), list) else []
     actions = "\n".join(
         f"- `{item.get('priority', '')}` {_display_owner(item.get('owner'))}：{item.get('action', '')}"
@@ -3404,16 +3378,12 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     if rerank_point_rows:
         points_text = "；".join(str(item.get("text") or "") for item in rerank_point_rows[:5])
         action_extras.append(f"- `P0` 重排策略负责人：初召回已覆盖这些必要断言但重排未保留，检查排序、去重和 topK：{points_text}")
-    if context_point_rows:
-        points_text = "；".join(str(item.get("text") or "") for item in context_point_rows[:5])
-        action_extras.append(f"- `P1` Prompt 组装负责人：这些必要断言已通过重排但未进入 Prompt，检查截断、拼接顺序和 token 预算：{points_text}")
     if action_extras:
         actions = actions + "\n" + "\n".join(action_extras)
     primary_lines = (
         [
             f"- 主因阶段：`{_display_stage(primary.get('stage'))}`",
             f"- 主因枚举：`{CAUSE_DISPLAY.get(str(primary.get('cause_code') or ''), str(primary.get('cause_code') or ''))}`（{primary.get('cause_code')}）",
-            f"- 置信度：`{primary.get('confidence')}`",
             f"- 建议负责人：`{_display_owner(primary.get('owner'))}`",
         ]
         if primary
@@ -3425,17 +3395,10 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     assessment_status = case_assessment.get("status", "indeterminate")
     assessment_reason = case_assessment.get("reason", "")
     oracle_status = result.get("oracle_status") if isinstance(result.get("oracle_status"), dict) else {}
-    inferred_doc_ids = _string_list(oracle_status.get("inferred_doc_ids"))
     provided_doc_ids = _string_list(oracle_status.get("provided_doc_ids"))
     expected_ids = doc_presence["expected"]
-    if inferred_doc_ids and oracle_status.get("source") in {"self_inferred", "mixed"}:
-        expected_text = f"self-oracle 推断：{'，'.join(inferred_doc_ids)}"
-    elif provided_doc_ids:
-        expected_text = f"宿主提供：{'，'.join(provided_doc_ids)}"
-    elif expected_ids:
-        expected_text = "，".join(expected_ids)
-    else:
-        expected_text = "未提供，且 self-oracle 未能构造"
+    provided_candidate_ids = provided_doc_ids or expected_ids
+    provided_candidate_text = _format_id_list(provided_candidate_ids)
     retrieval_state = request_dict.get("retrieval") if isinstance(request_dict.get("retrieval"), dict) else {}
     recall_counts = retrieval_state.get("theoretical_recall_counts") if isinstance(retrieval_state.get("theoretical_recall_counts"), dict) else {}
     recall_counts_text = (
@@ -3471,25 +3434,56 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
     if rerank_point_rows:
         breakpoint_lines.append("- 重排断点：" + "；".join(_report_short_text(row.get("text"), limit=120) for row in rerank_point_rows[:4]))
     if context_point_rows:
-        breakpoint_lines.append("- Prompt 断点：" + "；".join(_report_short_text(row.get("text"), limit=120) for row in context_point_rows[:4]))
+        breakpoint_lines.append("- Prompt 观察：" + "；".join(_report_short_text(row.get("text"), limit=120) for row in context_point_rows[:4]))
     if unavailable_point_rows:
         breakpoint_lines.append("- 待复核断言：" + "；".join(_report_short_text(row.get("text"), limit=120) for row in unavailable_point_rows[:4]))
     if not breakpoint_lines:
         breakpoint_lines.append("- 未发现断言级上游断点")
     stage_summary = _report_short_text(rationale or assessment_reason or "证据不足，需要补充验证或人工复核。", limit=260)
+    answer_issue_types = [
+        str(item)
+        for item in (secondary_findings.get("answer_issue_types") if isinstance(secondary_findings.get("answer_issue_types"), list) else [])
+        if str(item).strip()
+    ]
+    answer_issue_text = "、".join(f"`{item}`" for item in answer_issue_types) if answer_issue_types else "未发现结构化答案症状"
+    if primary:
+        cause_code = str(primary.get("cause_code") or "")
+        cause_label = CAUSE_DISPLAY.get(cause_code, cause_code)
+        primary_stage = str(primary.get("stage") or "")
+        conclusion_text = f"主因是 `{cause_code}`（{cause_label}），最早断点在{_display_stage(primary_stage)}。"
+    else:
+        primary_stage = ""
+        conclusion_text = "当前无法选择唯一主因，需要人工复核或补齐上游 evidence/counterfactual。"
+    if primary_stage == "answer":
+        answer_boundary = "上游证据链已通过或必要支撑已通过 rerank，答案症状构成本次主因。"
+    elif answer_issue_types:
+        answer_boundary = f"答案确实存在 {answer_issue_text}，但主因选择仍以最早断点为准；这些症状作为下游表现或伴随发现。"
+    else:
+        answer_boundary = "当前没有结构化答案症状；主因判断主要依赖上游 evidence chain。"
+    explanation_lines = [
+        f"- {conclusion_text}",
+        f"- {answer_boundary}",
+        f"- 选择依据：{_report_short_text(rationale or '证据不足，需要补充探针或人工复核。', limit=320)}",
+        f"- 断言级断点：{'；'.join(line.lstrip('- ') for line in breakpoint_lines[:4])}",
+    ]
     report = [
         "# FindReason 归因报告",
         "",
-        "## 1. 结论摘要",
+        "## 结论",
         "",
         *primary_lines,
         f"- Case 判定：{_display_assessment(assessment_status)}",
         f"- 一句话原因：{_report_short_text(_display_case_reason(assessment_reason), limit=260)}",
         f"- 是否需要人工复核：`{human_review}`",
         f"- 失败模式：`{', '.join(result.get('failure_patterns') or []) or '无'}`",
-        f"- 选择依据：{_report_short_text(rationale or '证据不足，需要补充探针或人工复核。', limit=320)}",
         "",
-        "## 2. 现场输入与答案",
+        "## 关键解释",
+        "",
+        *explanation_lines,
+        "",
+        "## 证据与验证",
+        "",
+        "### 现场输入与答案",
         "",
         f"- log_id：`{result.get('log_id') or ingest.get('log_id') or ''}`",
         f"- workspace_id：`{result.get('workspace_id') or ingest.get('workspace_id') or ''}`",
@@ -3519,21 +3513,19 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         "",
         *input_boundary_rows,
         "",
-        "## 3. 验证过程：我怎么查的",
+        "### 验证过程",
         "",
         *_format_probe_plan_summary(result),
         "",
-        "## 4. 阶段裁决：问题最早断在哪",
+        "### 阶段裁决",
         "",
         f"- 裁决摘要：{stage_summary}",
         "",
         "| 阶段 | 结论 | 我为什么这么判 |",
         "|---|---|---|",
-        *(stage_rows or ["| 未知 | 证据不足 | 没有 evidence_chain |"]),
+        *stage_rows,
         "",
-        "## 5. 关键证据与文档",
-        "",
-        "### Answer Findings",
+        "### 答案症状",
         "",
         *_format_answer_findings(secondary_findings),
         "",
@@ -3563,13 +3555,14 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         "",
         "### 召回上界与知识判断",
         "",
-        f"- Oracle 来源：`{oracle_status.get('source', 'unknown')}`，置信度：`{oracle_status.get('confidence', 0)}`，冲突：`{oracle_status.get('conflict_detected', False)}`",
+        f"- 候选来源：{ORACLE_SOURCE_DISPLAY.get(str(oracle_status.get('source') or ''), str(oracle_status.get('source') or 'unknown'))}，冲突：`{oracle_status.get('conflict_detected', False)}`",
         f"- 理论召回上界状态：`{retrieval_state.get('theoretical_recall_status', 'not_configured')}`",
         f"- 理论召回范围：`{retrieval_state.get('upper_bound_scope', '未配置')}`",
         f"- 理论召回 topK：`{retrieval_state.get('theoretical_recall_topk', '未配置')}`",
         f"- 理论召回 query：`{', '.join(_string_list(retrieval_state.get('theoretical_query_variants'))) or '未配置'}`",
         f"- 理论召回数量：`{recall_counts_text}`",
-        f"- 期望知识 ID：`{expected_text}`",
+        f"- 人工指定 expected doc ID：`{provided_candidate_text}`",
+        "- ID 说明：doc ID 只作为核对线索；主因以必要断言是否被文档正文支撑为准，不能仅凭 doc ID 缺失判知识缺失或重排/Prompt 失败。",
         "",
         "### 理论召回上界与断言关系",
         "",
@@ -3579,11 +3572,11 @@ def render_case_report_markdown(result: dict[str, Any], ingest: dict[str, Any], 
         "",
         *_format_chunk_conflict_findings(secondary_findings),
         "",
-        "## 6. 下一步建议",
+        "## 下一步",
         "",
         actions,
         "",
-        "## 7. 审计 JSON 索引",
+        "## 审计索引",
         "",
         "- 人读报告：`final/case_report.md`",
         "- 结构化摘要：`final/short_summary.json`",
@@ -3609,24 +3602,15 @@ def _next_actions(
     cause = primary["cause_code"]
     actions = {
         "suspected_knowledge_missing": "补入或改写缺失知识，并用相同 log/case 回归验证。",
-        "knowledge_topic_mismatch": "补录正主题知识或调整标题/索引描述，避免相邻主题覆盖。",
         "retrieval_miss": "检查 query 构造、索引新鲜度、filter、召回通道与 topK。",
-        "permission_miss": "审计 workspace/app/user ACL、namespace、知识状态和检索过滤。",
         "rerank_drop": "检查 rerank 模型、阈值、去重、topK 和多路优先级。",
-        "rerank_tunable": "复核可恢复目标文档的参数组合，并做小流量或离线回归。",
-        "context_assembly_error": "检查 prompt_docs 构造、截断、token budget 和拼接顺序。",
-        "unsupported_claim": "修正答案生成约束，要求只基于 prompt_docs 作答。",
-        "wrong_citation": "修正引用映射和 citation 选择策略。",
-        "partial_answer": "补齐答案覆盖策略，避免部分证据被当成完整回答。",
+        "answer_failure": "修正答案生成、引用映射和覆盖策略，要求基于已保留证据完整作答。",
         "workflow_input_loss": "检查评估入口、case 构造和调用 workflow 前的参数映射，确保用户实际问题、截图/上下文约束进入 Workflow 原始输入。",
-        "query_rewrite_drift": "优化 rewrite prompt 或对该类 query 关闭/绕过 rewrite。",
-        "keyword_loss": "调优关键词抽取并强制保留关键实体。",
-        "non_rag_route_boundary": "将 case 分流到正确的非 RAG 或工具规划路径。",
     }
     return [{"owner": primary["owner"], "action": actions.get(cause, "按 evidence_chain 修复对应阶段。"), "priority": "P0"}]
 
 
-def _probe_evidence(probe_name: str, stage: str, content: Any, confidence: float = 0.7) -> list[dict[str, Any]]:
+def _probe_evidence(probe_name: str, stage: str, content: Any) -> list[dict[str, Any]]:
     return [
         {
             "evidence_id": f"{probe_name}:ev_001",
@@ -3634,7 +3618,7 @@ def _probe_evidence(probe_name: str, stage: str, content: Any, confidence: float
             "source_stage": stage,
             "source": {"probe_name": probe_name},
             "content": content,
-            "quality": {"confidence": confidence},
+            "quality": {},
         }
     ]
 
@@ -3644,6 +3628,132 @@ def _request_from_ingest(ingest: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(request_dict, dict):
         raise V3Error("E_INGEST_INVALID", "ingest raw_artifacts.attribution_request is missing.", status_code=2)
     return _normalize_assertion_inputs(request_dict)
+
+
+def _is_numeric_text(value: Any) -> bool:
+    return bool(re.fullmatch(r"\d+", str(value or "").strip()))
+
+
+def _is_unknown_query(value: Any) -> bool:
+    text = str(value or "").strip()
+    return not text or text.lower() in {"unknown query", "unknown", "n/a", "na", "null"}
+
+
+def _first_numeric_value(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if _is_numeric_text(text):
+            return text
+    return ""
+
+
+def _sanitize_replay_request_from_ingest(
+    ingest: dict[str, Any],
+    *,
+    app_id: str | None = None,
+    query: str | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    request_dict = json.loads(json.dumps(_request_from_ingest(ingest), ensure_ascii=False, default=_json_default))
+    case_input = request_dict.setdefault("case_input", {})
+    if not isinstance(case_input, dict):
+        raise V3Error("E_INGEST_INVALID", "case_input is not an object.", status_code=2)
+
+    raw = ingest.get("raw_artifacts") if isinstance(ingest.get("raw_artifacts"), dict) else {}
+    trace_summary = raw.get("trace_summary") if isinstance(raw.get("trace_summary"), dict) else {}
+    resolved_app_id = _first_numeric_value(
+        app_id,
+        case_input.get("app_id"),
+        ingest.get("app_id"),
+        trace_summary.get("app_id"),
+    )
+    if resolved_app_id:
+        case_input["app_id"] = resolved_app_id
+
+    explicit_query = str(query or "").strip()
+    current_query = str(case_input.get("query") or "").strip()
+    query_hint = str(case_input.get("query_hint") or "").strip()
+    if explicit_query:
+        case_input["query"] = explicit_query
+    elif _is_unknown_query(current_query) and query_hint:
+        case_input["query"] = query_hint
+
+    if _is_unknown_query(case_input.get("query")) is False and not _string_list(case_input.get("retrieve_query_list")):
+        case_input["retrieve_query_list"] = [str(case_input.get("query") or "").strip()]
+
+    original_judgement = request_dict.get("judgement_evidence") if isinstance(request_dict.get("judgement_evidence"), dict) else {}
+    request_dict["judgement_evidence"] = {
+        "source_type": "historical_evaluator_signals_ignored_for_replay",
+        "raw_text": str(original_judgement.get("raw_text") or "")[:1000],
+        "mapper_status": "ignored_for_workflow_replay",
+        "signals": [],
+        "unmapped_notes": "judgement_evidence.signals are historical evaluator clues; they are never workflow replay inputs or current replay evidence.",
+    }
+
+    if overrides:
+        request_dict.setdefault("workflow_overrides", {}).update(overrides)
+
+    return _normalize_assertion_inputs(request_dict)
+
+
+def _replay_missing_actions(request_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    case_input = request_dict.get("case_input") if isinstance(request_dict.get("case_input"), dict) else {}
+    actions: list[dict[str, Any]] = []
+    if not _is_numeric_text(case_input.get("app_id")):
+        actions.append(
+            {
+                "action": "provide-app-id",
+                "field": "app_id",
+                "reason": "workflow replay requires a numeric app_id",
+            }
+        )
+    if _is_unknown_query(case_input.get("query")):
+        actions.append(
+            {
+                "action": "provide-query",
+                "field": "query",
+                "reason": "workflow replay requires the real user query; query_hint is accepted when query is unknown query",
+            }
+        )
+    return actions
+
+
+def _blocked_replay_payload(
+    *,
+    ingest: dict[str, Any],
+    request_dict: dict[str, Any],
+    actions: list[dict[str, Any]],
+    output_dir: str | None,
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "log_id": ingest.get("log_id"),
+        "workspace_id": ingest.get("workspace_id"),
+        "probe_name": "replay-workflow",
+        "status": "blocked",
+        "host_action_required": actions,
+        "stage_signals": {
+            "context": {
+                "replay_status": "blocked",
+                "replay_diverged": True,
+                "node_traces": [],
+                "trace_completeness": {},
+                "notes": "Workflow replay was not called because required replay inputs are missing.",
+            }
+        },
+        "evidence_bundle": _probe_evidence("replay-workflow", "context", {"host_action_required": actions}),
+        "raw_artifacts": {
+            "request_policy": {
+                "signals_ignored": True,
+                "allowed_workflow_inputs": ["query", "workspace_id", "app_id", "topK", "expected_knowledge_ids", "retrieve_query_list"],
+            },
+            "case_input": request_dict.get("case_input", {}),
+        },
+        "telemetry": {"exclusive": True, "error": "missing_replay_inputs"},
+    }
+    if output_dir:
+        write_json(Path(output_dir) / "replay-workflow.json", payload)
+    return payload
 
 
 def build_probe_result(
@@ -3914,7 +4024,7 @@ def run_probe_plan(
                 "matched_docs": probe["matched_docs"],
                 "converged_direction": probe["converged_direction"],
             },
-            "quality": {"confidence": 0.78},
+            "quality": {},
         }
         for probe in executed_probes
     ]
@@ -4027,8 +4137,8 @@ def _probe_plan_stage_signals(
     """Fold probe-plan execution results into the existing stage_signals contract.
 
     relevance_gap / coverage_gap probes feed the deterministic point_coverage chain
-    (knowledge / retrieval / rerank / context). scope_violation / citation_missing /
-    internal_contradiction probes set new answer / knowledge flags consumed by
+    (knowledge / retrieval / rerank, with prompt context as observation). scope_violation / citation_missing /
+    internal_contradiction probes set answer_issue_types / knowledge flags consumed by
     _infer_verdicts. converged_direction is recorded as a hypothesis only.
     """
     signals: dict[str, Any] = {}
@@ -4080,8 +4190,6 @@ def _probe_plan_stage_signals(
                 knowledge_signal.setdefault("chunk_conflicts", []).extend(_chunk_conflict_records(probe))
                 if _probe_plan_conflict_escalates(probe.get("converged_direction")):
                     knowledge_signal["internal_inconsistency"] = True
-            else:
-                knowledge_signal["internal_inconsistency"] = True
     knowledge_gap_points: list[str] = []
     retrieval_gap_points: list[str] = []
     rerank_gap_points: list[str] = []
@@ -4131,8 +4239,6 @@ def _probe_plan_stage_signals(
 
 
 def _compute_probe(probe_name: str, request_dict: dict[str, Any], ingest: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
-    if probe_name == "probe-self-oracle":
-        return _probe_self_oracle(probe_name, request_dict, params)
     if probe_name == "probe-knowledge-detail":
         return _probe_knowledge_detail(probe_name, request_dict, ingest, params)
     if probe_name == "probe-permission-check":
@@ -4199,9 +4305,6 @@ def _trace_evidence_docs(ingest: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         docs.extend(item for item in values if isinstance(item, dict))
     return docs
-
-
-ORACLE_SIGNAL_SOURCES = ("judgement_back_recall", "claim_back_recall", "query_wide_recall")
 
 
 def _upper_bound_query_variants(request_dict: dict[str, Any]) -> list[str]:
@@ -4334,7 +4437,7 @@ def _infer_knowledge_detail_reference(doc: dict[str, Any]) -> dict[str, str] | N
 
 
 def _knowledge_detail_endpoint(source: str, identifier: str) -> tuple[str, dict[str, str]]:
-    endpoint = os.getenv("KNOWLEDGE_DETAIL_URL", "").strip()
+    endpoint = KNOWLEDGE_DETAIL_URL.strip()
     if not endpoint:
         return "", {}
     url = endpoint.replace("{source}", source).replace("{identifier}", identifier)
@@ -4412,13 +4515,12 @@ def _summarize_knowledge_detail_doc(doc: dict[str, Any], reference: dict[str, st
 
 
 def _fetch_knowledge_doc_record(doc: dict[str, Any], reference: dict[str, str]) -> dict[str, Any]:
-    load_runtime_env()
     endpoint, params = _knowledge_detail_endpoint(reference["source"], reference["identifier"])
     if not endpoint:
         return {"status": "not_configured", "doc_id": _doc_id(doc), "reference": reference}
     headers = {"Accept": "application/json"}
     token_source = "not_required"
-    timeout = int(os.getenv("KNOWLEDGE_DETAIL_TIMEOUT_SECONDS") or DEFAULT_KNOWLEDGE_DETAIL_TIMEOUT_SECONDS)
+    timeout = KNOWLEDGE_DETAIL_TIMEOUT_SECONDS
     try:
         with httpx.Client(timeout=max(timeout, 1)) as client:
             response = client.get(endpoint, params=params, headers=headers)
@@ -4534,29 +4636,6 @@ def _claim_texts(request_dict: dict[str, Any], *, roles: set[str] | None = None,
     if include_answer_fallback and not claims and qa.get("answer"):
         claims.append(str(qa.get("answer")))
     return claims
-
-
-def _oracle_signal_text(request_dict: dict[str, Any], source: str) -> str:
-    case_input = request_dict.get("case_input") if isinstance(request_dict.get("case_input"), dict) else {}
-    judgement = request_dict.get("judgement_evidence") if isinstance(request_dict.get("judgement_evidence"), dict) else {}
-    preprocess = request_dict.get("preprocess") if isinstance(request_dict.get("preprocess"), dict) else {}
-    qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
-    if source == "judgement_back_recall":
-        parts = [case_input.get("judgement"), judgement.get("raw_text")]
-        for signal in judgement.get("signals") or []:
-            if isinstance(signal, dict):
-                parts.extend([signal.get("label"), signal.get("result"), signal.get("reason"), signal.get("value")])
-            else:
-                parts.append(signal)
-        return " ".join(str(item) for item in parts if item not in (None, ""))
-    if source == "claim_back_recall":
-        return " ".join(_claim_texts(request_dict, roles=REQUIRED_ASSERTION_ROLES, include_answer_fallback=False))
-    if source == "query_wide_recall":
-        parts = [case_input.get("query"), preprocess.get("rewrite_query")]
-        keywords = preprocess.get("keywords") or preprocess.get("keyword")
-        parts.extend(_as_list(keywords))
-        return " ".join(str(item) for item in parts if item not in (None, ""))
-    return ""
 
 
 POINT_KEYWORDS = (
@@ -4919,7 +4998,6 @@ def _assertion_audit_item(item: dict[str, Any]) -> dict[str, Any]:
         "text": item.get("text"),
         "role": item.get("role"),
         "source": item.get("source"),
-        "confidence": item.get("confidence"),
     }
     basis = [str(value).strip() for value in _as_list(item.get("basis")) if str(value).strip()]
     if basis:
@@ -4949,7 +5027,6 @@ def _merge_expected_required_text(left: str, right: str) -> str:
 def _combine_expected_required_assertions(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     merged = dict(left)
     merged["text"] = _merge_expected_required_text(str(left.get("text") or ""), str(right.get("text") or ""))
-    merged["confidence"] = round(max(float(left.get("confidence") or 0.0), float(right.get("confidence") or 0.0)), 4)
     basis = _merge_assertion_basis(left, right)
     if basis:
         merged["basis"] = basis
@@ -5000,7 +5077,7 @@ def _expected_knowledge_points(request_dict: dict[str, Any]) -> list[dict[str, A
     points: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def add(text: Any, source: str, confidence: float, role: str, metadata: dict[str, Any] | None = None) -> None:
+    def add(text: Any, source: str, role: str, metadata: dict[str, Any] | None = None) -> None:
         cleaned = _clean_point_text(text)
         if len(cleaned) < 3:
             return
@@ -5021,7 +5098,6 @@ def _expected_knowledge_points(request_dict: dict[str, Any]) -> list[dict[str, A
             "text": cleaned,
             "source": _canonical_assertion_source(source),
             "role": normalized_role,
-            "confidence": round(float(confidence), 4),
         }
         if metadata:
             basis = [str(value).strip() for value in _as_list(metadata.get("basis")) if str(value).strip()]
@@ -5032,22 +5108,17 @@ def _expected_knowledge_points(request_dict: dict[str, Any]) -> list[dict[str, A
                 point["why_required"] = why_required
         points.append(point)
 
-    def add_point_item(item: Any, source: str, default_confidence: float, default_role: str) -> None:
+    def add_point_item(item: Any, source: str, default_role: str) -> None:
         if isinstance(item, dict):
             value = _canonical_host_assertion_text(item)
-            confidence = item.get("confidence", default_confidence)
-            try:
-                confidence_value = float(confidence)
-            except (TypeError, ValueError):
-                confidence_value = default_confidence
             role = _canonical_host_assertion_role(item, default_role)
             source_value = _canonical_assertion_source(item.get("source") or source)
-            add(value, source_value, confidence_value, role, item)
+            add(value, source_value, role, item)
         else:
             _canonical_host_assertion_text(item)
 
     for item in _host_answer_claim_items(request_dict):
-        add_point_item(item, CANONICAL_ASSERTION_SOURCE, 0.55, "answer_claim")
+        add_point_item(item, CANONICAL_ASSERTION_SOURCE, "answer_claim")
     return _merge_semantic_expected_required_points(points)[:20]
 
 
@@ -5061,11 +5132,10 @@ def _normalize_assertion_inputs(request_dict: dict[str, Any]) -> dict[str, Any]:
     claims: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def add(item: Any, default_role: str, default_confidence: float) -> None:
+    def add(item: Any, default_role: str) -> None:
         if isinstance(item, dict):
             text = _canonical_host_assertion_text(item)
             role = _canonical_host_assertion_role(item, default_role)
-            confidence_raw = item.get("confidence", default_confidence)
             basis = [str(value).strip() for value in _as_list(item.get("basis")) if str(value).strip()]
             why_required = _clean_point_text(item.get("why_required"))
         else:
@@ -5073,10 +5143,6 @@ def _normalize_assertion_inputs(request_dict: dict[str, Any]) -> dict[str, Any]:
         cleaned = _clean_point_text(text)
         if not cleaned:
             return
-        try:
-            confidence = float(confidence_raw)
-        except (TypeError, ValueError):
-            confidence = default_confidence
         normalized_text_key = re.sub(r"\W+", "", cleaned.lower())
         key = f"{role}:{normalized_text_key}"
         if key in seen:
@@ -5086,7 +5152,6 @@ def _normalize_assertion_inputs(request_dict: dict[str, Any]) -> dict[str, Any]:
             "text": cleaned,
             "role": role,
             "source": CANONICAL_ASSERTION_SOURCE,
-            "confidence": round(confidence, 4),
         }
         if basis:
             claim["basis"] = basis
@@ -5095,7 +5160,7 @@ def _normalize_assertion_inputs(request_dict: dict[str, Any]) -> dict[str, Any]:
         claims.append(claim)
 
     for item in _as_list(host_agent.get("answer_claim")):
-        add(item, "answer_claim", 0.55)
+        add(item, "answer_claim")
     host_agent["answer_claim"] = claims
     return normalized
 
@@ -5106,6 +5171,25 @@ def _required_assertion_points(points: list[dict[str, Any]]) -> list[dict[str, A
 
 def _has_answer_claim_role(request_dict: dict[str, Any], role: str) -> bool:
     return any(str(point.get("role") or "") == role for point in _expected_knowledge_points(request_dict))
+
+
+def _answer_issue_types(request_dict: dict[str, Any]) -> list[str]:
+    qa = request_dict.get("qa") if isinstance(request_dict.get("qa"), dict) else {}
+    issues: list[str] = []
+
+    def add(issue: str) -> None:
+        if issue not in issues:
+            issues.append(issue)
+
+    if _has_answer_claim_role(request_dict, "unsupported_claim") or qa.get("hallucination") is True:
+        add("unsupported_claim")
+    if qa.get("wrong_citation") is True:
+        add("wrong_citation")
+    if qa.get("partial_answer") is True:
+        add("missing_aspect")
+    if qa.get("scope_violation") is True or qa.get("branching_unclear") is True:
+        add("scope_violation")
+    return issues
 
 
 def _point_required_terms(text: str) -> list[str]:
@@ -5148,7 +5232,7 @@ def _doc_brief(
         "rank": doc.get("rank"),
         "source": doc.get("source"),
     }
-    for key in ("identifier", "url", "link", "doc_url", "source_url"):
+    for key in ("identifier", "url", "link", "doc_url", "source_url", "recall_source", "recallSource", "type", "source_type", "sourceType"):
         if doc.get(key) not in (None, "", []):
             item[key] = doc.get(key)
     if score is not None:
@@ -5318,403 +5402,12 @@ def _knowledge_point_coverage(request_dict: dict[str, Any], points: list[dict[st
     return coverage
 
 
-def _oracle_source_confidence(source: str, score: float) -> float:
-    if source == "judgement_back_recall":
-        return round(min(0.95, 0.8 + score * 0.15), 4)
-    if source == "claim_back_recall":
-        return round(min(0.8, 0.6 + score * 0.2), 4)
-    return round(min(0.6, 0.4 + score * 0.2), 4)
-
-
-def _combine_confidences(values: list[float]) -> float:
-    miss_probability = 1.0
-    for value in values:
-        miss_probability *= max(0.0, 1.0 - float(value or 0.0))
-    return round(min(0.98, 1.0 - miss_probability), 4)
-
-
-def _jaccard(left: set[str], right: set[str]) -> float:
-    if not left and not right:
-        return 1.0
-    return len(left & right) / max(1, len(left | right))
-
-
-def _oracle_doc_sets(inferred_docs: list[dict[str, Any]]) -> dict[str, set[str]]:
-    result: dict[str, set[str]] = {}
-    for doc in inferred_docs:
-        doc_id = str(doc.get("doc_id") or "")
-        if not doc_id:
-            continue
-        for source in doc.get("oracle_sources") or []:
-            result.setdefault(str(source), set()).add(doc_id)
-    return result
-
-
-def _oracle_conflict(inferred_docs: list[dict[str, Any]]) -> tuple[bool, float | None]:
-    source_sets = [value for value in _oracle_doc_sets(inferred_docs).values() if value]
-    if len(source_sets) < 2:
-        return False, None
-    scores = [_jaccard(source_sets[i], source_sets[j]) for i in range(len(source_sets)) for j in range(i + 1, len(source_sets))]
-    min_score = min(scores) if scores else 1.0
-    return min_score < 0.1, round(min_score, 4)
-
-
-def _oracle_compare_to_flow(request_dict: dict[str, Any], inferred_ids: list[str]) -> dict[str, Any]:
-    ids = set(_string_list(inferred_ids))
-    origin_ids = _doc_ids(_docs_from_request(request_dict, "retrieval", "origin_doc_list") + _docs_from_request(request_dict, "retrieval", "origin_faq_list"))
-    rerank_ids = _doc_ids(_docs_from_request(request_dict, "rerank", "rerank_docs"))
-    prompt_ids = _doc_ids(_docs_from_request(request_dict, "rerank", "prompt_docs"))
-    origin_hit = ids & origin_ids
-    rerank_hit = ids & rerank_ids
-    prompt_hit = ids & prompt_ids
-    return {
-        "origin_hit_ids": sorted(origin_hit),
-        "rerank_hit_ids": sorted(rerank_hit),
-        "prompt_hit_ids": sorted(prompt_hit),
-        "missing_from_origin_ids": sorted(ids - origin_hit),
-        "missing_from_rerank_ids": sorted((ids & origin_ids) - rerank_hit),
-        "missing_from_prompt_ids": sorted((ids & (origin_ids | rerank_ids)) - prompt_hit),
-        "partial_retrieval_miss": bool(origin_hit and ids - origin_hit),
-        "partial_rerank_drop": bool(rerank_hit and (ids & origin_ids) - rerank_hit),
-        "partial_context_miss": bool(prompt_hit and (ids & (origin_ids | rerank_ids)) - prompt_hit),
-    }
-
-
-def _probe_self_oracle(probe_name: str, request_dict: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
-    requested_sources = _string_list(params.get("signals")) or list(ORACLE_SIGNAL_SOURCES)
-    sources = [source for source in requested_sources if source in ORACLE_SIGNAL_SOURCES] or list(ORACLE_SIGNAL_SOURCES)
-    topk = int(params.get("topk") or 50)
-    docs = _unique_docs(_all_docs(request_dict))
-    provided_ids = _string_list((request_dict.get("case_input") or {}).get("expected_knowledge_ids"))
-    expected_points = _expected_knowledge_points(request_dict)
-    required_points = _required_assertion_points(expected_points)
-    if not required_points and not provided_ids:
-        oracle_status = {
-            "source": "insufficient_assertions",
-            "signals_used": [],
-            "signals_attempted": list(sources),
-            "signals_failed": {"expected_assertions": "no expected_required assertions were supplied"},
-            "inferred_doc_count": 0,
-            "inferred_doc_ids": [],
-            "provided_doc_ids": [],
-            "confidence": 0.0,
-            "conflict_detected": False,
-            "provided_conflict_detected": False,
-            "no_docs_found": False,
-            "assertion_status": "insufficient_required_assertions",
-            "expected_knowledge_points": expected_points,
-            "point_coverage": [],
-            "missing_expected_points_from_theoretical_recall": [],
-            "missing_expected_points_from_origin": [],
-            "missing_expected_points_from_rerank": [],
-            "missing_expected_points_from_prompt": [],
-        }
-        content = {
-            "oracle_status": oracle_status,
-            "inferred_expected_docs": [],
-            "expected_knowledge_points": expected_points,
-            "point_coverage": [],
-        }
-        return {
-            "status": "indeterminate",
-            "oracle_status": oracle_status,
-            "stage_signals": {
-                "oracle_status": oracle_status,
-                "knowledge": {
-                    "knowledge_exists": "unknown",
-                    "inferred_expected_docs": [],
-                    "inferred_expected_ids": [],
-                    "oracle_confidence": 0.0,
-                    "expected_knowledge_points": expected_points,
-                    "point_coverage": [],
-                    "partial_knowledge_missing": False,
-                    "missing_expected_points_from_theoretical_recall": [],
-                },
-                "retrieval": {
-                    "inferred_expected_ids": [],
-                    "oracle_origin_hit_ids": [],
-                    "oracle_missing_from_origin_ids": [],
-                    "partial_retrieval_miss": False,
-                    "knowledge_gap_points": [],
-                    "point_retrieval_gap_points": [],
-                    "expected_knowledge_hit": None,
-                    "online_retrieval_hit": None,
-                },
-                "rerank": {
-                    "inferred_expected_ids": [],
-                    "oracle_rerank_hit_ids": [],
-                    "oracle_missing_from_rerank_ids": [],
-                    "partial_rerank_drop": False,
-                    "missing_expected_points_from_rerank": [],
-                    "expected_doc_survived_rerank": None,
-                },
-                "context": {
-                    "inferred_expected_ids": [],
-                    "oracle_prompt_hit_ids": [],
-                    "oracle_missing_from_prompt_ids": [],
-                    "partial_context_miss": False,
-                    "missing_expected_points_from_prompt": [],
-                    "expected_doc_in_prompt": None,
-                },
-            },
-            "evidence_bundle": _probe_evidence(probe_name, "knowledge", content, 0.35),
-            "raw_artifacts": {
-                "inferred_expected_docs": [],
-                "expected_knowledge_points": expected_points,
-                "point_coverage": [],
-                "per_source_hits": {},
-                "note": "未提供 expected_required 断言，self-oracle 不从 query 或 judgement 文本推断期望文档。",
-            },
-        }
-    signals_attempted: list[str] = []
-    signals_used: list[str] = []
-    signals_failed: dict[str, str] = {}
-    per_source_hits: dict[str, list[dict[str, Any]]] = {}
-    aggregated: dict[str, dict[str, Any]] = {}
-
-    for source in sources:
-        text = _oracle_signal_text(request_dict, source)
-        if len(text.strip()) < 10:
-            signals_failed[source] = "signal text is empty or shorter than 10 characters"
-            continue
-        signals_attempted.append(source)
-        if not docs:
-            signals_failed[source] = "no trace docs available for oracle matching"
-            continue
-        threshold = 0.08 if source in {"judgement_back_recall", "claim_back_recall"} else 0.04
-        scored = sorted(
-            [
-                {"doc": doc, "score": _oracle_score(text, doc)}
-                for doc in docs
-            ],
-            key=lambda item: item["score"],
-            reverse=True,
-        )
-        hits = [item for item in scored if item["score"] >= threshold][0:topk]
-        if not hits:
-            continue
-        signals_used.append(source)
-        source_hits: list[dict[str, Any]] = []
-        for item in hits:
-            doc = item["doc"]
-            doc_id = _doc_id(doc)
-            if not doc_id:
-                continue
-            confidence = _oracle_source_confidence(source, float(item["score"]))
-            basis = {
-                "oracle_source": source,
-                "score": item["score"],
-                "signal_excerpt": text[:300],
-                "doc_title": _doc_title(doc),
-            }
-            existing = aggregated.setdefault(
-                doc_id,
-                {
-                    "doc_id": doc_id,
-                    "title": _doc_title(doc),
-                    "confidence_parts": [],
-                    "oracle_sources": [],
-                    "inference_basis": [],
-                },
-            )
-            existing["confidence_parts"].append(confidence)
-            if source not in existing["oracle_sources"]:
-                existing["oracle_sources"].append(source)
-            existing["inference_basis"].append(basis)
-            source_hits.append({"doc_id": doc_id, "title": _doc_title(doc), "score": item["score"], "confidence": confidence})
-        per_source_hits[source] = source_hits
-
-    inferred_docs: list[dict[str, Any]] = []
-    for item in aggregated.values():
-        confidence_parts = [float(value) for value in item.pop("confidence_parts", [])]
-        item["confidence"] = _combine_confidences(confidence_parts)
-        inferred_docs.append(item)
-    inferred_docs.sort(key=lambda item: item.get("confidence", 0.0), reverse=True)
-    inferred_ids = [str(item["doc_id"]) for item in inferred_docs]
-    conflict_detected, jaccard = _oracle_conflict(inferred_docs)
-    if conflict_detected:
-        for item in inferred_docs:
-            item["confidence"] = round(min(0.5, float(item.get("confidence") or 0.0)), 4)
-    confidence = round(sum(float(item.get("confidence") or 0.0) for item in inferred_docs) / len(inferred_docs), 4) if inferred_docs else 0.0
-    no_docs_found = bool(signals_attempted) and bool(docs) and not inferred_docs and not signals_used
-    if no_docs_found:
-        confidence = 0.85
-    if provided_ids and inferred_ids:
-        source = "mixed"
-    elif provided_ids:
-        source = "provided"
-    elif inferred_docs or no_docs_found:
-        source = "self_inferred"
-    else:
-        source = "insufficient"
-    provided_set = set(provided_ids)
-    inferred_set = set(inferred_ids)
-    provided_conflict = bool(provided_set and inferred_set and not (provided_set & inferred_set))
-    compare = _oracle_compare_to_flow(request_dict, inferred_ids)
-    point_coverage = _knowledge_point_coverage(request_dict, expected_points)
-    missing_points_from_theoretical = [
-        item for item in point_coverage if item.get("missing_stage") == "knowledge"
-    ]
-    missing_points_from_origin = [
-        item for item in point_coverage if item.get("missing_stage") == "retrieval"
-    ]
-    missing_points_from_rerank = [
-        item for item in point_coverage if item.get("missing_stage") == "rerank"
-    ]
-    missing_points_from_prompt = [
-        item for item in point_coverage if item.get("missing_stage") == "context"
-    ]
-    oracle_status = {
-        "source": source,
-        "signals_used": signals_used,
-        "signals_attempted": list(sources),
-        "signals_failed": signals_failed,
-        "inferred_doc_count": len(inferred_docs),
-        "inferred_doc_ids": inferred_ids,
-        "provided_doc_ids": provided_ids,
-        "confidence": confidence,
-        "conflict_detected": conflict_detected,
-        "jaccard": jaccard,
-        "provided_conflict_detected": provided_conflict,
-        "no_docs_found": no_docs_found,
-        "expected_knowledge_points": expected_points,
-        "point_coverage": point_coverage,
-        "missing_expected_points_from_theoretical_recall": [
-            {"point_id": item.get("point_id"), "text": item.get("text"), "role": item.get("role"), "source": item.get("source"), "required_terms": item.get("required_terms", [])}
-            for item in missing_points_from_theoretical
-        ],
-        "missing_expected_points_from_origin": [
-            {"point_id": item.get("point_id"), "text": item.get("text"), "role": item.get("role"), "source": item.get("source"), "upper_bound_docs": item.get("upper_bound_docs", [])}
-            for item in missing_points_from_origin
-        ],
-        "missing_expected_points_from_rerank": [
-            {"point_id": item.get("point_id"), "text": item.get("text"), "role": item.get("role"), "source": item.get("source"), "origin_docs": item.get("origin_docs", [])}
-            for item in missing_points_from_rerank
-        ],
-        "missing_expected_points_from_prompt": [
-            {"point_id": item.get("point_id"), "text": item.get("text"), "role": item.get("role"), "source": item.get("source"), "rerank_docs": item.get("rerank_docs", [])}
-            for item in missing_points_from_prompt
-        ],
-    }
-    if source == "insufficient":
-        status = "indeterminate"
-    elif no_docs_found:
-        status = "empty"
-    else:
-        status = "ok"
-
-    evidence_bundle: list[dict[str, Any]] = []
-    for index, (source_name, hits) in enumerate(per_source_hits.items(), start=1):
-        evidence_bundle.append(
-            {
-                "evidence_id": f"probe-self-oracle:ev_{index:03d}",
-                "evidence_type": "inferred_oracle",
-                "source_stage": "knowledge",
-                "source": {"probe_name": probe_name, "oracle_signal": source_name},
-                "content": {
-                    "normalized_summary": f"{source_name} inferred {len(hits)} expected docs from trace candidates",
-                    "inferred_doc_ids": [item["doc_id"] for item in hits],
-                    "hits": hits[:10],
-                    "expected_knowledge_points": expected_points[:10],
-                    "point_coverage": point_coverage[:10],
-                },
-                "relation_to_query": {
-                    "semantic_relevance": "high" if hits else "unknown",
-                    "topic_match": bool(hits) or None,
-                    "constraint_match": None,
-                    "coverage": "partial" if hits else "unknown",
-                },
-                "quality": {
-                    "freshness": "valid",
-                    "permission_available": True,
-                    "confidence": max([float(item.get("confidence") or 0.0) for item in hits], default=0.0),
-                    "oracle_source": source_name,
-                },
-            }
-        )
-    if not evidence_bundle:
-        evidence_bundle = _probe_evidence(
-            probe_name,
-            "knowledge",
-            {
-                "oracle_status": oracle_status,
-                "inferred_expected_docs": inferred_docs,
-                "expected_knowledge_points": expected_points,
-                "point_coverage": point_coverage,
-            },
-            confidence if confidence else 0.35,
-        )
-
-    return {
-        "status": status,
-        "oracle_status": oracle_status,
-        "stage_signals": {
-            "oracle_status": oracle_status,
-            "knowledge": {
-                "knowledge_exists": "no" if no_docs_found else "yes" if inferred_docs or provided_ids else "unknown",
-                "inferred_expected_docs": inferred_docs,
-                "inferred_expected_ids": inferred_ids,
-                "oracle_confidence": confidence,
-                "expected_knowledge_points": expected_points,
-                "point_coverage": point_coverage,
-                "partial_knowledge_missing": bool(missing_points_from_theoretical),
-                "missing_expected_points_from_theoretical_recall": [
-                    item.get("text") for item in missing_points_from_theoretical if item.get("text")
-                ],
-            },
-            "retrieval": {
-                "inferred_expected_ids": inferred_ids,
-                "oracle_origin_hit_ids": compare["origin_hit_ids"],
-                "oracle_missing_from_origin_ids": compare["missing_from_origin_ids"],
-                "partial_retrieval_miss": compare["partial_retrieval_miss"],
-                "knowledge_gap_points": [
-                    item.get("text") for item in missing_points_from_theoretical if item.get("text")
-                ],
-                "point_retrieval_gap_points": [
-                    item.get("text") for item in missing_points_from_origin if item.get("text")
-                ],
-                "expected_knowledge_hit": (bool(compare["origin_hit_ids"]) if inferred_ids else None),
-                "online_retrieval_hit": (bool(compare["origin_hit_ids"]) if inferred_ids else None),
-            },
-            "rerank": {
-                "inferred_expected_ids": inferred_ids,
-                "oracle_rerank_hit_ids": compare["rerank_hit_ids"],
-                "oracle_missing_from_rerank_ids": compare["missing_from_rerank_ids"],
-                "partial_rerank_drop": compare["partial_rerank_drop"],
-                "missing_expected_points_from_rerank": [
-                    item.get("text") for item in missing_points_from_rerank if item.get("text")
-                ],
-                "expected_doc_survived_rerank": (bool(compare["rerank_hit_ids"]) if inferred_ids and compare["origin_hit_ids"] else None),
-            },
-            "context": {
-                "inferred_expected_ids": inferred_ids,
-                "oracle_prompt_hit_ids": compare["prompt_hit_ids"],
-                "oracle_missing_from_prompt_ids": compare["missing_from_prompt_ids"],
-                "partial_context_miss": compare["partial_context_miss"],
-                "missing_expected_points_from_prompt": [
-                    item.get("text") for item in missing_points_from_prompt if item.get("text")
-                ],
-                "expected_doc_in_prompt": (bool(compare["prompt_hit_ids"]) if inferred_ids and (compare["origin_hit_ids"] or compare["rerank_hit_ids"]) else None),
-            },
-        },
-        "evidence_bundle": evidence_bundle,
-        "raw_artifacts": {
-            "inferred_expected_docs": inferred_docs,
-            "expected_knowledge_points": expected_points,
-            "point_coverage": point_coverage,
-            "per_source_hits": per_source_hits,
-            "note": "P0 self-oracle uses trace-local candidate docs; it can be backed by a live KB recall service later.",
-        },
-    }
-
-
 def _probe_knowledge_detail(probe_name: str, request_dict: dict[str, Any], ingest: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     ids = _expected_ids(request_dict, params)
     trace_docs = _trace_evidence_docs(ingest)
     known_ids = _doc_ids([*_all_docs(request_dict), *trace_docs])
     retrieval = request_dict.get("retrieval") or {}
-    load_runtime_env()
-    detail_endpoint_configured = bool(os.getenv("KNOWLEDGE_DETAIL_URL", "").strip())
+    detail_endpoint_configured = bool(KNOWLEDGE_DETAIL_URL.strip())
     candidates = _knowledge_detail_candidate_docs(request_dict, ids, trace_docs) if detail_endpoint_configured else []
     fetched_docs: list[dict[str, Any]] = []
     not_found_docs: list[dict[str, Any]] = []
@@ -5752,23 +5445,18 @@ def _probe_knowledge_detail(probe_name: str, request_dict: dict[str, Any], inges
     if fetched_docs:
         state = "yes"
         status = "ok"
-        confidence = 0.9
     elif trace_indicates_known:
         state = "yes"
         status = "ok"
-        confidence = 0.86 if not detail_errors else 0.74
     elif retrieval.get("knowledge_exists") is False:
         state = "no"
         status = "ok"
-        confidence = 0.82
     elif detail_endpoint_configured and candidates and not_found_docs and len(not_found_docs) == len(candidates) and not detail_errors:
         state = "no"
         status = "ok"
-        confidence = 0.8
     else:
         state = "unknown"
         status = "indeterminate"
-        confidence = 0.45
     if fetched_docs:
         detail_status = "ok"
     elif detail_errors:
@@ -5794,9 +5482,9 @@ def _probe_knowledge_detail(probe_name: str, request_dict: dict[str, Any], inges
     return {
         "status": status,
         "stage_signals": {"knowledge": content},
-        "evidence_bundle": _probe_evidence(probe_name, "knowledge", content, confidence),
+        "evidence_bundle": _probe_evidence(probe_name, "knowledge", content),
         "raw_artifacts": {
-            "note": "knowledge detail uses trace/provided ids and optional live doc-record detail configured by KNOWLEDGE_DETAIL_URL",
+            "note": "knowledge detail uses trace/provided ids and fixed live doc-record detail endpoint from source constants",
             "knowledge_detail": {
                 "provider": "http_doc_record",
                 "endpoint_configured": detail_endpoint_configured,
@@ -5817,7 +5505,7 @@ def _probe_permission_check(probe_name: str, request_dict: dict[str, Any], param
     return {
         "status": "fail" if permission_miss else "indeterminate",
         "stage_signals": {"retrieval": content},
-        "evidence_bundle": _probe_evidence(probe_name, "retrieval", content, 0.82 if permission_miss else 0.45),
+        "evidence_bundle": _probe_evidence(probe_name, "retrieval", content),
         "raw_artifacts": {},
     }
 
@@ -5825,7 +5513,7 @@ def _probe_permission_check(probe_name: str, request_dict: dict[str, Any], param
 def _probe_wide_recall(probe_name: str, request_dict: dict[str, Any], ingest: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     expected = set(_expected_ids(request_dict, params))
     online_ids = _doc_ids(_docs_from_request(request_dict, "retrieval", "origin_doc_list") + _docs_from_request(request_dict, "retrieval", "origin_faq_list"))
-    topk = max(int(params.get("topk") or os.getenv("WIDE_RECALL_TOPK") or 50), 50)
+    topk = max(int(params.get("topk") or 50), 50)
     query_variants = _upper_bound_query_variants(request_dict)
     wide_docs: list[dict[str, Any]] = []
     wide_faqs: list[dict[str, Any]] = []
@@ -5891,7 +5579,7 @@ def _probe_wide_recall(probe_name: str, request_dict: dict[str, Any], ingest: di
     return {
         "status": "ok" if theoretical_status == "ok" else theoretical_status if theoretical_status else "indeterminate",
         "stage_signals": {"retrieval": content},
-        "evidence_bundle": _probe_evidence(probe_name, "retrieval", content, 0.78),
+        "evidence_bundle": _probe_evidence(probe_name, "retrieval", content),
         "raw_artifacts": {
             "request_payload": theoretical_request_payload,
             "response_payload": theoretical_response_payload,
@@ -5919,7 +5607,7 @@ def _probe_rerank_bypass(probe_name: str, request_dict: dict[str, Any], params: 
     return {
         "status": "fail" if bypass_would_restore else "not_applicable",
         "stage_signals": {"rerank": content},
-        "evidence_bundle": _probe_evidence(probe_name, "rerank", content, 0.84 if bypass_would_restore else 0.5),
+        "evidence_bundle": _probe_evidence(probe_name, "rerank", content),
         "raw_artifacts": {},
     }
 
@@ -5939,7 +5627,7 @@ def _probe_context_assembly(probe_name: str, request_dict: dict[str, Any], param
     return {
         "status": "fail" if missing_from_prompt else "ok" if prompt_ids else "indeterminate",
         "stage_signals": {"context": content},
-        "evidence_bundle": _probe_evidence(probe_name, "context", content, 0.84 if missing_from_prompt else 0.65),
+        "evidence_bundle": _probe_evidence(probe_name, "context", content),
         "raw_artifacts": {},
     }
 
@@ -5987,29 +5675,118 @@ def fetch_workflow_nodes_v3(*, workspace_id: str, app_id: str, output_dir: str |
     return payload
 
 
-async def replay_workflow_v3(*, ingest: dict[str, Any], overrides: dict[str, Any] | None = None, output_dir: str | None = None) -> dict[str, Any]:
-    request_dict = _request_from_ingest(ingest)
-    if overrides:
-        request_dict.setdefault("workflow_overrides", {}).update(overrides)
+def _model_docs_json(docs: Any) -> list[dict[str, Any]]:
+    if not isinstance(docs, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for doc in docs:
+        if hasattr(doc, "model_dump"):
+            normalized.append(doc.model_dump(mode="json"))
+        elif isinstance(doc, dict):
+            normalized.append(doc)
+    return normalized
+
+
+def _replay_stage_signals(replayed: AttributionRequest, raw: dict[str, Any], status: str) -> dict[str, Any]:
+    extracted = raw.get("extracted_evidence") if isinstance(raw.get("extracted_evidence"), dict) else {}
+    expected_ids = set(replayed.case_input.expected_knowledge_ids or [])
+    origin_docs = _model_docs_json(replayed.retrieval.origin_doc_list)
+    origin_faqs = _model_docs_json(replayed.retrieval.origin_faq_list)
+    rerank_docs = _model_docs_json(replayed.rerank.rerank_docs)
+    prompt_docs = _model_docs_json(replayed.rerank.prompt_docs)
+    origin_ids = _doc_ids(origin_docs + origin_faqs)
+    rerank_ids = _doc_ids(rerank_docs)
+    prompt_ids = _doc_ids(prompt_docs)
+    node_traces = raw.get("node_traces") if isinstance(raw.get("node_traces"), list) else extracted.get("node_traces")
+    trace_completeness = extracted.get("trace_completeness") if isinstance(extracted.get("trace_completeness"), dict) else {}
+    stage_signals: dict[str, Any] = {
+        "context": {
+            "replay_status": status,
+            "replay_diverged": status not in {"ok", "partial", "not_configured"},
+            "node_traces": node_traces if isinstance(node_traces, list) else [],
+            "trace_completeness": trace_completeness,
+            "notes": raw.get("notes") or "",
+            "signals_policy": "judgement_evidence.signals are historical evaluator clues and were not used as workflow inputs.",
+        }
+    }
+    if origin_docs or origin_faqs or replayed.retrieval.online_retrieval_hit is not None or replayed.retrieval.expected_knowledge_hit is not None:
+        retrieval_signal: dict[str, Any] = {
+            "origin_doc_list": origin_docs,
+            "origin_faq_list": origin_faqs,
+            "online_retrieval_hit": replayed.retrieval.online_retrieval_hit,
+            "expected_knowledge_hit": replayed.retrieval.expected_knowledge_hit,
+        }
+        if replayed.retrieval.knowledge_exists is not None:
+            retrieval_signal["knowledge_exists"] = replayed.retrieval.knowledge_exists
+        elif origin_docs or origin_faqs:
+            retrieval_signal["knowledge_exists"] = True
+        if expected_ids and replayed.retrieval.online_retrieval_hit is None and trace_completeness.get("has_origin_trace"):
+            retrieval_signal["online_retrieval_hit"] = bool(expected_ids & origin_ids)
+            retrieval_signal["expected_knowledge_hit"] = bool(expected_ids & origin_ids)
+        stage_signals["retrieval"] = retrieval_signal
+    if rerank_docs or prompt_docs or replayed.rerank.expected_doc_survived_rerank is not None or replayed.rerank.expected_doc_in_prompt is not None:
+        rerank_signal: dict[str, Any] = {
+            "rerank_docs": rerank_docs,
+            "prompt_docs": prompt_docs,
+            "expected_doc_survived_rerank": replayed.rerank.expected_doc_survived_rerank,
+            "expected_doc_in_prompt": replayed.rerank.expected_doc_in_prompt,
+        }
+        if expected_ids and replayed.rerank.expected_doc_survived_rerank is None and trace_completeness.get("has_rerank_trace"):
+            rerank_signal["expected_doc_survived_rerank"] = bool(expected_ids & rerank_ids)
+        if expected_ids and replayed.rerank.expected_doc_in_prompt is None and trace_completeness.get("has_prompt_trace"):
+            rerank_signal["expected_doc_in_prompt"] = bool(expected_ids & prompt_ids)
+        stage_signals["rerank"] = rerank_signal
+    if replayed.qa.answer:
+        stage_signals["answer"] = {"answer": replayed.qa.answer}
+    return stage_signals
+
+
+async def replay_workflow_v3(
+    *,
+    ingest: dict[str, Any],
+    overrides: dict[str, Any] | None = None,
+    output_dir: str | None = None,
+    app_id: str | None = None,
+    query: str | None = None,
+) -> dict[str, Any]:
+    request_dict = _sanitize_replay_request_from_ingest(
+        ingest,
+        app_id=app_id,
+        query=query,
+        overrides=overrides,
+    )
+    missing_actions = _replay_missing_actions(request_dict)
+    if missing_actions:
+        return _blocked_replay_payload(ingest=ingest, request_dict=request_dict, actions=missing_actions, output_dir=output_dir)
     try:
         request = AttributionRequest.model_validate(request_dict)
         replayed = await replay_workflow(request)
         status = replayed.workflow_replay.status
         raw = replayed.workflow_replay.model_dump(mode="json")
         error = replayed.workflow_replay.error
+        stage_signals = _replay_stage_signals(replayed, raw, status)
     except Exception as exc:
         status = "error"
         raw = {}
         error = str(exc)[:500]
+        stage_signals = {"context": {"replay_status": status, "replay_diverged": True, "node_traces": [], "trace_completeness": {}}}
     payload = {
         "schema_version": SCHEMA_VERSION,
         "log_id": ingest.get("log_id"),
         "workspace_id": ingest.get("workspace_id"),
         "probe_name": "replay-workflow",
         "status": status,
-        "stage_signals": {"context": {"replay_status": status, "replay_diverged": status not in {"ok", "not_configured"}}},
-        "evidence_bundle": _probe_evidence("replay-workflow", "context", raw or {"error": error}, 0.55 if error else 0.74),
-        "raw_artifacts": raw,
+        "host_action_required": [],
+        "stage_signals": stage_signals,
+        "evidence_bundle": _probe_evidence("replay-workflow", "context", raw or {"error": error}),
+        "raw_artifacts": {
+            **raw,
+            "request_policy": {
+                "signals_ignored": True,
+                "allowed_workflow_inputs": ["query", "workspace_id", "app_id", "topK", "expected_knowledge_ids", "retrieve_query_list"],
+                "notes": "judgement_evidence.signals are historical evaluator clues, not workflow replay inputs and not current replay evidence.",
+            },
+        },
         "telemetry": {"exclusive": True, "error": error},
     }
     if output_dir:

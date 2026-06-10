@@ -8,15 +8,16 @@ from typing import Any
 
 import httpx
 
-from .env import load_runtime_env
 from .models import AttributionRequest, EvidenceDoc, WorkflowReplayEvidence
 
-load_runtime_env()
-
 DEFAULT_WORKFLOW_REPLAY_URL = ""
-DEFAULT_WORKFLOW_OPEN_EXEC_BASE_URL = "https://zhishang.bytedance.net"
-DEFAULT_WORKFLOW_RDS_DATABASE = "zs_open"
-DEFAULT_OPEN_PLAT_WORKSPACE_INFO_URL = "https://zhishang.bytedance.net/open-plat/api/workspace/get-workspace-info"
+OPEN_PLAT_ZS_OPEN_TOKEN = "37160d0535224506965a54e58e0685c4"
+WORKFLOW_OPEN_EXEC_BASE_URL = "https://zhishang.bytedance.net"
+WORKFLOW_RDS_DATABASE = "zs_open"
+OPEN_PLAT_WORKSPACE_INFO_URL = "https://zhishang.bytedance.net/open-plat/api/workspace/get-workspace-info"
+BYTEDCLI_BIN = "bytedcli"
+WORKFLOW_RDS_TIMEOUT_SECONDS = 30.0
+WORKFLOW_PUBLISHED_STATUS = "1"
 MAX_REPLAY_VALUE_CHARS = 12000
 FAQ_RECALL_SOURCES = {"featured_search"}
 DOC_RECALL_SOURCES = {"doc_search", "self_dataset_search", "suite_dataset"}
@@ -46,9 +47,7 @@ def _truncate(value: Any, max_chars: int = MAX_REPLAY_VALUE_CHARS) -> Any:
 
 def _safe_error(exc: Exception) -> str:
     text = repr(exc) if not str(exc) else str(exc)
-    token = os.getenv("OPEN_PLAT_ZS_OPEN_TOKEN", "")
-    if token:
-        text = text.replace(token, "[REDACTED]")
+    text = text.replace(OPEN_PLAT_ZS_OPEN_TOKEN, "[REDACTED]")
     return text[:500]
 
 
@@ -62,28 +61,25 @@ def _numeric_id(value: Any, field_name: str) -> str:
 def _run_bytedcli_query(database: str, sql: str) -> list[dict[str, Any]]:
     env = os.environ.copy()
     env.setdefault("NPM_CONFIG_REGISTRY", "http://bnpm.byted.org")
-    timeout = float(os.getenv("WORKFLOW_RDS_TIMEOUT_SECONDS", "30"))
-    bytedcli_bin = os.getenv("BYTEDCLI_BIN", "bytedcli")
-    commands = [[bytedcli_bin, "--json", "rds", "db", "query", database, sql]]
-    if "BYTEDCLI_BIN" not in os.environ:
-        commands.append(
-            [
-                "npx",
-                "-y",
-                "@bytedance-dev/bytedcli@latest",
-                "--json",
-                "rds",
-                "db",
-                "query",
-                database,
-                sql,
-            ]
-        )
+    commands = [[BYTEDCLI_BIN, "--json", "rds", "db", "query", database, sql]]
+    commands.append(
+        [
+            "npx",
+            "-y",
+            "@bytedance-dev/bytedcli@latest",
+            "--json",
+            "rds",
+            "db",
+            "query",
+            database,
+            sql,
+        ]
+    )
     last_error = ""
     completed = None
     for command in commands:
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=env, check=False)
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=WORKFLOW_RDS_TIMEOUT_SECONDS, env=env, check=False)
         except FileNotFoundError as exc:
             last_error = str(exc)
             continue
@@ -368,7 +364,7 @@ def resolve_workflow(request: AttributionRequest, version_id: str | None = None)
     case_input = request.case_input
     workspace_id = _numeric_id(case_input.workspace_id, "workspace_id")
     app_id = _numeric_id(case_input.app_id, "app_id")
-    database = os.getenv("WORKFLOW_RDS_DATABASE", DEFAULT_WORKFLOW_RDS_DATABASE)
+    database = WORKFLOW_RDS_DATABASE
     app_rows = _run_bytedcli_query(
         database,
         (
@@ -378,12 +374,12 @@ def resolve_workflow(request: AttributionRequest, version_id: str | None = None)
     )
     if not app_rows:
         raise WorkflowResolverError(f"applications not found for workspace_id={workspace_id}, app_id={app_id} in {database}")
-    version = version_id or os.getenv("WORKFLOW_VERSION_ID")
+    version = version_id
     if version:
         version = _numeric_id(version, "version_id")
         wip_where = f"workspace_id = {workspace_id} and app_id = {app_id} and version_id = {version}"
     else:
-        published_status = _numeric_id(os.getenv("WORKFLOW_PUBLISHED_STATUS", "1"), "WORKFLOW_PUBLISHED_STATUS")
+        published_status = _numeric_id(WORKFLOW_PUBLISHED_STATUS, "WORKFLOW_PUBLISHED_STATUS")
         wip_where = f"workspace_id = {workspace_id} and app_id = {app_id} and status = {published_status}"
     wip_rows = _run_bytedcli_query(
         database,
@@ -449,7 +445,7 @@ def _coerce_param_value(value: Any, param_type: str) -> Any:
     return "" if value is None else str(value)
 
 
-def _mapped_input_value(request: AttributionRequest, key: str, query_variants: list[str] | None, topk_env: str, default_topk: int) -> tuple[bool, Any]:
+def _mapped_input_value(request: AttributionRequest, key: str, query_variants: list[str] | None, default_topk: int) -> tuple[bool, Any]:
     case_input = request.case_input
     canonical = _canonical_key(key)
     if canonical in {"query", "rankquery", "question", "input", "userquery", "oriquery", "originalquery"}:
@@ -458,9 +454,9 @@ def _mapped_input_value(request: AttributionRequest, key: str, query_variants: l
         values = query_variants if query_variants is not None else _clean_string_list(case_input.retrieve_query_list)
         return True, values
     if canonical in {"topk", "topn", "limit", "maxcount", "maxdocs", "count"}:
-        if topk_env == "WORKFLOW_TOPK" and request.workflow_overrides.topk is not None:
+        if request.workflow_overrides.topk is not None:
             return True, request.workflow_overrides.topk
-        return True, int(os.getenv(topk_env, str(default_topk)))
+        return True, int(default_topk)
     if canonical in {"workspaceid", "workspace"}:
         return True, case_input.workspace_id
     if canonical in {"appid", "app"}:
@@ -475,7 +471,6 @@ def build_workflow_payload(
     input_schema: list[dict[str, Any]],
     *,
     query_variants: list[str] | None = None,
-    topk_env: str = "WORKFLOW_TOPK",
     default_topk: int = 15,
 ) -> tuple[dict[str, Any], list[str]]:
     input_params: list[dict[str, Any]] = []
@@ -486,7 +481,7 @@ def build_workflow_payload(
             continue
         key = param["key"]
         param_type = _schema_param_type(param)
-        mapped, value = _mapped_input_value(request, key, query_variants, topk_env, default_topk)
+        mapped, value = _mapped_input_value(request, key, query_variants, default_topk)
         if not mapped:
             value = _schema_param_default(param)
         if value is None:
@@ -509,7 +504,7 @@ def _build_replay_payload(request: AttributionRequest, input_schema: list[dict[s
 
 
 def _workflow_endpoint(resolved_app: dict[str, Any]) -> str:
-    base_url = os.getenv("WORKFLOW_OPEN_EXEC_BASE_URL", DEFAULT_WORKFLOW_OPEN_EXEC_BASE_URL).rstrip("/")
+    base_url = WORKFLOW_OPEN_EXEC_BASE_URL.rstrip("/")
     app_id = resolved_app.get("app_id") or resolved_app.get("id")
     return f"{base_url}/open-exec/api/v1/workflow/{app_id}/completions"
 
@@ -886,21 +881,15 @@ def _workflow_headers(token: str) -> dict[str, str]:
 
 
 def _openplat_bootstrap_token() -> tuple[str, str]:
-    value = os.getenv("OPEN_PLAT_ZS_OPEN_TOKEN", "").strip()
-    if value:
-        return value, "OPEN_PLAT_ZS_OPEN_TOKEN"
-    return "", "not_configured"
+    return OPEN_PLAT_ZS_OPEN_TOKEN, "fixed_source_constant"
 
 
 async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, str]:
-    if os.getenv("FINDREASON_LIVE", "true").lower() in {"0", "false", "no"}:
-        return None, "live_disabled"
     bootstrap_token, bootstrap_source = _openplat_bootstrap_token()
     if bootstrap_token:
-        workspace_info_url = os.getenv("OPEN_PLAT_WORKSPACE_INFO_URL", DEFAULT_OPEN_PLAT_WORKSPACE_INFO_URL)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
-                workspace_info_url,
+                OPEN_PLAT_WORKSPACE_INFO_URL,
                 params={"workspaceId": workspace_id},
                 headers={
                     "x-zs-plt-open": "zs_open",
@@ -1009,7 +998,7 @@ async def replay_workflow(request: AttributionRequest) -> AttributionRequest:
             endpoint=endpoint,
             request_payload=request_payload,
             auth_token_source=auth_token_source,
-            notes="未配置 OPEN_PLAT_ZS_OPEN_TOKEN，无法获取当前 workspace 的 authInfo.apiKey，跳过流水线重跑。",
+            notes="源码固定 OpenPlat token 不可用，无法获取当前 workspace 的 authInfo.apiKey，跳过流水线重跑。",
         )
         return _merge_replay_evidence(request, replay)
 

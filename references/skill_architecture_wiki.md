@@ -308,8 +308,8 @@ flowchart LR
   KB -.不支撑.-> KFail[suspected_knowledge_missing<br/>或 human_review]
   OR -.上界支撑但 origin 缺失.-> RFail[retrieval_miss]
   RR -.origin 有支撑但 rerank 缺失.-> RKFail[rerank_drop]
-  PR -.rerank 有支撑但 prompt 缺失.-> CFail[context_assembly_error]
-  AN -.prompt 支撑但答案未覆盖.-> AFail[partial_answer]
+  PR -.rerank 有支撑但 prompt 缺失.-> CObs[prompt/context observation]
+  AN -.rerank 后有必要支撑但答案未覆盖.-> AFail[answer_failure<br/>+ answer_issue_types]
 ```
 
 覆盖矩阵聚焦线上阶段：
@@ -381,14 +381,14 @@ flowchart LR
   P[preprocess] --> K[knowledge]
   K --> R[retrieval]
   R --> RR[rerank]
-  RR --> C[context]
-  C --> A[answer]
+  RR --> A[answer]
+  RR -.prompt/context observation.-> C[context]
   A --> E[evaluation<br/>observation-only]
 ```
 
 主因选择规则：
 
-1. 按 `preprocess -> knowledge -> retrieval -> rerank -> context -> answer -> evaluation` 遍历。
+1. 按 `preprocess -> knowledge -> retrieval -> rerank -> answer` 选择最早断点；`context` / `evaluation` 只作为观察。
 2. 跳过 `upstream_blocked_by` 的 verdict。
 3. 跳过 `not_probed`。
 4. 选择第一个失败、counterfactual 可用、且 `downstream_would_change=true` 的阶段。
@@ -411,7 +411,7 @@ flowchart TB
 这版架构区分“单主因”和“多发现”：
 
 - `primary_cause` 仍是单一枚举。
-- answer 漏答、错引、越界、unsupported claim、branching unclear、chunk conflict 风险等，可以进入 `secondary_findings`。
+- answer 漏答、错引、越界、unsupported claim、branching unclear 等，统一进入 `secondary_findings.answer_issue_types`；chunk conflict 风险进入 `secondary_findings.chunk_conflict_findings`。
 - 如果上游证据不足，不能因为答案看起来错了就直接下沉到 answer cause。
 
 ```mermaid
@@ -424,55 +424,41 @@ flowchart LR
   SF --> Report
 ```
 
-答案类主因的基本前置条件：
+答案主因 `answer_failure` 的基本前置条件：
 
-- `qa.prompt_supports_answer=true`
 - `qa.answer_satisfies_expected=false`
+- `qa.prompt_supports_answer=true`，或必要支撑已通过 rerank
 - 上游没有更早且 counterfactual 成立的失败
 
-如果 `prompt_supports_answer=false`，主因应停在上游。
+如果上游 knowledge / retrieval / rerank 有更早断点，答案症状只能作为观察。
 
 ## 13. Cause code 分层
 
 ```mermaid
 flowchart TB
   subgraph Preprocess
-    P1[non_rag_route_boundary]
-    P2[workflow_input_loss]
-    P3[query_rewrite_drift]
-    P4[keyword_loss]
+    P1[workflow_input_loss]
   end
 
   subgraph Knowledge
     K1[suspected_knowledge_missing]
-    K2[knowledge_topic_mismatch]
-    K3[knowledge_internal_inconsistency]
   end
 
   subgraph Retrieval
     R1[retrieval_miss]
-    R2[permission_miss]
   end
 
   subgraph Rerank
     RR1[rerank_drop]
-    RR2[rerank_tunable]
-  end
-
-  subgraph Context
-    C1[context_assembly_error]
   end
 
   subgraph Answer
-    A1[unsupported_claim]
-    A2[wrong_citation]
-    A3[partial_answer]
-    A4[answer_scope_violation]
-    A5[answer_branching_unclear]
+    A1[answer_failure]
+    A2[secondary_findings.answer_issue_types]
   end
 ```
 
-Evaluation 在 v3 中是观察层，没有官方 cause code。
+Evaluation 和 prompt/context 在 v3 中是观察层，没有官方 cause code。
 
 ## 14. Workflow replay 的位置
 
@@ -562,17 +548,17 @@ mindmap
       counterfactual 必须可回指 evidence
 ```
 
-## 18. 推荐的人读报告组织
+## 18. 人读报告组织
 
-报告应优先回答“问题最早断在哪”，而不是堆 JSON：
+报告应优先回答“问题最早断在哪”，而不是堆 JSON。当前默认实现采用 adaptive narrative：
 
-1. 结论摘要：`primary_cause`、owner、confidence、是否需要人工复核。
-2. 现场输入与答案：log、workspace、app、真实 query、原始答案、文档数量。
-3. 验证过程：执行了哪些 `{stage}-exp`，为什么执行。
-4. 阶段裁决：preprocess 到 answer 每阶段 verdict。
-5. 关键证据与文档：必要断言、覆盖矩阵、理论召回上界关系、answer findings、chunk conflict findings。
-6. 下一步建议：owner 和 P0/P1 action。
-7. 审计 JSON 索引：指向 `attribution_record.json` 中的原始 trace、probe outputs、workflow I/O。
+- `## 结论`：`primary_cause`、owner、是否需要人工复核。
+- `## 关键解释`：解释最早断点、答案症状是主因还是下游表现、为什么不是其他阶段。
+- `## 证据与验证`：按 case 需要展示现场输入、验证卡片、阶段裁决、必要断言、覆盖矩阵、理论召回上界关系、answer findings、chunk conflict findings。
+- `## 下一步`：owner 和 P0/P1 action。
+- `## 审计索引`：指向 `attribution_record.json` 中的原始 trace、probe outputs、workflow I/O。
+
+这不是宿主 Agent 的强制模板。宿主 Agent 可以重写最终说明，但必须保留：唯一主因、答案症状边界、决定性 evidence、next action 和审计入口。
 
 ## 19. 当前架构的设计取舍
 
