@@ -20,16 +20,9 @@
       "outputs": ["oracle_status", "case_assessment", "primary_cause", "secondary_findings", "evidence_chain", "evidence_bundle", "failure_patterns", "next_actions", "short_summary.json", "case_report.md"]
     },
     {
-      "id": "probe_self_oracle",
-      "command": "probe-self-oracle",
-      "description": "Infer expected knowledge from judgement, answer claims, and query signals so no-ground-truth cases remain attributable.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "signals", "topk", "output_dir", "no_cache"],
-      "outputs": ["oracle_status", "stage_signals.knowledge", "stage_signals.retrieval", "stage_signals.rerank", "stage_signals.context", "evidence_bundle"]
-    },
-    {
       "id": "probe_knowledge_detail",
       "command": "probe-knowledge-detail",
-      "description": "Tri-state knowledge existence probe: trace/provided ids plus optional live doc-record detail via KNOWLEDGE_DETAIL_URL.",
+      "description": "Tri-state knowledge existence probe: trace/provided ids plus fixed live doc-record detail endpoint.",
       "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
       "outputs": ["stage_signals.knowledge", "evidence_bundle"]
     },
@@ -57,7 +50,7 @@
     {
       "id": "probe_context_assembly",
       "command": "probe-context-assembly",
-      "description": "Compare rerank docs vs prompt docs to detect context_assembly_error.",
+      "description": "Compare rerank docs vs prompt docs for prompt/context observation; does not produce a primary cause.",
       "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
       "outputs": ["stage_signals.context", "evidence_bundle"]
     },

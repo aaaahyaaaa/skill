@@ -6,7 +6,7 @@
 POST http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail
 Content-Type: application/json
 x-zs-plt-open: zs_open
-Authorization: Bearer <OPEN_PLAT_ZS_OPEN_TOKEN>
+Authorization: Bearer <source-fixed-token>
 ```
 
 请求体：

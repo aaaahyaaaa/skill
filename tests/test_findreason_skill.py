@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,9 +25,7 @@ def run_cli(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subproc
     merged_env = os.environ.copy()
     merged_env.update(
         {
-            "FINDREASON_ENV_DISABLE": "true",
             "FINDREASON_TRACE_WORKFLOW_MAPPING": "false",
-            "OPEN_PLAT_ZS_OPEN_TOKEN": "test-token",
         }
     )
     merged_env.update(env or {})
@@ -42,9 +44,7 @@ def run_module(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subp
     merged_env = os.environ.copy()
     merged_env.update(
         {
-            "FINDREASON_ENV_DISABLE": "true",
             "FINDREASON_TRACE_WORKFLOW_MAPPING": "false",
-            "OPEN_PLAT_ZS_OPEN_TOKEN": "test-token",
         }
     )
     merged_env.update(env or {})
@@ -56,6 +56,62 @@ def run_module(*args: str, cwd: Path, env: dict[str, str] | None = None) -> subp
         capture_output=True,
         check=False,
         timeout=60,
+    )
+
+
+def _load_cli_module() -> Any:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location("_findreason_cli_test", CLI)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load CLI from {CLI}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_ingest_with_trace_url(
+    trace_url: str,
+    *,
+    workspace_id: str = "55",
+    log_id: str = "log-1",
+    app_id: str = "",
+    case_file_path: Path | None = None,
+    output_dir: Path | None = None,
+    raw: bool = False,
+    limit: int = 1000,
+) -> subprocess.CompletedProcess[str]:
+    cli_module = _load_cli_module()
+    import findreason_core.v3 as v3
+
+    old_trace_url = v3.OPEN_PLAT_TRACE_DETAIL_URL
+    args = SimpleNamespace(
+        workspace_id=workspace_id,
+        log_id=log_id,
+        app_id=app_id,
+        case_file=str(case_file_path) if case_file_path else None,
+        output_dir=str(output_dir) if output_dir else None,
+        raw=raw,
+        limit=limit,
+        trace_timeout_seconds=90,
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    returncode = 0
+    try:
+        v3.OPEN_PLAT_TRACE_DETAIL_URL = trace_url
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                returncode = int(cli_module._cmd_ingest(args) or 0)
+            except v3.V3Error as exc:
+                print(v3.json_dumps(exc.to_payload()), file=sys.stderr)
+                returncode = exc.status_code
+    finally:
+        v3.OPEN_PLAT_TRACE_DETAIL_URL = old_trace_url
+    return subprocess.CompletedProcess(
+        args=["ingest-fornax-trace"],
+        returncode=returncode,
+        stdout=stdout.getvalue(),
+        stderr=stderr.getvalue(),
     )
 
 
@@ -366,7 +422,7 @@ def test_schema_exposes_v3_and_old_commands_are_absent(tmp_path: Path) -> None:
     assert payload["schema_version"] == "v3"
     assert "ingest-fornax-trace" in payload["commands"]
     assert "orchestrate" in payload["commands"]
-    assert "probe-self-oracle" in payload["commands"]["probes"]
+    assert "probe-self-oracle" not in payload["commands"]["probes"]
     assert "probe-rerank-bypass" in payload["commands"]["probes"]
     combined = result.stdout + run_module("--help", cwd=SKILL_ROOT, env={"HOME": str(tmp_path)}).stdout
     for old in (
@@ -392,6 +448,7 @@ def test_output_schema_accepts_current_oracle_status_sources() -> None:
 
     assert "insufficient_assertions" in source_enum
     assert "host_assertions" in source_enum
+    assert "self_inferred" not in source_enum
 
 
 def test_capabilities_exclude_removed_weak_semantic_probes() -> None:
@@ -399,35 +456,28 @@ def test_capabilities_exclude_removed_weak_semantic_probes() -> None:
     capabilities = {item["command"]: item for item in manifest["capabilities"]}
 
     assert "topk" in capabilities["probe-wide-recall"]["inputs"]
-    for command in ("probe-by-judgement", "probe-by-claim", "probe-by-doc-title", "probe-rerank-tune"):
+    for command in ("probe-self-oracle", "probe-by-judgement", "probe-by-claim", "probe-by-doc-title", "probe-rerank-tune"):
         assert command not in capabilities
 
 
 def test_ingest_fetches_openplat_trace_and_emits_v3_summary(tmp_path: Path) -> None:
     with TraceServer(trace_payload()) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_file(tmp_path)),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_file(tmp_path),
+            output_dir=tmp_path / "case-out",
         )
 
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert server.requests[0]["headers"]["Authorization"] == "Bearer test-token"
+    assert server.requests[0]["headers"]["Authorization"] == "Bearer 37160d0535224506965a54e58e0685c4"
     assert server.requests[0]["headers"]["x-zs-plt-open"] == "zs_open"
     assert server.requests[0]["body"] == {"workspaceId": 55, "logId": "log-1", "limit": 1000}
     assert payload["schema_version"] == "v3"
     assert payload["app_id"] == "100"
     assert payload["ingest_summary"]["trace_completeness"]["retrieval"] == "complete"
-    assert payload["ingest_summary"]["suggested_probe_set"][0] == "probe-self-oracle"
+    assert "probe-self-oracle" not in payload["ingest_summary"]["suggested_probe_set"]
+    assert "probe-wide-recall" in payload["ingest_summary"]["suggested_probe_set"]
     assert "probe-rerank-bypass" in payload["ingest_summary"]["suggested_probe_set"]
     assert payload["raw_artifacts"]["workflow_span_ios"]
     assert (tmp_path / "case-out" / "ingest.json").exists()
@@ -436,18 +486,10 @@ def test_ingest_fetches_openplat_trace_and_emits_v3_summary(tmp_path: Path) -> N
 
 def test_ingest_without_host_assertions_requests_probe_plan(tmp_path: Path) -> None:
     with TraceServer(trace_payload()) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_file(tmp_path, expected_knowledge_ids=[])),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_file(tmp_path, expected_knowledge_ids=[]),
+            output_dir=tmp_path / "case-out",
         )
 
     assert result.returncode == 0, result.stderr
@@ -483,18 +525,10 @@ def test_cli_ingest_preserves_host_agent_answer_claim(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with TraceServer(trace_payload()) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_path),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_path,
+            output_dir=tmp_path / "case-out",
         )
 
     assert result.returncode == 0, result.stderr
@@ -507,7 +541,6 @@ def test_cli_ingest_preserves_host_agent_answer_claim(tmp_path: Path) -> None:
             "source": "host_agent.answer_claim",
             "basis": ["trace_query", "evaluator_reason"],
             "why_required": "用户询问云图是什么",
-            "confidence": 0.9,
         }
     ]
     assert "extract_host_agent_answer_claim" not in [
@@ -530,18 +563,10 @@ def test_cli_ingest_preserves_host_agent_answer_claim_in_case_object(tmp_path: P
         },
     )
     with TraceServer(trace_payload()) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_path),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_path,
+            output_dir=tmp_path / "case-out",
         )
 
     assert result.returncode == 0, result.stderr
@@ -552,7 +577,6 @@ def test_cli_ingest_preserves_host_agent_answer_claim_in_case_object(tmp_path: P
             "text": "正确答案应说明云图是指标分析的数据产品",
             "role": "expected_required",
             "source": "host_agent.answer_claim",
-            "confidence": 0.9,
         }
     ]
     assert "extract_host_agent_answer_claim" not in [
@@ -588,18 +612,10 @@ def test_cli_ingest_normalizes_answer_hint_when_trace_answer_missing(tmp_path: P
     )
     empty_trace = {"code": 0, "msg": "", "data": {"spans": [], "has_more": False, "next_page_token": ""}}
     with TraceServer(empty_trace) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_path),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_path,
+            output_dir=tmp_path / "case-out",
         )
 
     assert result.returncode == 0, result.stderr
@@ -619,18 +635,10 @@ def test_cli_ingest_answer_hint_does_not_override_trace_answer(tmp_path: Path) -
         host_agent={"answer_claim": [{"text": "正确答案应说明云图定义。", "role": "expected_required"}]},
     )
     with TraceServer(trace_payload()) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_path),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_path,
+            output_dir=tmp_path / "case-out",
         )
 
     assert result.returncode == 0, result.stderr
@@ -657,18 +665,10 @@ def test_cli_trace_failure_preserves_current_host_fields(tmp_path: Path) -> None
         qa={"answer_satisfies_expected": False, "partial_answer": True},
     )
     with TraceServer({"code": -512, "msg": "request is limited", "data": {}}) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_path),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_path,
+            output_dir=tmp_path / "case-out",
         )
 
     assert result.returncode == 0, result.stderr
@@ -685,7 +685,6 @@ def test_cli_trace_failure_preserves_current_host_fields(tmp_path: Path) -> None
             "text": "正确答案应说明商品添加机制",
             "role": "expected_required",
             "source": "host_agent.answer_claim",
-            "confidence": 0.55,
             "basis": ["query_hint", "evaluator_reason"],
         }
     ]
@@ -728,7 +727,7 @@ def test_report_explains_empty_assertion_matrix_needs_probe_plan() -> None:
     assert "run-probe-plan" in report
 
 
-def test_case_report_uses_readable_numbered_sections_and_trace_appendix(tmp_path: Path) -> None:
+def test_case_report_uses_adaptive_narrative_with_required_evidence_contract(tmp_path: Path) -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import orchestrate_v3
 
@@ -781,29 +780,26 @@ def test_case_report_uses_readable_numbered_sections_and_trace_appendix(tmp_path
     payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
     report = payload["human_report_markdown"]
 
-    expected_order = [
-        "## 1. 结论摘要",
-        "## 2. 现场输入与答案",
-        "## 3. 验证过程：我怎么查的",
-        "## 4. 阶段裁决：问题最早断在哪",
-        "## 5. 关键证据与文档",
-        "### 理论召回上界与断言关系",
-        "## 6. 下一步建议",
-        "## 7. 审计 JSON 索引",
-    ]
-    positions = [report.index(heading) for heading in expected_order]
-
-    assert positions == sorted(positions)
+    assert "## 结论" in report
+    assert "## 关键解释" in report
+    assert "## 证据与验证" in report
+    assert "## 下一步" in report
+    assert "## 审计索引" in report
+    assert "## 1. 结论摘要" not in report
+    assert "## 7. 审计 JSON 索引" not in report
+    assert report.index("## 结论") < report.index("## 关键解释") < report.index("## 证据与验证")
     assert "答案摘要：可以在计划管理设置。" in report
     assert "### Workflow 原始完整输入" in report
     assert "### Workflow 原始完整输出" in report
     assert '"query": "随心推铺底计划怎么设置"' in report
     assert '"answer": "可以在计划管理设置。"' in report
-    assert report.index("## 7. 审计 JSON 索引") > report.index("## 6. 下一步建议")
+    assert report.index("## 审计索引") > report.index("## 下一步")
     assert "### Workflow 输入摘录" not in report
     assert "### Workflow 输出摘录" not in report
     assert "### 原始 Workflow 输入输出" not in report
     assert "输入边界判断：用户实际问题中的关键约束已进入 Workflow 原始输入。" in report
+    assert "### 阶段裁决" in report
+    assert "### 断言覆盖矩阵" in report
     assert "### 理论召回上界与断言关系" in report
     assert "支持该断言：`wide-setup-1` 随心推铺底计划设置指南" in report
 
@@ -843,7 +839,7 @@ def test_case_report_renders_validation_as_chinese_process_cards() -> None:
     payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
     report = payload["human_report_markdown"]
 
-    assert "## 3. 验证过程：我怎么查的" in report
+    assert "### 验证过程" in report
     assert "### 验证 1：风险答案覆盖" in report
     assert "- 我为什么查这个：评估器提示答案遗漏 ROI 波动风险" in report
     assert "- 我查了哪里：最终答案" in report
@@ -913,20 +909,35 @@ def test_case_report_matched_docs_show_links_and_support_snippets() -> None:
     assert "matched_docs: 2033060" not in report
 
 
+def test_case_report_linkifies_answer_urls_without_swallowing_following_text() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    answer = (
+        "申请全域乘方策略投放权限主要有两种方式：对于非官方抖音号，"
+        "需在千川账户后台选择非官方抖音号授权管理-申请授权"
+        "3(https://support.oceanengine.com/support/content/142794)。"
+        "选定抖音号后，等待其官方千川账户或抖音APP站内信中确认授权。"
+    )
+    request = {
+        "case_input": {"query": "全域乘方怎么授权", "workspace_id": "55", "app_id": "100"},
+        "qa": {"answer": answer},
+    }
+
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
+    report = payload["human_report_markdown"]
+
+    assert "3([链接](https://support.oceanengine.com/support/content/142794))。选定抖音号后" in report
+    assert "https://support.oceanengine.com/support/content/142794)。选定" not in report
+    assert "选定抖音号后" in report
+
+
 def test_probe_rerank_bypass_is_auxiliary_without_assertion_gap(tmp_path: Path) -> None:
     with TraceServer(trace_payload()) as server:
-        ingest_result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(case_file(tmp_path)),
-            "--output-dir",
-            str(tmp_path / "case-out"),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        ingest_result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=case_file(tmp_path),
+            output_dir=tmp_path / "case-out",
         )
     assert ingest_result.returncode == 0, ingest_result.stderr
     probe_dir = tmp_path / "case-out" / "probes"
@@ -957,8 +968,8 @@ def test_probe_rerank_bypass_is_auxiliary_without_assertion_gap(tmp_path: Path) 
     assert payload["app_id"] == "100"
     report = payload["human_report_markdown"]
     assert "# FindReason 归因报告" in report
-    assert "## 4. 阶段裁决：问题最早断在哪" in report
-    assert "## 7. 审计 JSON 索引" in report
+    assert "### 阶段裁决" in report
+    assert "## 审计索引" in report
     assert "- Workflow 输出：" not in report
     assert "### Workflow 原始完整输入" in report
     assert "### Workflow 原始完整输出" in report
@@ -1152,54 +1163,6 @@ def test_host_agent_answer_claim_rejects_old_role_alias() -> None:
     assert error.value.details["role"] == "missing_expected"
 
 
-def test_oracle_claim_signal_uses_only_required_assertions() -> None:
-    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    import findreason_core.v3 as v3
-
-    request = {
-        "case_input": {"query": "同店铺下两个千川号人群会不会互相影响", "workspace_id": "55", "app_id": "100"},
-        "host_agent": {
-            "answer_claim": [
-                {"text": "正确输出应回答两个千川号的人群模型是否互相影响。", "role": "expected_required"},
-                {"text": "同店铺下的不同千川号信用评分会相互影响。", "role": "answer_claim"},
-                {"text": "用户问题限定在人群模型，不应只回答信用评分。", "role": "constraint_check"},
-            ]
-        },
-    }
-
-    signal = v3._oracle_signal_text(request, "claim_back_recall")
-
-    assert "人群模型是否互相影响" in signal
-    assert "信用评分" not in signal
-    assert "不应只回答" not in signal
-
-
-def test_probe_cache_key_changes_when_host_assertions_change(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result
-
-    monkeypatch.setenv("HOME", str(tmp_path))
-    base = {
-        "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
-        "retrieval": {"origin_doc_list": [{"id": "d1", "title": "云图定义", "content": "云图是指标分析数据产品。"}]},
-        "rerank": {"rerank_docs": [], "prompt_docs": []},
-        "qa": {"answer": ""},
-    }
-    first = json.loads(json.dumps(base))
-    first["host_agent"] = {"answer_claim": [{"text": "正确答案应说明云图是指标分析数据产品。", "role": "expected_required"}]}
-    second = json.loads(json.dumps(base))
-    second["host_agent"] = {"answer_claim": [{"text": "正确答案应说明铺底计划设置入口。", "role": "expected_required"}]}
-
-    first_probe = build_probe_result("probe-self-oracle", ingest=minimal_ingest(first))
-    second_probe = build_probe_result("probe-self-oracle", ingest=minimal_ingest(second))
-
-    assert first_probe["telemetry"]["cache_hit"] is False
-    assert second_probe["telemetry"]["cache_hit"] is False
-    assert first_probe["telemetry"]["cache_key"] != second_probe["telemetry"]["cache_key"]
-    assert first_probe["oracle_status"]["expected_knowledge_points"][0]["text"] == "正确答案应说明云图是指标分析数据产品"
-    assert second_probe["oracle_status"]["expected_knowledge_points"][0]["text"] == "正确答案应说明铺底计划设置入口"
-
-
 def test_empty_legacy_assertion_fields_do_not_block() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     import findreason_core.v3 as v3
@@ -1234,6 +1197,8 @@ def test_internal_trace_legacy_assertion_fields_are_dropped_before_host_claims()
     points = v3._expected_knowledge_points(normalized)
 
     assert [point["text"] for point in points] == ["new host assertion"]
+    assert "confidence" not in points[0]
+    assert "confidence" not in normalized["host_agent"]["answer_claim"][0]
     assert "answer_claims" not in normalized["qa"]
     assert "expected_knowledge_points" not in normalized["case_input"]
     assert "assertions" not in normalized["judgement_evidence"]["signals"][0]
@@ -1241,7 +1206,7 @@ def test_internal_trace_legacy_assertion_fields_are_dropped_before_host_claims()
 
 def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeypatch: pytest.MonkeyPatch) -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result, orchestrate_v3
+    import findreason_core.v3 as v3
 
     request = {
         "case_input": {
@@ -1272,17 +1237,16 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
             ]
         },
         "preprocess": {"rewrite_query": "随心推 设置 铺底计划"},
-        "retrieval": {"knowledge_exists": None, "origin_doc_list": [], "origin_faq_list": []},
+        "retrieval": {"knowledge_exists": None, "origin_doc_list": [{"id": "d1", "title": "云图文档"}], "origin_faq_list": []},
         "rerank": {"rerank_docs": [], "prompt_docs": []},
     }
     with RecallServer() as server:
         ingest = minimal_ingest(request)
         ingest["raw_artifacts"]["trace_detail"] = trace_payload_with_recall_template(server.recall_url)
-        monkeypatch.setenv("OPEN_PLAT_ZS_OPEN_TOKEN", "bootstrap-token")
-        monkeypatch.setenv("OPEN_PLAT_WORKSPACE_INFO_URL", server.workspace_info_url)
-        monkeypatch.delenv("WORKFLOW_AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("OPEN_PLAT_ZS_OPEN_TOKEN", "wrong-env-token")
+        monkeypatch.setattr(v3, "OPEN_PLAT_WORKSPACE_INFO_URL", server.workspace_info_url)
 
-        wide_probe = build_probe_result("probe-wide-recall", ingest=ingest, params={"topk": 50}, no_cache=True)
+        wide_probe = v3.build_probe_result("probe-wide-recall", ingest=ingest, params={"topk": 50}, no_cache=True)
 
     assert wide_probe["status"] == "ok"
     retrieval = wide_probe["stage_signals"]["retrieval"]
@@ -1294,7 +1258,8 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
     assert "workspace-key" not in json.dumps(wide_probe, ensure_ascii=False)
     get_request = next(item for item in server.requests if item["method"] == "GET")
     post_requests = [item for item in server.requests if item["method"] == "POST"]
-    assert get_request["headers"]["Authorization"] == "Bearer bootstrap-token"
+    assert get_request["headers"]["Authorization"] == f"Bearer {v3.OPEN_PLAT_ZS_OPEN_TOKEN}"
+    assert "wrong-env-token" not in json.dumps(server.requests, ensure_ascii=False)
     assert {item["headers"]["Authorization"] for item in post_requests} == {"Bearer workspace-key"}
     for item in post_requests:
         for recall_request in item["body"]["recallRequests"]:
@@ -1303,7 +1268,7 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
             assert recall_request["maxCount"] >= 50
             assert recall_request["params"]["score"] == 0
 
-    payload = orchestrate_v3(ingest=ingest, probes=[wide_probe], mode="final")
+    payload = v3.orchestrate_v3(ingest=ingest, probes=[wide_probe], mode="final")
     report = payload["human_report_markdown"]
     assert "理论召回范围：`open_label`" in report
     assert "断言覆盖矩阵" in report
@@ -1311,11 +1276,15 @@ def test_probe_wide_recall_calls_sirius_open_label_without_leaking_token(monkeyp
     assert "角色" in report
     assert "线上召回缺失" in report
     assert payload["primary_cause"]["cause_code"] == "retrieval_miss"
+    assert "confidence" not in payload["primary_cause"]
+    assert "confidence" not in payload["oracle_status"]
+    assert '"confidence"' not in json.dumps(payload, ensure_ascii=False)
+    assert "置信度" not in report
 
 
-def test_probe_wide_recall_does_not_use_workflow_auth_token_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_probe_wide_recall_ignores_workflow_auth_token_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result
+    import findreason_core.v3 as v3
 
     request = {
         "case_input": {"query": "铺底计划入口", "workspace_id": "55", "app_id": "100"},
@@ -1327,16 +1296,15 @@ def test_probe_wide_recall_does_not_use_workflow_auth_token_fallback(monkeypatch
     with RecallServer() as server:
         ingest = minimal_ingest(request)
         ingest["raw_artifacts"]["trace_detail"] = trace_payload_with_recall_template(server.recall_url)
-        monkeypatch.delenv("OPEN_PLAT_ZS_OPEN_TOKEN", raising=False)
         monkeypatch.setenv("WORKFLOW_AUTH_TOKEN", "wrong-workspace-token")
-        monkeypatch.setenv("OPEN_PLAT_WORKSPACE_INFO_URL", server.workspace_info_url)
+        monkeypatch.setattr(v3, "OPEN_PLAT_WORKSPACE_INFO_URL", server.workspace_info_url)
 
-        wide_probe = build_probe_result("probe-wide-recall", ingest=ingest, params={"topk": 50}, no_cache=True)
+        wide_probe = v3.build_probe_result("probe-wide-recall", ingest=ingest, params={"topk": 50}, no_cache=True)
 
     retrieval = wide_probe["stage_signals"]["retrieval"]
-    assert retrieval["theoretical_recall_status"] == "not_configured"
-    assert retrieval["auth_token_source"] == "not_configured"
-    assert not server.requests
+    assert retrieval["theoretical_recall_status"] == "ok"
+    assert retrieval["auth_token_source"] == "workspace_info:fixed_source_constant"
+    assert "wrong-workspace-token" not in json.dumps(server.requests, ensure_ascii=False)
 
 
 def test_knowledge_detail_reference_infers_source_and_identifier_from_links() -> None:
@@ -1364,7 +1332,7 @@ def test_knowledge_detail_reference_infers_source_and_identifier_from_links() ->
 
 def test_probe_knowledge_detail_fetches_live_doc_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result
+    import findreason_core.v3 as v3
 
     request = {
         "case_input": {"query": "新客试投在哪里", "workspace_id": "55", "app_id": "100", "expected_knowledge_ids": ["55284"]},
@@ -1391,10 +1359,9 @@ def test_probe_knowledge_detail_fetches_live_doc_record(monkeypatch: pytest.Monk
         "splits": [{"content": "新客试投入口在巨量千川首页。"}],
     }
     with KnowledgeDetailServer({("LARK_DOC", "doccnGGktnmTzIBO13yUVzmd8rg"): record}) as server:
-        monkeypatch.setenv("KNOWLEDGE_DETAIL_URL", server.url)
-        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(v3, "KNOWLEDGE_DETAIL_URL", server.url)
 
-        probe = build_probe_result("probe-knowledge-detail", ingest=minimal_ingest(request), no_cache=True)
+        probe = v3.build_probe_result("probe-knowledge-detail", ingest=minimal_ingest(request), no_cache=True)
 
     assert server.requests == [
         {
@@ -1420,7 +1387,7 @@ def test_probe_knowledge_detail_fetches_live_doc_record(monkeypatch: pytest.Monk
 
 def test_probe_knowledge_detail_uses_raw_trace_doc_links(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result
+    import findreason_core.v3 as v3
 
     request = {
         "case_input": {"query": "新客试投在哪里", "workspace_id": "55", "app_id": "100", "expected_knowledge_ids": ["1514299"]},
@@ -1446,10 +1413,9 @@ def test_probe_knowledge_detail_uses_raw_trace_doc_links(monkeypatch: pytest.Mon
         "content": "新客试投功能入口：完成注册后，首次进入巨量千川首页即可看到。",
     }
     with KnowledgeDetailServer({("COGNITION", "129985"): record}) as server:
-        monkeypatch.setenv("KNOWLEDGE_DETAIL_URL", server.url)
-        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(v3, "KNOWLEDGE_DETAIL_URL", server.url)
 
-        probe = build_probe_result("probe-knowledge-detail", ingest=ingest, no_cache=True)
+        probe = v3.build_probe_result("probe-knowledge-detail", ingest=ingest, no_cache=True)
 
     assert server.requests[0]["query"] == {"source": "COGNITION", "identifier": "129985"}
     knowledge = probe["stage_signals"]["knowledge"]
@@ -1648,7 +1614,7 @@ def test_workflow_input_loss_does_not_win_when_online_chain_covers_assertion() -
     payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
 
     assert payload["primary_cause"]["stage"] == "answer"
-    assert payload["primary_cause"]["cause_code"] == "unsupported_claim"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
     preprocess = next(item for item in payload["evidence_chain"] if item["stage"] == "preprocess")
     assert preprocess["status"] == "pass"
     assert "online origin/rerank/prompt" in json.dumps(preprocess, ensure_ascii=False)
@@ -1741,13 +1707,13 @@ def test_preprocess_rewrite_drift_when_workflow_input_is_complete() -> None:
 
     payload = orchestrate_v3(ingest=ingest, probes=[], mode="final")
 
-    assert payload["primary_cause"]["cause_code"] == "query_rewrite_drift"
+    assert payload["primary_cause"]["cause_code"] == "workflow_input_loss"
     assert payload["primary_cause"]["stage"] == "preprocess"
 
 
 def test_missing_expected_ids_does_not_block_downstream_answer_cause() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result, orchestrate_v3
+    from findreason_core.v3 import orchestrate_v3
 
     request = {
         "case_input": {"query": "q", "workspace_id": "55", "app_id": "100"},
@@ -1764,12 +1730,10 @@ def test_missing_expected_ids_does_not_block_downstream_answer_cause() -> None:
         },
         "host_agent": {"answer_claim": [{"text": "unsupported", "role": "unsupported_claim"}]},
     }
-    ingest = minimal_ingest(request)
-    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
-    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe], mode="final")
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
 
     assert payload["primary_cause"]["stage"] == "answer"
-    assert payload["primary_cause"]["cause_code"] == "unsupported_claim"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
     assert payload["needs_human_review"] is False
     assert payload["oracle_status"]["source"] == "insufficient_assertions"
     assert payload["oracle_status"]["inferred_doc_ids"] == []
@@ -1779,7 +1743,8 @@ def test_missing_expected_ids_does_not_block_downstream_answer_cause() -> None:
     assert knowledge["status"] == "indeterminate"
     assert "candidate_cause" not in knowledge
     answer = next(item for item in payload["evidence_chain"] if item["stage"] == "answer")
-    assert answer["candidate_cause"] == "unsupported_claim"
+    assert answer["candidate_cause"] == "answer_failure"
+    assert payload["secondary_findings"]["answer_issue_types"] == ["unsupported_claim"]
 
 
 def test_explicit_answer_satisfied_outputs_not_badcase_assessment() -> None:
@@ -1804,9 +1769,9 @@ def test_explicit_answer_satisfied_outputs_not_badcase_assessment() -> None:
     assert "不应认定为 badcase" in payload["human_report_markdown"]
 
 
-def test_self_oracle_enables_upstream_rerank_drop_without_expected_ids() -> None:
+def test_host_assertions_enable_upstream_rerank_drop_without_expected_ids() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result, orchestrate_v3
+    from findreason_core.v3 import orchestrate_v3
 
     request = {
         "case_input": {
@@ -1840,23 +1805,43 @@ def test_self_oracle_enables_upstream_rerank_drop_without_expected_ids() -> None
         },
         "host_agent": {"answer_claim": [{"text": "云图应被解释为用于指标分析的数据产品。", "role": "expected_required"}]},
     }
-    ingest = minimal_ingest(request)
-    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
-    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe], mode="final")
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
 
-    assert payload["oracle_status"]["inferred_doc_ids"] == ["d1"]
     assert payload["primary_cause"]["stage"] == "rerank"
     assert payload["primary_cause"]["cause_code"] == "rerank_drop"
-    assert payload["primary_cause"]["confidence"] < 0.86
     report = payload["human_report_markdown"]
     assert "重排断点" in report
     assert "云图应被解释为用于指标分析的数据产品" in report
     assert "命中 `d1` 云图定义" in report
 
 
-def test_self_oracle_point_gap_selects_knowledge_missing() -> None:
+def test_report_does_not_show_auto_candidate_doc_ids() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result, orchestrate_v3
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {"query": "云图是什么", "workspace_id": "55", "app_id": "100"},
+        "preprocess": {"rewrite_query": "云图是什么"},
+        "retrieval": {"knowledge_exists": None, "origin_doc_list": [{"id": "d1", "title": "云图文档"}], "origin_faq_list": []},
+        "rerank": {"rerank_docs": [], "prompt_docs": []},
+        "qa": {"answer": "云图是天气图片。"},
+    }
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
+
+    assert payload["primary_cause"] is None
+    retrieval = next(item for item in payload["evidence_chain"] if item["stage"] == "retrieval")
+    assert retrieval["status"] == "pass"
+    assert "candidate_cause" not in retrieval
+    report = payload["human_report_markdown"]
+    assert "人工指定 expected doc ID：`无`" in report
+    assert "候选 doc ID" not in report
+    assert "期望知识 ID" not in report
+    assert "不能仅凭 doc ID 缺失判知识缺失或重排/Prompt 失败" in report
+
+
+def test_point_gap_selects_knowledge_missing() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
 
     request = {
         "case_input": {
@@ -1891,7 +1876,6 @@ def test_self_oracle_point_gap_selects_knowledge_missing() -> None:
         "host_agent": {"answer_claim": [{"text": "随心推铺底计划的正确答案应说明设置步骤和入口。", "role": "expected_required"}]},
     }
     ingest = minimal_ingest(request)
-    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
     wide_probe = {
         "schema_version": "v3",
         "log_id": "log-x",
@@ -1920,11 +1904,11 @@ def test_self_oracle_point_gap_selects_knowledge_missing() -> None:
         ],
         "raw_artifacts": {},
     }
-    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe, wide_probe], mode="final")
+    payload = orchestrate_v3(ingest=ingest, probes=[wide_probe], mode="final")
 
     assert payload["primary_cause"]["stage"] == "knowledge"
     assert payload["primary_cause"]["cause_code"] == "suspected_knowledge_missing"
-    assert payload["oracle_status"]["missing_expected_points_from_theoretical_recall"]
+    assert payload["oracle_status"]["point_coverage"][0]["missing_stage"] == "knowledge"
     report = payload["human_report_markdown"]
     assert "理论召回上界也没有找到可承载这些必要断言的文档" in report
     assert "铺底计划" in report
@@ -1932,7 +1916,7 @@ def test_self_oracle_point_gap_selects_knowledge_missing() -> None:
 
 def test_report_explains_upper_bound_doc_assertion_relationship() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result, orchestrate_v3
+    from findreason_core.v3 import orchestrate_v3
 
     request = {
         "case_input": {
@@ -1952,7 +1936,6 @@ def test_report_explains_upper_bound_doc_assertion_relationship() -> None:
         },
     }
     ingest = minimal_ingest(request)
-    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
     wide_probe = {
         "schema_version": "v3",
         "log_id": "log-x",
@@ -1976,7 +1959,7 @@ def test_report_explains_upper_bound_doc_assertion_relationship() -> None:
         "evidence_bundle": [],
         "raw_artifacts": {},
     }
-    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe, wide_probe], mode="final")
+    payload = orchestrate_v3(ingest=ingest, probes=[wide_probe], mode="final")
     report = payload["human_report_markdown"]
     matrix_section = report.split("### 断言覆盖矩阵", 1)[1].split("### 召回上界与知识判断", 1)[0]
 
@@ -1989,7 +1972,7 @@ def test_report_explains_upper_bound_doc_assertion_relationship() -> None:
 
 def test_evaluator_dimensions_are_not_expected_knowledge_points() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result, orchestrate_v3
+    from findreason_core.v3 import orchestrate_v3
 
     request = {
         "case_input": {
@@ -2030,9 +2013,7 @@ def test_evaluator_dimensions_are_not_expected_knowledge_points() -> None:
         },
         "qa": {"answer": ""},
     }
-    ingest = minimal_ingest(request)
-    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
-    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe], mode="final")
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
 
     points = payload["oracle_status"]["expected_knowledge_points"]
     assert points == []
@@ -2044,7 +2025,7 @@ def test_evaluator_dimensions_are_not_expected_knowledge_points() -> None:
 
 def test_host_answer_claims_drive_point_coverage() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import build_probe_result, orchestrate_v3
+    from findreason_core.v3 import orchestrate_v3
 
     request = {
         "case_input": {
@@ -2083,9 +2064,7 @@ def test_host_answer_claims_drive_point_coverage() -> None:
             ],
         },
     }
-    ingest = minimal_ingest(request)
-    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
-    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe], mode="final")
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
 
     points = payload["oracle_status"]["expected_knowledge_points"]
     assert [point["text"] for point in points] == [
@@ -2180,7 +2159,7 @@ def test_expected_required_semantic_merge_keeps_distinct_entry_requirements() ->
     assert not any("merged_from" in point for point in points)
 
 
-def test_orchestrate_uses_ingest_host_assertions_without_self_oracle() -> None:
+def test_orchestrate_uses_ingest_host_assertions_directly() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import orchestrate_v3
 
@@ -2312,9 +2291,7 @@ def test_point_coverage_requires_answerable_support_span() -> None:
             ]
         },
     }
-    ingest = minimal_ingest(request)
-    oracle_probe = build_probe_result("probe-self-oracle", ingest=ingest, no_cache=True)
-    payload = orchestrate_v3(ingest=ingest, probes=[oracle_probe], mode="final")
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
 
     row = payload["oracle_status"]["point_coverage"][0]
     assert row["missing_stage"] == "retrieval"
@@ -2348,7 +2325,8 @@ def test_answer_cause_requires_prompt_support_precondition() -> None:
     supported["qa"]["prompt_supports_answer"] = True
     selected = orchestrate_v3(ingest=minimal_ingest(supported), probes=[], mode="final")
     assert selected["primary_cause"]["stage"] == "answer"
-    assert selected["primary_cause"]["cause_code"] == "unsupported_claim"
+    assert selected["primary_cause"]["cause_code"] == "answer_failure"
+    assert selected["secondary_findings"]["answer_issue_types"] == ["unsupported_claim"]
 
     unsupported = json.loads(json.dumps(base))
     unsupported["qa"]["prompt_supports_answer"] = False
@@ -2389,7 +2367,52 @@ def _answer_ready_request(**qa_overrides: Any) -> dict[str, Any]:
     return request
 
 
-def test_probe_plan_scope_violation_maps_answer_scope_violation() -> None:
+def test_answer_failure_collects_multiple_issue_types() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = _answer_ready_request(
+        wrong_citation=True,
+        partial_answer=True,
+        scope_violation=True,
+        branching_unclear=True,
+    )
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
+
+    assert payload["primary_cause"]["stage"] == "answer"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
+    assert payload["secondary_findings"]["answer_issue_types"] == [
+        "unsupported_claim",
+        "wrong_citation",
+        "missing_aspect",
+        "scope_violation",
+    ]
+
+
+def test_context_gap_is_observation_not_primary_cause() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core.v3 import orchestrate_v3
+
+    request = {
+        "case_input": {"query": "云图是什么", "workspace_id": "55", "app_id": "100", "expected_knowledge_ids": ["d1"]},
+        "preprocess": {"rewrite_query": "云图是什么"},
+        "retrieval": {"knowledge_exists": True, "online_retrieval_hit": True, "expected_knowledge_hit": True},
+        "rerank": {
+            "rerank_docs": [{"id": "d1", "title": "云图定义", "content": "云图是用于指标分析的数据产品。"}],
+            "prompt_docs": [],
+            "missing_expected_points_from_prompt": ["正确答案应说明云图是用于指标分析的数据产品。"],
+        },
+        "qa": {"answer": "云图是天气图片。"},
+    }
+    payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[], mode="final")
+
+    context = next(item for item in payload["evidence_chain"] if item["stage"] == "context")
+    assert context["status"] == "indeterminate"
+    assert "candidate_cause" not in context
+    assert payload["primary_cause"] is None
+
+
+def test_probe_plan_scope_violation_maps_answer_failure_issue_type() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import orchestrate_v3
 
@@ -2398,10 +2421,11 @@ def test_probe_plan_scope_violation_maps_answer_scope_violation() -> None:
     payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
 
     assert payload["primary_cause"]["stage"] == "answer"
-    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
+    assert set(payload["secondary_findings"]["answer_issue_types"]) == {"unsupported_claim", "scope_violation"}
 
 
-def test_answer_span_scope_violation_miss_maps_answer_scope_violation() -> None:
+def test_answer_span_scope_violation_miss_maps_answer_failure_issue_type() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import orchestrate_v3, run_probe_plan
 
@@ -2431,7 +2455,8 @@ def test_answer_span_scope_violation_miss_maps_answer_scope_violation() -> None:
     assert probe["content"]["probe_results"][0]["hit"] is False
     assert probe["stage_signals"]["answer"]["scope_violation"] is True
     assert payload["primary_cause"]["stage"] == "answer"
-    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
+    assert set(payload["secondary_findings"]["answer_issue_types"]) == {"unsupported_claim", "scope_violation"}
 
 
 def test_answer_span_scope_violation_hit_supports_spaced_terms() -> None:
@@ -2489,7 +2514,8 @@ def test_required_assertions_covered_can_satisfy_answer_precondition() -> None:
 
     assert payload["oracle_status"]["point_coverage"][0]["missing_stage"] == "covered"
     assert payload["primary_cause"]["stage"] == "answer"
-    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
+    assert payload["secondary_findings"]["answer_issue_types"] == ["scope_violation"]
 
 
 def test_trace_incomplete_pattern_requires_blocking_stage() -> None:
@@ -2515,7 +2541,7 @@ def test_trace_incomplete_pattern_requires_blocking_stage() -> None:
     probe = _probe_plan_probe({"answer": {"scope_violation": True}})
     payload = orchestrate_v3(ingest=ingest, probes=[probe], mode="final")
 
-    assert payload["primary_cause"]["cause_code"] == "answer_scope_violation"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
     assert "trace_incomplete_blocking_attribution" not in payload["failure_patterns"]
     assert payload["needs_human_review"] is False
 
@@ -2596,7 +2622,7 @@ def test_doc_id_only_rerank_bypass_does_not_select_primary_without_assertion_gap
     assert payload["primary_cause"] is None
 
 
-def test_probe_plan_internal_contradiction_maps_answer_branching_unclear() -> None:
+def test_probe_plan_internal_contradiction_maps_answer_scope_issue() -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
     from findreason_core.v3 import orchestrate_v3
 
@@ -2605,7 +2631,8 @@ def test_probe_plan_internal_contradiction_maps_answer_branching_unclear() -> No
     payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
 
     assert payload["primary_cause"]["stage"] == "answer"
-    assert payload["primary_cause"]["cause_code"] == "answer_branching_unclear"
+    assert payload["primary_cause"]["cause_code"] == "answer_failure"
+    assert set(payload["secondary_findings"]["answer_issue_types"]) == {"unsupported_claim", "scope_violation"}
 
 
 def test_probe_plan_internal_contradiction_miss_maps_knowledge_inconsistency() -> None:
@@ -2624,7 +2651,7 @@ def test_probe_plan_internal_contradiction_miss_maps_knowledge_inconsistency() -
     payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
 
     assert payload["primary_cause"]["stage"] == "knowledge"
-    assert payload["primary_cause"]["cause_code"] == "knowledge_internal_inconsistency"
+    assert payload["primary_cause"]["cause_code"] == "suspected_knowledge_missing"
 
 
 def test_probe_plan_citation_miss_maps_suspected_knowledge_missing() -> None:
@@ -2755,7 +2782,7 @@ def test_run_probe_plan_transfers_exp_metadata_and_report_groups_without_p_prefi
     payload = orchestrate_v3(ingest=minimal_ingest(request), probes=[probe], mode="final")
     report = payload["human_report_markdown"]
 
-    assert "## 3. 验证过程：我怎么查的" in report
+    assert "### 验证过程" in report
     assert "### 验证 1：风险答案覆盖" in report
     assert "答案遗漏 ROI 波动风险" in report
     assert "### answer-exp" not in report
@@ -2896,7 +2923,7 @@ def test_chunk_conflict_exp_can_escalate_to_knowledge_inconsistency() -> None:
 
     assert probe["stage_signals"]["knowledge"]["internal_inconsistency"] is True
     assert payload["primary_cause"]["stage"] == "knowledge"
-    assert payload["primary_cause"]["cause_code"] == "knowledge_internal_inconsistency"
+    assert payload["primary_cause"]["cause_code"] == "suspected_knowledge_missing"
 
 
 def test_run_probe_plan_does_not_treat_unavailable_wide_recall_as_miss() -> None:
@@ -2981,16 +3008,9 @@ def test_judgement_signals_over_2kb_fails_before_trace_request(tmp_path: Path) -
     too_large = [{"key": "grader_or_rubric", "value": "x" * 3000}]
     path = case_file(tmp_path, judgement_evidence={"signals": too_large})
     with TraceServer(trace_payload()) as server:
-        result = run_cli(
-            "ingest-fornax-trace",
-            "--workspace-id",
-            "55",
-            "--log-id",
-            "log-1",
-            "--case-file",
-            str(path),
-            cwd=SKILL_ROOT,
-            env={"OPEN_PLAT_TRACE_DETAIL_URL": server.url, "HOME": str(tmp_path)},
+        result = run_ingest_with_trace_url(
+            server.url,
+            case_file_path=path,
         )
 
     assert result.returncode == 2
@@ -3028,52 +3048,384 @@ def test_fetch_workflow_nodes_preserves_nodes_edges_and_global_config(monkeypatc
     assert (tmp_path / "workflow_nodes.json").exists()
 
 
-def test_workflow_auth_resolver_does_not_use_workflow_auth_token_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def replay_missing_trace_ingest() -> dict[str, Any]:
+    return {
+        "schema_version": "v3",
+        "log_id": "log-empty",
+        "workspace_id": "138",
+        "app_id": "unknown",
+        "ingest_summary": {
+            "trace_completeness": {
+                "preprocess": "trace_missing_node",
+                "knowledge": "missing_evidence",
+                "retrieval": "trace_missing_node",
+                "rerank": "trace_missing_node",
+                "context": "missing_evidence",
+                "answer": "complete",
+                "evaluation": "complete",
+            },
+            "suggested_probe_set": ["replay-workflow"],
+            "skip_reason": {},
+            "host_action_required": [{"action": "replay-workflow", "reason": "fornax trace lacks middle-node evidence", "priority": "P0"}],
+        },
+        "raw_artifacts": {
+            "attribution_request": {
+                "case_input": {
+                    "query": "unknown query",
+                    "query_hint": "已经暂停了\n还是不行",
+                    "workspace_id": "138",
+                    "app_id": "unknown",
+                    "retrieve_query_list": [],
+                    "case_id": "row-x",
+                    "expected_knowledge_ids": [],
+                },
+                "judgement_evidence": {
+                    "source_type": "lark_sheet",
+                    "raw_text": "old evaluator result",
+                    "signals": [{"name": "knowledge_is_answered", "label": "是否回答", "passed": False}],
+                },
+                "qa": {"answer": "旧答案", "answer_satisfies_expected": False},
+                "host_agent": {
+                    "answer_claim": [
+                        {
+                            "text": "应说明暂停或其他不可投状态下是否还能以相同抖音号和相同商品创建计划。",
+                            "role": "expected_required",
+                        }
+                    ]
+                },
+            },
+            "workflow_span_ios": [],
+            "trace_summary": {"has_middle_node_trace": False},
+        },
+    }
+
+
+def test_replay_workflow_blocks_with_explicit_missing_fields_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    monkeypatch.setenv("FINDREASON_ENV_DISABLE", "true")
-    monkeypatch.delenv("OPEN_PLAT_ZS_OPEN_TOKEN", raising=False)
+    import findreason_core.v3 as v3
+
+    async def unexpected_replay(_: Any) -> Any:
+        raise AssertionError("replay_workflow should not be called when app_id is missing")
+
+    monkeypatch.setattr(v3, "replay_workflow", unexpected_replay)
+
+    payload = asyncio.run(v3.replay_workflow_v3(ingest=replay_missing_trace_ingest()))
+
+    assert payload["status"] == "blocked"
+    assert payload["telemetry"]["error"] == "missing_replay_inputs"
+    actions = payload["host_action_required"]
+    assert {"action": "provide-app-id", "field": "app_id", "reason": "workflow replay requires a numeric app_id"} in actions
+
+
+def test_replay_workflow_overrides_app_query_and_ignores_stale_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+    from findreason_core.models import AttributionRequest, EvidenceDoc, WorkflowReplayEvidence
+
+    captured: dict[str, Any] = {}
+
+    async def fake_replay(request: AttributionRequest) -> AttributionRequest:
+        captured["request"] = request.model_dump(mode="json")
+        enriched = request.model_copy(deep=True)
+        doc = EvidenceDoc(id="2226723", title="巨量千川FAQ-11月新增", content="计划暂停或者其他不可投状态下，不可以再以相同抖音号且相同商品创建计划。")
+        enriched.retrieval.origin_doc_list = [doc]
+        enriched.rerank.rerank_docs = [doc]
+        enriched.rerank.prompt_docs = [doc]
+        enriched.qa.answer = "重跑答案"
+        enriched.workflow_replay = WorkflowReplayEvidence(
+            enabled=True,
+            status="ok",
+            endpoint="https://zhishang.bytedance.net/open-exec/api/v1/workflow/1001883/completions",
+            request_payload={"input_params": [{"key": "query", "type": "String", "value": request.case_input.query}]},
+            extracted_evidence={
+                "origin_doc_list": [doc.model_dump(mode="json")],
+                "rerank_docs": [doc.model_dump(mode="json")],
+                "prompt_docs": [doc.model_dump(mode="json")],
+                "answer": "重跑答案",
+                "trace_completeness": {
+                    "has_origin_trace": True,
+                    "has_rerank_trace": True,
+                    "has_prompt_trace": True,
+                    "has_answer_trace": True,
+                    "output_only": False,
+                },
+                "node_traces": [
+                    {"node_id": "Start_ssTK", "name": "开始", "type": "Start", "input": {}, "output": {}, "status": "", "error": None},
+                    {"node_id": "ZhiShangRAGRecall_ItZu", "name": "知商召回1", "type": "ZhiShangRAGRecall", "input": {}, "output": {}, "status": "", "error": None},
+                ],
+            },
+            node_traces=[
+                {"node_id": "Start_ssTK", "name": "开始", "type": "Start", "input": {}, "output": {}, "status": "", "error": None},
+                {"node_id": "ZhiShangRAGRecall_ItZu", "name": "知商召回1", "type": "ZhiShangRAGRecall", "input": {}, "output": {}, "status": "", "error": None},
+            ],
+        )
+        return enriched
+
+    monkeypatch.setattr(v3, "replay_workflow", fake_replay)
+
+    payload = asyncio.run(
+        v3.replay_workflow_v3(
+            ingest=replay_missing_trace_ingest(),
+            app_id="1001883",
+            query="已经暂停了\n还是不行",
+        )
+    )
+
+    assert payload["status"] == "ok"
+    assert captured["request"]["case_input"]["app_id"] == "1001883"
+    assert captured["request"]["case_input"]["query"] == "已经暂停了\n还是不行"
+    assert captured["request"]["judgement_evidence"]["signals"] == []
+    assert "judgement_evidence" not in json.dumps(payload["raw_artifacts"]["request_payload"], ensure_ascii=False)
+    assert "signals" not in json.dumps(payload["raw_artifacts"]["request_payload"], ensure_ascii=False)
+    assert payload["stage_signals"]["context"]["node_traces"][1]["type"] == "ZhiShangRAGRecall"
+    assert payload["stage_signals"]["retrieval"]["origin_doc_list"][0]["id"] == "2226723"
+    assert payload["stage_signals"]["rerank"]["prompt_docs"][0]["id"] == "2226723"
+
+
+def test_replay_workflow_uses_query_hint_when_trace_query_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+    from findreason_core.models import AttributionRequest
+
+    captured: dict[str, Any] = {}
+
+    async def fake_replay(request: AttributionRequest) -> AttributionRequest:
+        captured["query"] = request.case_input.query
+        enriched = request.model_copy(deep=True)
+        enriched.workflow_replay.status = "ok"
+        enriched.workflow_replay.request_payload = {"input_params": [{"key": "query", "value": request.case_input.query}]}
+        return enriched
+
+    monkeypatch.setattr(v3, "replay_workflow", fake_replay)
+
+    payload = asyncio.run(v3.replay_workflow_v3(ingest=replay_missing_trace_ingest(), app_id="1001883"))
+
+    assert payload["status"] == "ok"
+    assert captured["query"] == "已经暂停了\n还是不行"
+
+
+def test_orchestrate_merges_replay_docs_for_downstream_analysis() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+
+    request = {
+        "case_input": {
+            "query": "已经暂停了\n还是不行",
+            "workspace_id": "138",
+            "app_id": "1001883",
+            "expected_knowledge_ids": ["2226723"],
+        },
+        "host_agent": {
+            "answer_claim": [
+                {
+                    "text": "计划暂停或者其他不可投状态下，不可以再以相同抖音号且相同商品创建计划。",
+                    "role": "expected_required",
+                }
+            ]
+        },
+        "qa": {"answer": "重跑答案", "answer_satisfies_expected": False},
+    }
+    probe = {
+        "probe_name": "replay-workflow",
+        "status": "ok",
+        "stage_signals": {
+            "retrieval": {
+                "origin_doc_list": [
+                    {
+                        "id": "2226723",
+                        "title": "巨量千川FAQ-11月新增",
+                        "content": "计划暂停或者其他不可投状态下，不可以再以相同抖音号且相同商品创建计划。",
+                    }
+                ],
+                "online_retrieval_hit": True,
+                "expected_knowledge_hit": True,
+                "knowledge_exists": True,
+            },
+            "rerank": {
+                "rerank_docs": [
+                    {
+                        "id": "2226723",
+                        "title": "巨量千川FAQ-11月新增",
+                        "content": "计划暂停或者其他不可投状态下，不可以再以相同抖音号且相同商品创建计划。",
+                    }
+                ],
+                "prompt_docs": [
+                    {
+                        "id": "2226723",
+                        "title": "巨量千川FAQ-11月新增",
+                        "content": "计划暂停或者其他不可投状态下，不可以再以相同抖音号且相同商品创建计划。",
+                    }
+                ],
+                "expected_doc_survived_rerank": True,
+                "expected_doc_in_prompt": True,
+            },
+            "answer": {"answer": "重跑答案"},
+        },
+    }
+
+    merged, _ = v3._merge_probe_signals(request, [probe])
+
+    assert merged["retrieval"]["origin_doc_list"][0]["id"] == "2226723"
+    assert merged["rerank"]["rerank_docs"][0]["id"] == "2226723"
+    assert merged["rerank"]["prompt_docs"][0]["id"] == "2226723"
+    assert merged["retrieval"]["knowledge_exists"] is True
+    assert merged["qa"]["answer"] == "重跑答案"
+
+
+def test_report_counts_replay_docs_when_trace_counts_are_empty() -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    import findreason_core.v3 as v3
+
+    request = {
+        "case_input": {
+            "query": "已经暂停了还是不行",
+            "workspace_id": "138",
+            "app_id": "1001883",
+        },
+    }
+    probe = {
+        "probe_name": "replay-workflow",
+        "status": "ok",
+        "stage_signals": {
+            "retrieval": {
+                "origin_doc_list": [{"id": "d1", "title": "重跑召回文档", "content": "重跑召回内容"}],
+                "origin_faq_list": [{"id": "f1", "title": "重跑 FAQ", "content": "FAQ 内容"}],
+                "knowledge_exists": True,
+            },
+            "rerank": {
+                "rerank_docs": [{"id": "d1", "title": "重跑召回文档", "content": "重跑召回内容"}],
+                "prompt_docs": [{"id": "d1", "title": "重跑召回文档", "content": "重跑召回内容"}],
+            },
+            "answer": {"answer": "重跑答案"},
+        },
+    }
+    ingest = minimal_ingest(request)
+    ingest["raw_artifacts"]["trace_summary"] = {"counts": {"origin_doc_list": 0, "origin_faq_list": 0, "rerank_docs": 0, "prompt_docs": 0}}
+
+    payload = v3.orchestrate_v3(ingest=ingest, probes=[probe], mode="final")
+
+    assert "线上文档数量：origin=`1`，faq=`1`，rerank=`1`，prompt=`1`" in payload["human_report_markdown"]
+
+
+def test_workflow_auth_resolver_uses_fixed_bootstrap_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+    from findreason_core import workflow_replay
+
+    monkeypatch.setenv("OPEN_PLAT_ZS_OPEN_TOKEN", "wrong-env-token")
     monkeypatch.setenv("WORKFLOW_AUTH_TOKEN", "wrong-workspace-token")
-    from findreason_core.workflow_replay import resolve_workflow_auth_token
 
-    token, source = asyncio.run(resolve_workflow_auth_token("55"))
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
 
-    assert token is None
-    assert source == "not_configured"
+        def json(self) -> dict[str, Any]:
+            return {"code": 0, "data": {"authInfo": {"apiKey": "workspace-key"}}}
+
+    class FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def get(self, url: str, **kwargs: Any) -> FakeResponse:
+            self.requests.append({"url": url, **kwargs})
+            fake_client_requests.extend(self.requests)
+            return FakeResponse()
+
+    fake_client_requests: list[dict[str, Any]] = []
+    monkeypatch.setattr(workflow_replay.httpx, "AsyncClient", FakeAsyncClient)
+
+    token, source = asyncio.run(workflow_replay.resolve_workflow_auth_token("55"))
+
+    assert token == "workspace-key"
+    assert source == "workspace_info_api:fixed_source_constant"
+    assert fake_client_requests[0]["headers"]["Authorization"] == f"Bearer {workflow_replay.OPEN_PLAT_ZS_OPEN_TOKEN}"
+    assert "wrong-env-token" not in json.dumps(fake_client_requests, ensure_ascii=False)
 
 
-def test_static_openplat_token_has_no_bearer_prefix_when_configured() -> None:
-    config = json.loads((SKILL_ROOT / "config" / "runtime_defaults.json").read_text(encoding="utf-8"))
-    zs_open_token = config["OPEN_PLAT_ZS_OPEN_TOKEN"]
-    assert not zs_open_token.lower().startswith("bearer ")
-    assert "OPEN_PLAT_TRACE_TOKEN" not in config
-    assert "OPEN_PLAT_BOOTSTRAP_TOKEN" not in config
-
-
-def test_openplat_auth_reads_only_zs_open_token(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fixed_runtime_constants_are_source_of_truth(monkeypatch: pytest.MonkeyPatch) -> None:
     sys.path.insert(0, str(SKILL_ROOT / "scripts"))
-    from findreason_core.v3 import _openplat_token
+    import findreason_core.v3 as v3
+    from findreason_core import workflow_replay
 
-    monkeypatch.delenv("OPEN_PLAT_ZS_OPEN_TOKEN", raising=False)
-    monkeypatch.setenv("OPEN_PLAT_TRACE_TOKEN", "jwt-token")
+    monkeypatch.setenv("OPEN_PLAT_ZS_OPEN_TOKEN", "wrong-env-token")
 
-    token, source = _openplat_token()
+    assert v3.OPEN_PLAT_ZS_OPEN_TOKEN == "37160d0535224506965a54e58e0685c4"
+    assert workflow_replay.OPEN_PLAT_ZS_OPEN_TOKEN == v3.OPEN_PLAT_ZS_OPEN_TOKEN
+    assert not v3.OPEN_PLAT_ZS_OPEN_TOKEN.lower().startswith("bearer ")
+    assert v3._openplat_token() == (v3.OPEN_PLAT_ZS_OPEN_TOKEN, "fixed_source_constant")
+    assert workflow_replay._openplat_bootstrap_token() == (
+        workflow_replay.OPEN_PLAT_ZS_OPEN_TOKEN,
+        "fixed_source_constant",
+    )
+    assert v3.OPEN_PLAT_TRACE_DETAIL_URL == "http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail"
+    assert v3.OPEN_PLAT_WORKSPACE_INFO_URL == "https://zhishang.bytedance.net/open-plat/api/workspace/get-workspace-info"
+    assert v3.KNOWLEDGE_DETAIL_URL == "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id"
+    assert workflow_replay.WORKFLOW_OPEN_EXEC_BASE_URL == "https://zhishang.bytedance.net"
+    assert workflow_replay.WORKFLOW_RDS_DATABASE == "zs_open"
 
-    assert token == ""
-    assert source == "not_configured"
 
-    monkeypatch.setenv("OPEN_PLAT_ZS_OPEN_TOKEN", "fixed-token")
+def test_runtime_code_no_longer_depends_on_env_bootstrap_files() -> None:
+    runtime_files = [
+        SKILL_ROOT / "scripts" / "findreason_core" / "v3.py",
+        SKILL_ROOT / "scripts" / "findreason_core" / "workflow_replay.py",
+        SKILL_ROOT / "scripts" / "findreason.py",
+    ]
+    forbidden = [
+        "load_runtime_env",
+        "dotenv",
+        "FINDREASON_ENV_",
+        "runtime_defaults",
+    ]
 
-    token, source = _openplat_token()
+    offenders: list[str] = []
+    for path in runtime_files:
+        text = path.read_text(encoding="utf-8")
+        for term in forbidden:
+            if term in text:
+                offenders.append(f"{path.relative_to(SKILL_ROOT)}: {term}")
+        if path.name == "v3.py":
+            for term in ("OPEN_PLAT_ZS_OPEN_TOKEN", "OPEN_PLAT_TRACE_DETAIL_URL", "OPEN_PLAT_WORKSPACE_INFO_URL", "KNOWLEDGE_DETAIL_URL", "WIDE_RECALL_TOPK"):
+                assert f"os.getenv(\"{term}\"" not in text
+        if path.name == "workflow_replay.py":
+            for term in (
+                "OPEN_PLAT_ZS_OPEN_TOKEN",
+                "OPEN_PLAT_WORKSPACE_INFO_URL",
+                "WORKFLOW_RDS_DATABASE",
+                "WORKFLOW_OPEN_EXEC_BASE_URL",
+                "BYTEDCLI_BIN",
+                "WORKFLOW_RDS_TIMEOUT_SECONDS",
+                "FINDREASON_LIVE",
+            ):
+                assert f"os.getenv(\"{term}\"" not in text
 
-    assert token == "fixed-token"
-    assert source == "OPEN_PLAT_ZS_OPEN_TOKEN"
+    assert offenders == []
+    assert not (SKILL_ROOT / "scripts" / "findreason_core" / "env.py").exists()
+    assert not (SKILL_ROOT / "config" / "runtime_defaults.json").exists()
+    assert not (SKILL_ROOT / ".env.example").exists()
+    assert "python-dotenv" not in (SKILL_ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+
+def test_skill_documents_fixed_source_runtime_contract() -> None:
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    env_doc = (SKILL_ROOT / "references" / "env.md").read_text(encoding="utf-8")
+
+    assert "源码固定常量" in skill
+    assert "不要设置 env 期望改变运行行为" in skill
+    assert "运行前必须先读 `references/env.md`" not in skill
+    assert "历史废弃说明" in env_doc
+    assert "不再作为当前运行配置入口" in env_doc
+    assert "FINDREASON_ENV_FILE" not in env_doc
+    assert "runtime_defaults.json" not in skill
 
 
 def test_project_contract_does_not_document_old_field_aliases() -> None:
     files = [
         SKILL_ROOT / "SKILL.md",
-        SKILL_ROOT / ".env.example",
-        SKILL_ROOT / "config" / "runtime_defaults.json",
         *sorted((SKILL_ROOT / "references").glob("*.md")),
     ]
     forbidden_terms = [

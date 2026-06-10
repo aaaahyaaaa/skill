@@ -33,7 +33,6 @@ from findreason_core.v3 import (
 
 
 PROBE_COMMANDS = [
-    "probe-self-oracle",
     "probe-knowledge-detail",
     "probe-permission-check",
     "probe-wide-recall",
@@ -279,7 +278,13 @@ async def _cmd_replay_workflow_async(args: argparse.Namespace) -> int:
     overrides = read_json_arg(args.override, {}) if args.override else {}
     if not isinstance(overrides, dict):
         raise V3Error("E_REPLAY_OVERRIDE_INVALID", "--override must be a JSON object or @file.", status_code=2)
-    payload = await replay_workflow_v3(ingest=ingest, overrides=overrides, output_dir=args.output_dir)
+    payload = await replay_workflow_v3(
+        ingest=ingest,
+        overrides=overrides,
+        output_dir=args.output_dir,
+        app_id=args.app_id,
+        query=args.query,
+    )
     _print_json(payload)
     return 0
 
@@ -308,7 +313,11 @@ def _cmd_schema(args: argparse.Namespace) -> int:
                 "probe_optional_fields": ["display_name", "exp_kind", "trigger_source", "trigger_observation", "hypothesis"],
             },
             "fetch-workflow-nodes": {"required": ["workspace_id", "app_id"]},
-            "replay-workflow": {"required": ["ingest_file or workspace_id+log_id"], "exclusive": True},
+            "replay-workflow": {
+                "required": ["ingest_file or workspace_id+log_id"],
+                "optional": ["app_id", "query", "override", "output_dir"],
+                "exclusive": True,
+            },
         },
         "stage_order": STAGE_ORDER,
         "cause_enum": sorted(CAUSE_ENUM),
@@ -372,9 +381,6 @@ def _add_probe_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     parser.add_argument("--no-cache", action="store_true")
     if command in {"probe-knowledge-detail", "probe-permission-check", "probe-rerank-bypass", "probe-context-assembly"}:
         parser.add_argument("--doc-ids")
-    if command == "probe-self-oracle":
-        parser.add_argument("--signals", default="judgement_back_recall,claim_back_recall,query_wide_recall")
-        parser.add_argument("--topk", type=int, default=50)
     if command == "probe-wide-recall":
         parser.add_argument("--topk", type=int, default=50)
     parser.set_defaults(func=_cmd_probe)
@@ -402,6 +408,8 @@ def _add_workflow_parsers(subparsers: argparse._SubParsersAction[argparse.Argume
     replay.add_argument("--ingest-file")
     replay.add_argument("--workspace-id")
     replay.add_argument("--log-id")
+    replay.add_argument("--app-id")
+    replay.add_argument("--query")
     replay.add_argument("--override")
     replay.add_argument("--output-dir")
     replay.set_defaults(func=_cmd_replay_workflow)

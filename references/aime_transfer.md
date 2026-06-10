@@ -8,7 +8,6 @@
 - `scripts/findreason_core/`
 - `references/`
 - `requirements.txt`
-- `config/runtime_defaults.json`
 
 宿主应通过 `python -m findreason` 调用。
 
@@ -40,6 +39,4 @@ python -m findreason orchestrate \
 
 ## 配置
 
-`config/runtime_defaults.json` 不应包含真实 token。通过导出的环境变量或宿主本地 env 文件提供 `OPEN_PLAT_ZS_OPEN_TOKEN`，值不带 `Bearer` 前缀；不要再使用旧 token 变量名。
-
-当宿主需要使用不同 token 或 endpoint 时，导出的环境变量仍然优先于项目默认配置。
+当前 CLI 使用源码固定常量，不再读取 `config/runtime_defaults.json`、`.env.local` 或导出的环境变量来改写 token / endpoint。宿主需要更换 token 或 endpoint 时，必须修改对应 CLI 源码常量并重新验证。

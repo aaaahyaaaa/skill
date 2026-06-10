@@ -68,7 +68,7 @@ Workflow 原始输入
 预处理输出 rewrite_query / keywords
 ```
 
-如果用户实际问题或评估器用户上下文中的关键场景约束没有进入 Workflow 原始输入，先记录输入边界风险；只有受影响的 `expected_required` 在理论召回上界可支撑、但 online origin recall 缺失时，才归因到 `workflow_input_loss`。如果同一断言已经被 online origin / rerank / prompt 支撑，继续判断下游阶段。若 Workflow 原始输入保留了这些约束，但 rewrite / keywords 丢失，再判断 `query_rewrite_drift` 或 `keyword_loss`。
+如果用户实际问题或评估器用户上下文中的关键场景约束没有进入 Workflow 原始输入，先记录输入边界风险；只有受影响的 `expected_required` 在理论召回上界可支撑、但 online origin recall 缺失时，才归因到 `workflow_input_loss`。如果同一断言已经被 online origin / rerank / prompt 支撑，继续判断下游阶段。若 Workflow 原始输入保留了这些约束，但 rewrite / keywords 丢失并影响召回，也并入 `workflow_input_loss`。
 
 ## 输出
 
@@ -99,8 +99,7 @@ Agent planning 输出两个对象，并可在执行过程中增量更新：
 {
   "text": "品牌客户可以在后台的“品牌投放-品牌竞价”找到一元试投入口。",
   "role": "answer_claim",
-  "basis": ["workflow_output"],
-  "confidence": 0.8
+  "basis": ["workflow_output"]
 }
 ```
 
@@ -134,7 +133,7 @@ Agent planning 输出两个对象，并可在执行过程中增量更新：
 | 观察 | assertion / probe 倾向 |
 |-|-|
 | origin 有支撑、rerank 或 prompt 丢失 | `expected_required` + `rerank-exp` / `context-exp` |
-| prompt 已包含限制但答案遗漏 | `expected_required` + `answer-exp`，必要时 `partial_answer` |
+| rerank 后已有必要支撑但答案遗漏 | `expected_required` + `answer-exp`，记录 `missing_aspect` |
 | 答案引用停用或 stale 文档 | `answer_claim` + `citation-exp`，检查引用是否支撑且是否有更新来源 |
 | prompt 混入冲突材料但答案未区分前提 | `chunk-conflict-exp` 或 `answer-exp` |
 | 文档只标题命中、正文无支撑 | 不计入覆盖；生成更具体的 `expected_required` 或 wide recall 检查 |
@@ -147,13 +146,13 @@ Agent planning 输出两个对象，并可在执行过程中增量更新：
 
 ```text
 用户约束未进入 Workflow 原始输入，且受影响断言上界可支撑但线上初召回缺失 -> workflow_input_loss
-Workflow 输入保留约束，但 rewrite / keywords 丢失 -> query_rewrite_drift / keyword_loss
+Workflow 输入保留约束，但 rewrite / keywords 丢失并影响召回 -> workflow_input_loss
 KB / wide recall 不支撑 -> suspected_knowledge_missing 或 human_review
 KB 支撑，origin 未召回 -> retrieval_miss
 origin 支撑，rank/rerank 丢失 -> rerank_drop
-rank 后支撑，prompt/context 丢失 -> context_assembly_error
-prompt/context 支撑，output 未覆盖 -> partial_answer
-prompt/context 支撑，output 越界 -> answer_scope_violation
+rank 后支撑，prompt/context 丢失 -> prompt/context 观察，不作为顶层主因
+rerank 后有必要支撑，output 未覆盖 -> answer_failure + missing_aspect
+rerank 后有必要支撑，output 越界 -> answer_failure + scope_violation
 ```
 
 如果 workflow 只输出文档，没有自然语言答案，最后一步检查 `output_artifact` 是否包含能支撑 `expected_required` 的文档；answer 阶段通常不适用。
@@ -163,31 +162,32 @@ prompt/context 支撑，output 越界 -> answer_scope_violation
 `answer_claim` 验证 output 是否 grounded：
 
 ```text
-prompt/context 支撑 -> grounded
-prompt 不支撑，且 KB / 引用也不支撑 -> unsupported_claim
+rerank 后支撑 -> grounded
+rerank 后不支撑，且 KB / 引用也不支撑 -> 上游知识或召回问题；unsupported_claim 只作为答案症状
 prompt 不支撑，但 KB 另有支撑 -> answer grounding 问题，不反推 retrieval/rerank
-引用文档不支持 claim -> wrong_citation
-claim 与 expected_required 的约束不匹配 -> answer_scope_violation
-claims 内部分支混用 -> answer_branching_unclear
+引用文档不支持 claim -> answer_failure + wrong_citation
+claim 与 expected_required 的约束不匹配 -> answer_failure + scope_violation
+claims 内部分支混用 -> answer_failure + scope_violation
 ```
 
 ### Citation
 
 ```text
 没有引用且任务不要求引用 -> 不归因
-引用链接不可用 -> wrong_citation，subtype=citation_unavailable
-引用文档存在但不支持 claim -> wrong_citation
+引用链接不可用 -> answer_failure + wrong_citation，subtype=citation_unavailable
+引用文档存在但不支持 claim -> answer_failure + wrong_citation
 需要官方来源，KB 无权威来源 -> suspected_knowledge_missing
 KB 有官方来源但 origin 未召回 -> retrieval_miss
-origin 有但 prompt/context 未承接 -> context_assembly_error
+origin 有但 rerank 丢失 -> rerank_drop
+rerank 有但 prompt/context 未承接 -> prompt/context 观察
 ```
 
 ### Consistency
 
 ```text
-KB 自身冲突且无清晰适用前提 -> knowledge_internal_inconsistency
-KB 有清晰前提但 output 混用分支 -> answer_branching_unclear
-prompt/context 拼入冲突材料且未提供可区分前提 -> context_assembly_error 或 answer_branching_unclear
+KB 自身冲突且无清晰适用前提 -> suspected_knowledge_missing
+KB 有清晰前提但 output 混用分支 -> answer_failure + scope_violation
+prompt/context 拼入冲突材料且未提供可区分前提 -> chunk_conflict 观察；若答案混用分支则 answer_failure + scope_violation
 ```
 
 ## 禁止事项

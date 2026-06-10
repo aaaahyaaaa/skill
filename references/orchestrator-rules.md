@@ -1,12 +1,18 @@
 # v3 编排规则
 
-阶段顺序为：
+主因阶段顺序为：
 
 ```text
-preprocess -> knowledge -> retrieval -> rerank -> context -> answer -> evaluation
+preprocess -> knowledge -> retrieval -> rerank -> answer
 ```
 
-对每个阶段，`orchestrate` 都会输出一个 verdict，其中包含 `stage`、`status`、`evidence_ids`、`counterfactual` 和 `upstream_blocked_by`。失败 verdict 还会包含 `candidate_cause`、`confidence` 和 `owner`。
+`orchestrate` 仍可在 `evidence_chain` 中保留 `context` 和 `evaluation` 观察 verdict，但它们不产生顶层 `candidate_cause`。失败 verdict 只允许输出 5 类 cause：`workflow_input_loss`、`suspected_knowledge_missing`、`retrieval_miss`、`rerank_drop`、`answer_failure`。
+
+推荐诊断流程：
+
+1. 先做 answer symptom extraction：抽取 `unsupported_claim`、`wrong_citation`、`missing_aspect`、`scope_violation`，写入 `secondary_findings.answer_issue_types`。
+2. 再做 upstream evidence chain：检查 preprocess / knowledge / retrieval / rerank 的断言级证据链。
+3. 最后选择 `candidate_cause`：选择最早断点；如果上游都通过或必要证据已通过 rerank，才落到 `answer_failure`。
 
 主因选择规则：
 
@@ -25,4 +31,14 @@ preprocess -> knowledge -> retrieval -> rerank -> context -> answer -> evaluatio
 
 如果同一断言已经被 online origin / rerank / prompt 支撑，说明 Workflow 原始输入差异没有切断正确证据链，preprocess 不应阻断下游归因。若理论召回上界也不支撑该断言，则优先判断知识缺口或人工复核。
 
-以下情况需要人工复核：preliminary mode、低置信度、重试后知识存在性仍为 unknown、trace 不完整阻塞归因、replay 与 trace 不一致、probe 证据相互矛盾、或主因为 null。
+`answer_failure` 的前置条件：
+
+1. `qa.answer_satisfies_expected=false`。
+2. `qa.prompt_supports_answer=true`，或断言覆盖显示必要支撑已通过 rerank。
+3. knowledge / retrieval / rerank 没有更早断点。
+
+答案层细节只进入 `secondary_findings.answer_issue_types`。即使答案存在多种症状，只要上游有更早断点，顶层主因仍停在上游。
+
+Prompt/context 当前不是独立归因阶段。`missing_expected_points_from_prompt`、`expected_doc_in_prompt=false`、prompt truncation 和 noise overload 只作为 trace 观察，不选择 `context_assembly_error`，也不阻塞答案层裁决。
+
+以下情况需要人工复核：preliminary mode、重试后知识存在性仍为 unknown、trace 不完整阻塞归因、replay 与 trace 不一致、probe 证据相互矛盾、或主因为 null。

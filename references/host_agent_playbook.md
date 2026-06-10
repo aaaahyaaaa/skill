@@ -22,12 +22,12 @@ trace hydration
 - 运行验证前，先执行 Agent attribution planning：消费 trace artifacts、动态 backlog 和 `judgement_evidence.signals`，生成 assertion set 与必要 `{stage}-exp`。详细规则见 `references/agent_attribution_planning.md`。
 - 字段契约只保留最新约定字段。不要提供旧字段、旧 role 或旧 schema alias；外部输入出现过时断言字段时 CLI 会 fail fast。
 - `host_agent.answer_claim` 是唯一 assertion set 输入字段，必须使用嵌套结构 `{"host_agent": {"answer_claim": [...]}}`。每项必须是对象并包含 `text`、`role`。核心 role 是 `expected_required` 和 `answer_claim`。
-- `expected_required` 用于判断 knowledge、retrieval、rerank、context 缺口。CLI 会保守合并“场景约束 + 同一入口/路径要求”的包含/细化断言，`basis` 取并集，原始断言保存在 `merged_from`，覆盖矩阵只看合并后的行。`answer_claim` 是从 workflow output 中抽取出的可验证命题 X，用于 grounding、scope、citation 和 consistency 检查；文本不要写成“答案称 X”。
-- 归因前先看输入边界：如果用户实际问题或评估器用户上下文包含关键场景约束，但 `raw_artifacts.workflow_span_ios[].input` 中的 Workflow 原始输入已丢失，先记录输入边界风险；只有受影响的 `expected_required` 在理论召回上界可支撑、但线上初召回缺失时，主因才停在 `workflow_input_loss`。如果正确断言已经进入 online origin / rerank / prompt，不能把该 badcase 归因为输入丢失，应继续判断 rerank、context 或 answer。
+- `expected_required` 用于判断 knowledge、retrieval、rerank 缺口；prompt/context 生存状态只作为观察。CLI 会保守合并“场景约束 + 同一入口/路径要求”的包含/细化断言，`basis` 取并集，原始断言保存在 `merged_from`，覆盖矩阵只看合并后的行。`answer_claim` 是从 workflow output 中抽取出的可验证命题 X，用于 grounding、scope、citation 和 consistency 检查；文本不要写成“答案称 X”。
+- 归因前先看输入边界：如果用户实际问题或评估器用户上下文包含关键场景约束，但 `raw_artifacts.workflow_span_ios[].input` 中的 Workflow 原始输入已丢失，先记录输入边界风险；只有受影响的 `expected_required` 在理论召回上界可支撑、但线上初召回缺失时，主因才停在 `workflow_input_loss`。如果正确断言已经进入 online origin / rerank / prompt，不能把该 badcase 归因为输入丢失，应继续判断 rerank 或 answer。
 - 如果 ingest 返回 `host_action_required[].action=generate-probe-plan`，按照 Agent planning playbook 构造 assertion set 和兼容 `probe-v1` 验证计划，并把 `expected_required` / `answer_claim` 写入 `host_agent.answer_claim`。用更新后的 case 文件重新运行 ingest，再执行 `run-probe-plan` 或相关 `{stage}-exp`，最后再 `orchestrate`。
 - 不要从 query 文本、评估器维度、通过/失败标签、空回复诊断或任意 rubric / judgement 长片段中让 CLI 创建期望断言；这一步必须由宿主 Agent 显式完成。
 - 不要把断言放入 `case_input.expected_knowledge_points`、`qa.answer_claims`、`qa.missing_expected_points`、`qa.unsupported_claims`、`qa.claim_alignments` 或 `judgement_evidence.signals[].assertions/fact_points/missing_expected_points`；旧字段非空会报 `E_LEGACY_ASSERTION_INPUT`。
-- 将 unsupported claims 抽到 assertion set；`wrong_citations` 和答案前置条件字段单独保留。
+- 先抽取答案症状：unsupported claim、wrong citation、missing aspect、scope violation / branching unclear。它们最终进入 `secondary_findings.answer_issue_types`，用于解释答案错在哪里；只有上游 evidence chain 通过时，顶层主因才会落到 `answer_failure`。
 - 读取 `ingest_summary.suggested_probe_set`，除非用户要求特定分支，否则只运行推荐或 backlog 证明必要的 `{stage}-exp`。
 - 从 `orchestrate` JSON 渲染最终报告，并显式展示 `needs_human_review` 原因。
 - 如果没有 `expected_required` 断言，应预期 `oracle_status.source=insufficient_assertions`；若需要上游归因，补充 assertion set 后重跑。
@@ -51,7 +51,7 @@ trace hydration
 
 - 关键断言在召回链路不清楚：生成 `retrieval-exp`，验证 query/rewrite/keyword/topK/open-label/permission。
 - origin 有支撑但 rerank 丢失：生成 `rerank-exp`，验证 bypass、阈值或排序恢复信号。
-- prompt 已有支撑但答案未覆盖或越界：生成 `answer-exp`。
+- rerank 后已有必要支撑但答案未覆盖、错引或越界：生成 `answer-exp` / `citation-exp`。
 - 引用文档停用或不支撑 claim：生成 `citation-exp`。
 - chunk 内部冲突：生成 `chunk-conflict-exp`。
 - trace 缺中间节点：再考虑 `fetch-workflow-nodes` / `replay-workflow`，并标低证据质量。
@@ -62,7 +62,7 @@ trace hydration
 
 1. 运行 `python -m findreason ingest-fornax-trace --workspace-id <ws> --log-id <log> --case-file <case.json> --output-dir <case-dir>`。
 2. 检查 `ingest_summary.trace_completeness`、`suggested_probe_set`、`host_action_required` 和 `raw_artifacts`。
-3. 做动态诊断 backlog：读取 workflow input/output、rewrite/keywords、origin/rerank/prompt 数量、关键文档生存路径、停用或 stale 来源、引用支撑、prompt-vs-answer alignment、chunk 冲突风险。
+3. 先做 answer symptom extraction，再做动态诊断 backlog：读取 workflow input/output、rewrite/keywords、origin/rerank/prompt 数量、关键文档生存路径、停用或 stale 来源、引用支撑、prompt-vs-answer alignment、chunk 冲突风险。
 4. 如果需要 `generate-probe-plan`，用 trace artifacts、backlog 和 evaluator signals 生成 assertion set 和兼容 `plan.json`，用 `host_agent.answer_claim` 更新 `case.json`，重新 ingest，然后执行 `run-probe-plan`。
 5. 将推荐或 backlog 证明必要的 `{stage}-exp` 运行到 `<case-dir>/probes/`。除 `replay-workflow` 外，独立验证环节可以并行；不要固定运行所有 probes。
 6. 运行 `python -m findreason orchestrate --ingest-file <case-dir>/ingest.json --probe-dir <case-dir>/probes --mode final --schema-version v3 --output-dir <case-dir>/final`。
@@ -79,8 +79,9 @@ trace hydration
 - Case 标识：`log_id`、`workspace_id`、`app_id`、`case_id/source_row`。
 - Trace 摘要：节点完整性、origin/rerank/prompt 数量、workflow span 输入/输出摘录。
 - 现场观察摘要：文档生存路径、stale / 停用来源、引用支撑、prompt-vs-answer alignment。
-- 主因：stage、cause_code、confidence、owner、rationale。
+- 主因：stage、cause_code、owner、rationale。
 - 断言覆盖矩阵：断言文本、role、source、线上初召回、rerank、prompt；只展示去重后的 `expected_required`，`merged_from` 只作审计；只有带 `full_support` / `partial_support` 正文片段的文档才计入，并在单独的“理论召回上界与断言关系”小节列出支撑片段。
-- 证据链：带 counterfactual 和 `upstream_blocked_by` 的阶段 verdict。
+- 答案症状：展示 `secondary_findings.answer_issue_types` 和候选解释。
+- 证据链：带 counterfactual 和 `upstream_blocked_by` 的阶段 verdict；context/prompt 只作为观察，不作为主因阶段。
 - Failure patterns 和 next actions。
 - 当 `needs_human_review=true` 时，报告中必须明确提示人工复核。
