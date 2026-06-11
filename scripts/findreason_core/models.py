@@ -15,12 +15,6 @@ class Stage(str, Enum):
     UNKNOWN = "unknown"
 
 
-class VerdictStatus(str, Enum):
-    PASS = "pass"
-    FAIL = "fail"
-    UNCERTAIN = "uncertain"
-
-
 class EvidenceDoc(BaseModel):
     id: Optional[str] = None
     title: str = ""
@@ -113,30 +107,6 @@ class FieldMapEntry(BaseModel):
     normalized_value: Any = None
     confidence: float = 0.0
     missing_reason: Optional[str] = None
-
-
-class ImmediateFailure(BaseModel):
-    stage: Stage = Stage.UNKNOWN
-    cause: str = "uncertain"
-    explanation: str = ""
-    evidence_refs: List[str] = Field(default_factory=list)
-
-
-class CausalPathStep(BaseModel):
-    order: int
-    stage: Stage
-    event: str
-    evidence_refs: List[str] = Field(default_factory=list)
-
-
-class ConfidenceBreakdown(BaseModel):
-    evidence_quality: float = 0.0
-    metric_strength: float = 0.0
-    reference_confidence: float = 0.0
-    counterfactual_lift: float = 0.0
-    cross_skill_consistency: float = 0.0
-    field_mapping_confidence: float = 0.0
-    penalty: float = 0.0
 
 
 class PreprocessEvidence(BaseModel):
@@ -337,114 +307,3 @@ class AttributionRequest(BaseModel):
     wide_recall: WideRecallEvidence = Field(default_factory=WideRecallEvidence)
     knowledge_detail: KnowledgeDetailEvidence = Field(default_factory=KnowledgeDetailEvidence)
     contrastive_probe: ContrastiveProbeEvidence = Field(default_factory=ContrastiveProbeEvidence)
-
-
-class EvidenceRecord(BaseModel):
-    stage: Stage
-    field: str
-    reason: str
-    value: Any = None
-    source_path: Optional[str] = None
-
-
-class StageVerdict(BaseModel):
-    stage: Stage
-    status: VerdictStatus
-    candidate_cause: str
-    confidence: float
-    owner: str
-    suggested_action: str
-    evidence: List[EvidenceRecord] = Field(default_factory=list)
-
-
-class EvidenceRequirementReport(BaseModel):
-    field: str
-    description: str
-    required: bool = True
-
-
-class DiagnosticResult(BaseModel):
-    spec_id: str
-    domain: str
-    stage: Stage
-    status: VerdictStatus
-    candidate_cause: str
-    confidence: float
-    owner: str
-    suggested_action: str
-    matched_rule_id: Optional[str] = None
-    evidence_requirements: List[EvidenceRequirementReport] = Field(default_factory=list)
-    evidence: List[EvidenceRecord] = Field(default_factory=list)
-    metrics: Dict[str, Any] = Field(default_factory=dict)
-
-    def to_stage_verdict(self) -> StageVerdict:
-        return StageVerdict(
-            stage=self.stage,
-            status=self.status,
-            candidate_cause=self.candidate_cause,
-            confidence=self.confidence,
-            owner=self.owner,
-            suggested_action=self.suggested_action,
-            evidence=self.evidence,
-        )
-
-
-class SkillProbe(BaseModel):
-    marker: str
-    skill_name: str
-    observed_input_keys: List[str] = Field(default_factory=list)
-    observed_output_keys: List[str] = Field(default_factory=list)
-    instruction: str = ""
-
-
-class ReferenceChainStep(BaseModel):
-    name: str
-    status: str
-    summary: str = ""
-    evidence: List[EvidenceRecord] = Field(default_factory=list)
-    suggested_next_action: str = ""
-    skill_input: Any = None
-    skill_output: Any = None
-    skill_probe: Optional[SkillProbe] = None
-
-
-class AgentTraceStep(BaseModel):
-    step_index: int
-    tool_name: str
-    status: str
-    summary: str = ""
-    planner_reason: str = ""
-    duration_ms: float = 0.0
-    error: Optional[str] = None
-    input: Any = None
-    output: Any = None
-
-
-class AttributionResponse(BaseModel):
-    run_id: Optional[str] = None
-    case_id: Optional[str] = None
-    field_map: Dict[str, FieldMapEntry] = Field(default_factory=dict)
-    immediate_failure: ImmediateFailure = Field(default_factory=ImmediateFailure)
-    primary_cause: str
-    primary_stage: Optional[Stage]
-    secondary_causes: List[str] = Field(default_factory=list)
-    causal_path: List[CausalPathStep] = Field(default_factory=list)
-    confidence: float
-    confidence_breakdown: ConfidenceBreakdown = Field(default_factory=ConfidenceBreakdown)
-    owner: str
-    suggested_action: str
-    evidence: List[EvidenceRecord] = Field(default_factory=list)
-    stage_verdicts: List[StageVerdict] = Field(default_factory=list)
-    reference_chain: List[ReferenceChainStep] = Field(default_factory=list)
-    evidence_chain: List[ReferenceChainStep] = Field(default_factory=list)
-    diagnostic_results: List[DiagnosticResult] = Field(default_factory=list)
-    arbitration: Dict[str, Any] = Field(default_factory=dict)
-    agent_trace: List[AgentTraceStep] = Field(default_factory=list)
-    need_reference_refresh: bool = False
-    reference_refresh_reason: Optional[str] = None
-    need_human_review: bool = False
-    contrastive_probe_summary: str = ""
-    retrieval_gap_summary: str = ""
-    knowledge_verdict: str = ""
-    knowledge_gap_confidence: float = 0.0
-    counterfactual_lift: float = 0.0

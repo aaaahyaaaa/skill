@@ -1,2 +1,1 @@
-"""FindReason v3 module entrypoint package."""
-
+"""FindReason agent-judgement v4 module entrypoint package."""
