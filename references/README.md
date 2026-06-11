@@ -1,45 +1,44 @@
-# FindReason References
+# FindReason v4 References
 
-这个目录保存 FindReason v3 的宿主 Agent playbook、CLI 契约和证据裁决说明。当前主线是：
+当前主线是 agent-judgement v4：
 
 ```text
-trace hydration
-  -> 动态诊断 backlog
-  -> evaluator compression
-  -> selected {stage}-exp execution
-  -> orchestrate
+collect evidence
+  -> extract answer symptoms
+  -> propose candidate root causes
+  -> run recall / rerank / replay experiments
+  -> Agent writes judgement
 ```
+
+代码不再输出固定 `primary_cause`，也不再用“最早断点”硬裁决作为最终产品行为。旧 v3 文档只作为历史背景，不是当前入口。
 
 ## 核心口径
 
-- Trace artifacts 是 workflow 现场的权威来源。外部 `query` / `answer` 只作为用户实际问题/评估问题线索或 hint；Workflow 原始输入/输出必须从 trace 的 `workflow_span_ios` 读取。
-- 宿主 Agent 先做动态诊断 backlog，读取 workflow input/output、rewrite/keywords、`origin -> rerank -> prompt` 文档生存路径、停用或 stale 来源、引用支撑、prompt-vs-answer alignment 和 chunk 冲突风险；backlog 只用于选择 assertion、`{stage}-exp` 和报告重点，不直接决定 `primary_cause`。
-- 输入边界先于 RAG 链路归因，但不能只凭 query 差异判主因：只有用户约束未进入 Workflow 原始输入，且受影响的 `expected_required` 在理论召回上界可支撑、线上初召回缺失时，才判 `workflow_input_loss`。如果同一断言已经进入线上 origin / rerank / prompt，输入差异只作为风险信号，继续判断下游。
-- 评估器输出只压缩为 `judgement_evidence.signals`，用于说明“怀疑哪里坏了”；它不直接决定 `primary_cause`。
-- 字段契约只保留最新约定字段，不为旧字段、旧 role、旧 env var 或旧 schema alias 做自动映射；过时断言字段应 fail fast。
-- `host_agent.answer_claim` 是宿主 Agent 产出的唯一 assertion set 输入字段。
-- 主设计只使用 `expected_required` 和 `answer_claim` 两个核心 role。
-- `expected_required` 驱动 knowledge / retrieval / rerank / context 覆盖链路；`answer_claim` 用于 output grounding、scope、citation 和 consistency 检查。
-- 未执行的 hypothesis / backlog item 不是证据。只有 `{stage}-exp` 执行后的 hit/miss、matched docs、support spans、实验结果和 evidence IDs 才能进入 `orchestrate`。
+- Trace artifacts 是现场事实来源；外部 query、评估器信号和人工备注只是线索。
+- `recall` 是人读名称，等于 `origin_doc_list + origin_faq_list`；报告中可以合并展示，但审计时保留两路原始字段。
+- 线上召回链路要以 trace 中实际接口为准：常见 RAG QA 现场可能仍走旧 `/searchDoc` 主链路，新 `/recall`、`/rerank` 是拆分能力，不要只按接口名猜阶段。
+- `qaPromptDocs` 不一定等于全部 `reRankDocs`；prompt/context 不作为 v4 顶层 cause，但必须作为证据是否真正给到模型的观察面。
+- 代码只产出事实和实验结果，不替 Agent 选择根因。
+- Agent 先做 answer symptom extraction，再从表象生成多个候选解释。
+- 每个候选解释都要有支持证据、反证证据和下一步实验。
+- 如果证据不足，报告应写“不足以判断”的原因，而不是强行落标签。
+- 报告必须展示可读证据：文档标题 + 实际链接或援引片段；不要只贴 `prompt_doc_ids` 这类裸 id 数组。
+- 默认本地 JSON 作为可索引证据包，Fornax 按历史 `log_id` 回查原始 trace，飞书文档只作为分享/发布层。
 
-## 当前正式入口
+## 当前文档
 
-- 正式 CLI 入口是 `scripts/findreason.py`，正式归因实现集中在 `scripts/findreason_core/v3.py`，输出契约以 `schema_version: "v3"` 为准。
-- `references/` 是当前唯一文档源。新增 cause、probe、字段契约或报告口径时，先更新 `references/` 与 v3 测试。
-- 旧 agent/diagnostics 路径已移除，包括 `agent_graph`、`diagnostics`、`attribution`、旧 `skills/*` wrapper、旧 `skills/specs/*`、未接入 v3 的旧 `wide_recall.py` / `knowledge_detail.py` / `rerank_experiment.py`。
-- 需要恢复旧能力时，应先按 v3 语义重新接入 `v3.py`、`references/` 和测试，不能重新引入并行规则源。
+- `agent_judgement_v4.md`：Agent 如何从现场侦查、答案症状和实验结果写 judgement。
+- `symptom_to_root_cause.md`：表象到候选根因的对照表，来自用户指定飞书文档第三节的方法论。
+- `evidence_kernel.md`：代码层边界，说明哪些事必须代码化，哪些事必须留给 Agent。
+- `recall_chain.md`：召回、重排、进入 prompt 的真实链路、字段解释和排查抓手。
+- `report_contract.md`：报告必填字段、证据索引、可读证据展示和归因表约束。
+- `capabilities.json`：v4 CLI capability manifest。
 
-## 主要文档
+## 已退出主流程
 
-- `agent_attribution_planning.md`：宿主 Agent 如何从 trace artifacts、动态 backlog 和评估器信号生成 assertion set 与 `{stage}-exp`。
-- `field_contract.md`：case 输入、ingest 输出和 orchestrate 输出字段契约。
-- `probe-spec.md`：验证环节输出格式、缓存、失败语义和 `run-probe-plan` 兼容契约。
-- `cause-codes.md`：v3 cause enum、owner 和边界。
-- `orchestrator-rules.md`：counterfactual 与 primary cause 选择规则。
-- `host_agent_playbook.md`：端到端宿主 Agent 操作流程。
-- `output-schema.json`：orchestrate JSON 输出 schema。
-- `capabilities.json`：CLI capability manifest。
-
-## 已移除旧能力
-
-`probe-by-judgement`、`probe-by-claim`、`probe-by-doc-title`、`probe-rerank-tune` 已从 CLI 和 capability manifest 中移除。语义判断、问题拆解和动态验证规划由宿主 Agent 按 `agent_attribution_planning.md` 完成，并交给对应 `{stage}-exp` 或兼容 `run-probe-plan` 执行确定性检查。
+- `orchestrate`
+- 固定 `candidate_cause` / `primary_cause`
+- earliest failing stage 硬裁决
+- 旧 v3 回归测试作为目标行为
+- 把答案症状零散摊成多个顶层 cause
+- 旧 v3 reference 文档已经移除；需要历史细节时查 git history，不要让当前 Agent 读取旧规则作为工作流依据。

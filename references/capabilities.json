@@ -1,92 +1,68 @@
 {
   "name": "findreason-rag-attribution",
-  "version": "0.3.1",
-  "schema_version": "v3",
+  "version": "0.4.0-agent-judgement",
+  "schema_version": "agent-judgement-v4",
   "runtime": "python",
   "entrypoint": "python -m findreason",
   "capabilities": [
     {
-      "id": "ingest_fornax_trace",
-      "command": "ingest-fornax-trace",
-      "description": "Fetch OpenPlat Fornax trace detail by workspace_id/log_id and emit v3 ingest_summary/raw_artifacts.",
-      "inputs": ["workspace_id", "log_id", "app_id", "case_file", "raw", "limit", "output_dir"],
-      "outputs": ["schema_version", "ingest_summary", "raw_artifacts", "attribution_record.json"]
+      "id": "collect_evidence",
+      "command": "collect-evidence",
+      "description": "Fetch or read Fornax trace, normalize RAG artifacts, and persist case facts for Agent judgement.",
+      "inputs": ["workspace_id", "log_id", "app_id", "case_file", "trace_file", "limit", "output_dir"],
+      "outputs": ["case_facts.json", "agent_brief.md"]
     },
     {
-      "id": "orchestrate",
-      "command": "orchestrate",
-      "description": "Merge v3 ingest and probe evidence, validate evidence bindings, and select primary_cause with counterfactual rules.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "probe_dir", "mode", "schema_version", "only_stages", "output_dir"],
-      "outputs": ["oracle_status", "case_assessment", "primary_cause", "secondary_findings", "evidence_chain", "evidence_bundle", "failure_patterns", "next_actions", "short_summary.json", "case_report.md"]
+      "id": "run_experiment_recall",
+      "command": "run-experiment --type recall",
+      "description": "Plan recall query variants, or execute a trace-template query override when --query and recall_templates are available.",
+      "inputs": ["facts_file", "query", "timeout_seconds", "output_dir"],
+      "outputs": ["recall_experiment.json"]
     },
     {
-      "id": "probe_knowledge_detail",
-      "command": "probe-knowledge-detail",
-      "description": "Tri-state knowledge existence probe: trace/provided ids plus fixed live doc-record detail endpoint.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.knowledge", "evidence_bundle"]
+      "id": "run_experiment_rerank",
+      "command": "run-experiment --type rerank",
+      "description": "Observe doc-id survival from recall to rerank_docs/prompt_docs without selecting a cause.",
+      "inputs": ["facts_file", "target_doc_id", "output_dir"],
+      "outputs": ["rerank_experiment.json"]
     },
     {
-      "id": "probe_permission_check",
-      "command": "probe-permission-check",
-      "description": "Check ACL/namespace visibility signals for permission_miss.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.retrieval", "evidence_bundle"]
+      "id": "run_experiment_replay",
+      "command": "run-experiment --type replay",
+      "description": "Replay workflow as a current-version experiment and return normalized recall/rerank/prompt/answer evidence.",
+      "inputs": ["facts_file", "query", "app_id", "output_dir"],
+      "outputs": ["replay_experiment.json"]
     },
     {
-      "id": "probe_wide_recall",
-      "command": "probe-wide-recall",
-      "description": "Run retrieval-exp via broad recall evidence to distinguish retrieval_miss from upstream knowledge issues.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "topk", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.retrieval", "evidence_bundle"]
-    },
-    {
-      "id": "probe_rerank_bypass",
-      "command": "probe-rerank-bypass",
-      "description": "Run rerank-exp by comparing recall docs vs rerank docs as an auxiliary doc-id observation; rerank_drop still requires assertion-level support loss.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.rerank", "evidence_bundle"]
-    },
-    {
-      "id": "probe_context_assembly",
-      "command": "probe-context-assembly",
-      "description": "Compare rerank docs vs prompt docs for prompt/context observation; does not produce a primary cause.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "doc_ids", "output_dir", "no_cache"],
-      "outputs": ["stage_signals.context", "evidence_bundle"]
-    },
-    {
-      "id": "run_probe_plan",
-      "command": "run-probe-plan",
-      "description": "Execute a host-Agent validation plan against requested evidence faces and emit deterministic hit/miss stage_signals.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "plan", "output_dir", "no_cache"],
-      "outputs": ["stage_signals", "content.probe_results", "evidence_bundle"]
-    },
-    {
-      "id": "fetch_workflow_nodes",
-      "command": "fetch-workflow-nodes",
-      "description": "Fetch latest applications_wip.status=1 workflow nodes, edges, global_config, and input_schema.",
-      "inputs": ["workspace_id", "app_id", "output_dir"],
-      "outputs": ["workflow.nodes", "workflow.edges", "workflow.global_config"]
-    },
-    {
-      "id": "replay_workflow",
-      "command": "replay-workflow",
-      "description": "Exclusive replay fallback for trace-missing cases.",
-      "inputs": ["ingest_file", "workspace_id", "log_id", "override", "output_dir"],
-      "outputs": ["stage_signals.context", "raw_artifacts"]
+      "id": "synthesize_brief",
+      "command": "synthesize-brief",
+      "description": "Generate a concise human judgement summary, evidence sufficiency review scaffold, and local searchable evidence index from facts and experiment outputs.",
+      "inputs": ["facts_file", "experiment_dir", "output_dir"],
+      "outputs": ["agent_judgement.md", "evidence_index.json"]
     },
     {
       "id": "schema",
       "command": "schema",
-      "description": "Print v3 command metadata, stage order, cause enum, and output contract.",
+      "description": "Print v4 evidence-kernel manifest.",
       "inputs": [],
-      "outputs": ["schema_version", "commands", "cause_enum"]
+      "outputs": ["schema_version", "commands", "removed_contracts", "raw_artifacts", "human_aliases", "report_outputs"]
     }
+  ],
+  "removed_contracts": [
+    "No fixed primary_cause selection",
+    "No earliest-failing-stage hard arbitration",
+    "No compatibility promise for old v3 CLI output or tests"
+  ],
+  "reference_docs": [
+    "references/agent_judgement_v4.md",
+    "references/symptom_to_root_cause.md",
+    "references/evidence_kernel.md",
+    "references/recall_chain.md",
+    "references/report_contract.md"
   ],
   "live_dependencies": [
     "OpenPlat trace detail API",
-    "bytedcli RDS query for applications/applications_wip",
-    "open-exec workflow replay API",
-    "optional knowledge detail / wide recall service integrations"
+    "bytedcli RDS query for workflow replay resolution",
+    "open-exec workflow replay API"
   ]
 }

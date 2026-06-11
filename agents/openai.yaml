@@ -1,4 +1,4 @@
 interface:
   display_name: "FindReason RAG Attribution"
   short_description: "Run FindReason badcase attribution from pasted cases or Fornax traces"
-  default_prompt: "Use $findreason-rag-attribution to inspect trace artifacts first, compare workflow input/output with origin -> rerank -> prompt document survival and answer alignment, then choose the needed CLI/probe evidence before explaining the primary cause."
+  default_prompt: "Use $findreason-rag-attribution to inspect trace artifacts, run needed recall/rerank/replay experiments, then give the user a concise judgement summary with candidate_cause, confidence, answer symptoms, upstream evidence, key snippets, and missing evidence. Keep JSON artifacts for audit; do not make the user read them."

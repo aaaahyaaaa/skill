@@ -1,137 +1,153 @@
 ---
 name: findreason-rag-attribution
-description: FindReason RAG 归因 skill。对 RAG 答错、答漏、答非所问的 badcase 做证据采集和规则归因，输出 primary_cause、evidence_chain、failure_patterns、next_actions。触发词包括 RAG 归因、findreason、fornax trace、为什么答错了、case 复盘、归因报告、知识缺失、召回缺失、rerank 误杀、unsupported claim、wrong citation、partial answer。
+description: FindReason RAG 归因 skill。用于 RAG badcase、Fornax trace、为什么答错/答漏/答非所问、知识缺失、召回缺失、rerank 误杀、unsupported claim、wrong citation、scope violation 等复盘场景。当前 v4 是 agent-judgement 工作流：代码只采集 trace、归一化 recall/rerank/prompt 证据并运行实验；最终归因解释由 Agent 基于表象、候选根因和实验结果生成。
 ---
 
-# FindReason RAG 归因 v3
+# FindReason Agent Judgement v4
 
-## 概览
+FindReason v4 不再让 CLI 选择单一 `primary_cause`，也不再用“最早断点”硬裁决替代分析。代码负责把真实现场和实验结果整理成可审计事实；宿主 Agent 负责从表象出发，提出多个合理根因解释，再用 recall / rerank / replay 实验支持或反证。
 
-FindReason 是一个证据优先的 RAG badcase 归因 skill。宿主 Agent 负责理解 case、抽取断言、选择验证步骤和面向用户解释；CLI 负责采集 trace / probe 证据、归一化 stage signals，并在 `orchestrate` 中做可复核的反事实仲裁。
+旧 v3 的 `orchestrate` / `candidate_cause` / `primary_cause` 路径已退出主流程。不要为了兼容旧 CLI 或旧测试恢复这条路径。
 
-当前正式 CLI 入口是 `scripts/findreason.py`，正式归因实现集中在 `scripts/findreason_core/v3.py`。`references/` 是字段、原因码、验证、编排和报告口径的规则源；`SKILL.md` 只保留操作主线和跨阶段硬约束。
+## 分工
 
+代码负责：
 
-## 适用范围
+- 拉取、解析、固化 Fornax trace。
+- 归一化 `origin_doc_list`、`origin_faq_list`、`rerank_docs`、`prompt_docs`。
+- 把 `origin_doc_list + origin_faq_list` 汇总为人读层的 `recall`，同时保留原始字段用于审计。具体线上召回链路见 `references/recall_chain.md`。
+- 运行或规划 recall / rerank / replay 实验。
+- 输出 `case_facts.json`、`*_experiment.json`、`agent_brief.md`。
+- 用 `synthesize-brief` 生成短版 `agent_judgement.md` 和 `evidence_index.json` 本地证据索引。
 
-适用于 RAG badcase 归因：答错、答漏、答非所问、知识缺失、召回缺失、重排误杀、prompt/context 丢证据、unsupported claim、wrong citation、partial answer 和召回 chunk 冲突风险。
+Agent 负责：
 
-不适用于非 RAG 路由、纯产品策略判断、无法获取 trace 且无法 replay 的 case、或没有任何可验证 artifact 的主观评价。评估器输入只是可选线索源，不是假定所有 case 都有，也不能直接决定主因。
+- 现场侦查怎么想。
+- answer symptom extraction 怎么做。
+- 哪些候选解释合理。
+- 怎么规划下一步 probe / experiment。
+- 怎么写人读报告。
+- 不同阶段的边界、反思流程和最终 judgement。
 
-## 执行流程
+## 主流程
 
-1. 将用户输入、表格行、curl/body 或评估器线索整理为当前字段契约允许的 case 输入；字段细节只看 `references/field_contract.md`。
-2. 运行 `ingest-fornax-trace` 拉取并固化 Fornax trace 证据。
-3. 读取 `raw_artifacts` 做现场侦查，形成动态诊断 backlog；现场观察只决定下一步验证，不直接决定主因。
-4. 如果需要断言或静态 artifact 验证，由宿主 Agent 生成 assertion set 和必要的 `{stage}-exp` / `probe-v1` 计划；断言统一放入 `host_agent.answer_claim`，详细语义见 `references/agent_attribution_planning.md`。
-5. 运行推荐或现场观察证明必要的验证命令；独立 probes 可以并行，`replay-workflow` 只能作为独占 fallback。`replay-workflow` 会清空旧 `judgement_evidence.signals` 后构造 replay-only request，旧 signals 不是 workflow 输入，也不是当前重跑评估结果。
-6. 最后运行 `orchestrate` 合并 ingest / probe 证据，输出 `primary_cause`、`evidence_chain`、`failure_patterns`、`next_actions` 和审计 JSON。
-7. 如果使用 `orchestrate --output-dir`，读取 `final/case_report.md` 作为唯一人读报告。报告采用 adaptive narrative：固定证据和裁决协议，不固定 7 段模板；硬约束见 `references/report_template.md`。
+1. 用 `collect-evidence` 固化 trace 和 RAG artifacts。
+2. 读取 `case_facts.json` 与 `agent_brief.md`，先抽答案症状，再列候选根因。
+3. 对每个候选根因写明支持证据、反证证据和下一步实验。
+4. 需要时用 `run-experiment` 规划或运行 recall / rerank / replay 实验。
+5. 运行 `synthesize-brief` 生成短版 judgement summary 和证据索引。
+6. Agent 基于事实和实验结果给用户输出短版结论，风格类似一次清晰复盘回复；不要要求用户阅读 JSON 或长报告。
 
-## 全局规则
-
-1. 每个 case 必须先运行 `ingest-fornax-trace`，最后运行 `orchestrate`；`ingest-fornax-trace --raw` 只用于查看原始 trace，不属于归因流程。
-2. 本 skill 每次只处理一个 RAG 答案 badcase；批量 fan-out、语言理解、断言抽取和面向用户解释由宿主 Agent 负责。
-3. Fornax trace 中间节点是首选证据；只有 trace 查询失败或缺少关键中间节点时，才使用独占 fallback `replay-workflow`。如果 replay 缺少真实 `app_id` 或真实用户 `query`，必须显式补齐；CLI 会返回 `host_action_required`，不要用旧评估信号猜输入。
-4. CLI 运行配置使用源码固定常量；不要设置 env 期望改变运行行为。鉴权 token、OpenPlat endpoint、workspace info endpoint、workflow endpoint/database 和 knowledge detail endpoint 都以源码常量为准。
-5. 字段契约只接受 `references/field_contract.md` 中定义的当前内容；`SKILL.md` 不列字段清单，也不写兼容细则。
-6. 候选原因只使用 `references/cause-codes.md` 的 v3 枚举；evidence 绑定、verdict、`counterfactual` 和主因选择以 `references/evidence-spec.md`、`references/orchestrator-rules.md` 为准。
-7. 主因遍历和观察层边界以 `references/orchestrator-rules.md` 为准；如果上游 `counterfactual` 证据不足，不继续下沉猜答案问题，输出 `primary_cause=null` 并进入 `needs_human_review`。
-8. 断言输入按 `references/field_contract.md`：宿主 Agent 把需要验证的断言放入 `host_agent.answer_claim`；各 role 的含义、如何生成断言、哪些断言能驱动阶段归因，统一参考 `references/agent_attribution_planning.md`。
-
-## 阶段验证路由
-
-宿主 Agent 维护动态诊断 backlog。每看到一个线索，就记录 `trigger_source`、`trigger_observation`、`hypothesis`、`exp_kind`、`target_stage` 和 `expected_evidence`，再选择对应验证环节。
-
-| 验证环节 | 使用场景 | 典型动作 |
-|-|-|-|
-| `retrieval-exp` | 验证召回链路是否能拿到更好证据 | query / rewrite / keyword / query variant / topK / open-label / permission |
-| `rerank-exp` | 验证 rerank 是否丢掉 origin 中已有证据 | 重排生存观察、阈值、参数或排序恢复信号 |
-| `answer-exp` | 验证 prompt 已有约束是否被 answer 覆盖 | answer span 覆盖、漏答、越界、弱化表达 |
-| `citation-exp` | 验证引用是否存在、可用、支撑 claim | stale / 停用来源、引用文档不支撑 claim |
-| `chunk-conflict-exp` | 验证召回/prompt chunk 是否内部矛盾 | 冲突断言、doc/chunk、支撑片段、适用前提 |
-
-`run-probe-plan` 是执行器，用于把宿主 Agent 已选择的静态 artifact 验证落成 JSON 证据；它不负责语言理解，也不直接决定主因。验证细节见 `references/probe-spec.md`。
-
-## 现场侦查
-
-在生成 assertion set 或运行 probes 前，宿主 Agent 应先做一次现场侦查。现场侦查是为了释放 Agent 的临场判断，不绕过 evidence binding。
-
-- 确认 trace 中 Workflow 原始输入/输出、rewrite query、keywords、origin docs / FAQ、rerank docs、prompt docs、final answer、citation mapping 是否完整。
-- 摊平 `origin -> rerank -> prompt` 文档生存路径，记录关键候选在哪个阶段出现或丢失，以及是否只是 doc ID 命中但正文不支撑断言。
-- 标记高风险来源：停用、过期、重复 chunk、非权威来源、引用链接不可用或引用文档不支撑 answer claim。
-- 做 prompt-vs-answer alignment：已有证据是否覆盖关键限制、反例、预算/ROI、适用范围，最终答案是否遗漏、弱化或反向表达。
-- 根据现场观察选择下一步验证；未执行的 hypothesis / backlog item 不是证据，只有执行后的结果才能进入 `orchestrate`。
-
-## 命令速查
-
-基础流程：
+## 命令
 
 ```bash
-python -m findreason ingest-fornax-trace \
+python -m findreason collect-evidence \
   --workspace-id <workspace_id> \
   --log-id <log_id> \
   --app-id <app_id> \
   --case-file /path/to/case.json \
   --output-dir /tmp/findreason-case
-
-python -m findreason orchestrate \
-  --ingest-file /tmp/findreason-case/ingest.json \
-  --probe-dir /tmp/findreason-case/probes \
-  --mode final \
-  --schema-version v3 \
-  --output-dir /tmp/findreason-case/final
 ```
 
-常用验证命令：
+如果已有本地 trace JSON，可跳过线上拉取：
 
 ```bash
-python -m findreason probe-knowledge-detail --ingest-file /tmp/findreason-case/ingest.json --output-dir /tmp/findreason-case/probes
-python -m findreason probe-permission-check --ingest-file /tmp/findreason-case/ingest.json --output-dir /tmp/findreason-case/probes
-python -m findreason probe-wide-recall --ingest-file /tmp/findreason-case/ingest.json --output-dir /tmp/findreason-case/probes
-python -m findreason probe-rerank-bypass --ingest-file /tmp/findreason-case/ingest.json --output-dir /tmp/findreason-case/probes
-python -m findreason probe-context-assembly --ingest-file /tmp/findreason-case/ingest.json --output-dir /tmp/findreason-case/probes
-python -m findreason run-probe-plan --ingest-file /tmp/findreason-case/ingest.json --plan @plan.json --output-dir /tmp/findreason-case/probes
+python -m findreason collect-evidence \
+  --workspace-id <workspace_id> \
+  --log-id <log_id> \
+  --trace-file /path/to/trace.json \
+  --case-file /path/to/case.json \
+  --output-dir /tmp/findreason-case
 ```
 
-Workflow fallback：
+实验入口：
 
 ```bash
-python -m findreason fetch-workflow-nodes --workspace-id <workspace_id> --app-id <app_id>
-python -m findreason replay-workflow \
-  --ingest-file /tmp/findreason-case/ingest.json \
-  --app-id <app_id> \
-  --query "<真实用户问题>" \
-  --override @override.json \
-  --output-dir /tmp/findreason-case/probes
+python -m findreason run-experiment --type recall --facts-file /tmp/findreason-case/case_facts.json --query "<实验 query>" --output-dir /tmp/findreason-case
+python -m findreason run-experiment --type rerank --facts-file /tmp/findreason-case/case_facts.json --target-doc-id <doc_id> --output-dir /tmp/findreason-case
+python -m findreason run-experiment --type replay --facts-file /tmp/findreason-case/case_facts.json --query "<真实用户问题>" --app-id <app_id> --output-dir /tmp/findreason-case
 ```
 
-如果 `case_input.query` 是 `unknown query` 且有 `query_hint`，replay 默认使用 `query_hint`；如果 `app_id` 不是数字或仍然缺真实 query，命令只返回 `blocked` 和 `host_action_required`，不会发起线上 workflow 调用。replay 输出里的 `node_traces`、`retrieval/rerank/answer` stage signals 才代表当前重跑结果；`judgement_evidence.signals` 只是历史评估线索。
+不传 `--query` 时，recall 实验只输出 query variant 规划；传入 `--query` 且 trace 中有 recall/searchDoc 请求模板时，代码会复用模板执行一次 query override。rerank 实验输出 doc-id 生存观察，不直接等价为同断言丢失。
 
-只查看原始 trace：
+报告合成入口：
 
 ```bash
-python -m findreason ingest-fornax-trace --workspace-id <workspace_id> --log-id <log_id> --raw
+python -m findreason synthesize-brief \
+  --facts-file /tmp/findreason-case/case_facts.json \
+  --experiment-dir /tmp/findreason-case \
+  --output-dir /tmp/findreason-case
 ```
 
-查看 schema：
+默认产物：
+
+- `agent_judgement.md`：每条 case 的唯一短版人读 judgement 结论文件，包含当前结论入口、答案症状、上游证据链、关键证据和本地证据包位置；不要再额外维护一份 `summary.md` / `summary` 人读副本，避免两份结论漂移。
+- `evidence_index.json`：本地可索引证据包，包含 trace/replay/实验文档的 title、url、snippet、rank、score。
+
+查看 v4 manifest：
 
 ```bash
 python -m findreason schema
 ```
 
-## Reference 索引
+## 现场侦查
 
-- `references/README.md`：v3 当前主线、核心口径和已移除旧能力。
-- `references/field_contract.md`：case 输入、ingest 输出和 orchestrate 输出字段契约。
-- `references/cause-codes.md`：v3 cause 枚举、owner、触发条件和边界。
-- `references/orchestrator-rules.md`：阶段顺序、`counterfactual` 和主因选择规则。
-- `references/evidence-spec.md`：evidence bundle schema 和校验规则。
-- `references/host_agent_playbook.md`：宿主 Agent 职责、现场观察和端到端操作流程。
-- `references/agent_attribution_planning.md`：如何把 trace artifacts 与评估器信号转成 assertion set 和验证计划。
-- `references/probe-spec.md`：probe 输入、输出、缓存、失败语义和 `run-probe-plan` 兼容契约。
-- `references/report_template.md`：人读报告契约；固定硬约束，不固定章节范式。
-- `references/workflow-ops.md`：workflow 节点获取和 replay 行为。
-- `references/span-extraction.md`：Fornax span 抽取映射。
-- `references/output-schema.json`：供宿主侧校验使用的 v3 输出 schema。
-- `references/capabilities.json`：v3 capability manifest。
+先看表象，再找根因，不要一开始就落标签。
+
+- 输入表象：用户真实问题、评估器上下文、Workflow 原始输入、rewrite、keywords 是否一致。
+- 答案表象：漏答、错引、越界、自相矛盾、无依据断言、把弱证据写成强结论。
+- 证据生存：同一必要断言是否从 `recall` 进入 `rerank_docs`，再进入 `prompt_docs` / `qaPromptDocs`。
+- 召回边界：报告里可叫 `recall`，但审计时要区分 `origin_doc_list` 与 `origin_faq_list`；线上链路可能来自旧 `/searchDoc`，也可能来自新拆分 `/recall` 能力，以 trace 为准。
+- 知识边界：宽召回是否仍无权威支撑，还是只有相邻主题。
+- 证据充分性：把用户问题拆成 required assertions，判断关键证据组合是完整支撑、部分支撑还是只解释了 replay 改善；明确仍缺哪条权威文档或业务规则。
+- 实验反思：每个候选根因都要写“什么证据会推翻它”。
+
+## 输出要求
+
+每条 case 都必须产出一个短版人读结论，默认写入 `agent_judgement.md`，Agent 给用户的最终回复也应从这个结论改写而来。不要把 `case_facts.json`、`recall_experiment.json`、`rerank_experiment.json`、`replay_experiment.json` 原文贴给用户，也不要让用户自己去读这些 JSON。JSON 是 Agent 的证据包，不是用户的阅读界面。
+
+如果 `synthesize-brief` 只生成了 `candidate_cause: 待 Agent 判断` 的草稿，Agent 在完成归因后必须更新同一个 `agent_judgement.md`，把它改成最终短版结论；不要另建 `summary.md` 或在聊天里给一份、文件里留一份未完成草稿。
+
+`agent_judgement.md` 是结论文件，不是提示词或 checklist。不要在里面写“Agent 最终回复要求”“给用户输出短版结论”这类面向 Agent 的写作要求；这类规则只保留在 `SKILL.md`、`references/report_contract.md` 或 `agent_brief.md`。
+
+最终回复建议使用 5-7 个短段落或短列表，必须包含：
+
+- log_id、workspace_id、app_id；如果 replay 返回新的 log_id / trace_id，也必须写出；如果没有返回，要明确写“replay 未返回新的 log_id”。
+- 原始 query、Workflow 输入、Workflow 输出、包装后的输出 / `answer_hint`。
+- 总结提炼后的评估器信号，而不是整段原始 evaluator 文本直接堆叠。
+- 表象摘要：答案具体错在哪里。
+- 候选根因：至少列出 2 个合理解释，除非证据已明显排除。
+- 证据对照：trace facts / recall / rerank / replay 分别支持或反驳什么。
+- 证据充分性判断：列出 required assertions，给关键证据标注 `direct_support`、`partial_support`、`adjacent_support`、`insufficient` 或 `contradictory`，并说明是否足以产出严谨业务答案。
+- 反证意识：每个关键候选根因都要写支持证据、已跑实验、什么会推翻它、当前判断；不要求用大表格。
+- 归因整理：最终候选 cause 必须落在 `workflow_input_loss`、`suspected_knowledge_missing`、`retrieval_miss`、`rerank_drop`、`answer_failure` 这 5 类之一；证据不足时写低置信或人工复核，不强行裁决。
+- 当前 judgement：最可信根因、置信度、仍缺的证据。
+- 下一步实验：如果证据不足，明确下一步该跑什么。
+
+证据充分性要求：
+
+- 先把正确答案应覆盖的点拆成 required assertions。
+- 对每条关键证据说明它支撑了哪条断言，以及支撑等级：`direct_support` 表示直接支撑；`partial_support` 表示只能支撑一部分；`adjacent_support` 表示主题相关但不能直接下结论；`insufficient` 表示看似相关但不能使用；`contradictory` 表示与其他证据冲突。
+- 明确区分“证据足以解释为什么 replay 比历史答案好”和“证据足以产出严谨业务答案”。前者不等于后者。
+- 如果证据组合有用但不完整，要写出仍缺的权威证据，例如“缺少明确说明是否自动扣费/自动续费/到期后如何处理的业务规则”。
+
+证据展示硬约束：
+
+- 不要在报告中只贴 `{"prompt_doc_ids": [...]}` 或类似裸 id 数组。
+- 每个关键证据必须至少展示文档标题，并展示实际链接或援引片段；doc id 只能作为审计补充。
+- 同一个必要断言的 recall / rerank / prompt 生存情况写在一起；不同断言分开展示。
+
+证据索引建议：
+
+- 默认使用本地 JSON 作为可索引事实来源：`case_facts.json`、`recall_experiment.json`、`rerank_experiment.json`、`replay_experiment.json`、`evidence_index.json`。
+- Fornax 平台适合按历史 `log_id` 回查原始 trace；不要依赖飞书文档作为唯一证据库。
+- 飞书文档适合作为分享/评审发布层；若用户明确要求发布，再把短版 `agent_judgement.md` 转成飞书文档。
+
+## References
+
+- `references/agent_judgement_v4.md`：v4 归因思路和 Agent 工作流。
+- `references/symptom_to_root_cause.md`：表象到根因的对照框架。
+- `references/evidence_kernel.md`：代码证据内核的边界。
+- `references/recall_chain.md`：线上召回、重排、进入 prompt 的字段和接口链路。
+- `references/report_contract.md`：报告字段、证据索引、可读证据展示的硬约束。
+- `references/README.md`：当前 reference 索引。
