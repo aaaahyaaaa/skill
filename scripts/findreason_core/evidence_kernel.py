@@ -202,7 +202,17 @@ def normalize_case_payload(payload: dict[str, Any]) -> dict[str, Any]:
         return payload["case"]
     if isinstance(payload.get("case_input"), dict):
         case = dict(payload["case_input"])
-        for key in ("query_hint", "answer_hint", "judgement", "judgement_evidence", "qa", "host_agent", "source_row", "case_id"):
+        for key in (
+            "query_hint",
+            "answer_hint",
+            "chat_history",
+            "judgement",
+            "judgement_evidence",
+            "qa",
+            "host_agent",
+            "source_row",
+            "case_id",
+        ):
             if key in payload:
                 case[key] = payload[key]
         return case
@@ -255,6 +265,7 @@ def build_case_facts(
             "query_hint": case.get("query_hint") or "",
             "judgement": case.get("judgement") or "",
             "answer_hint": case.get("answer_hint") or "",
+            "chat_history": case.get("chat_history") or "",
             "source_row": case.get("source_row") or "",
             "case_id": case.get("case_id") or "",
         },

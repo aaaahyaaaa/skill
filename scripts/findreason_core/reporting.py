@@ -276,6 +276,27 @@ def build_evidence_index(
                 "missing_authoritative_evidence",
             ],
         },
+        "badcase_review_contract": {
+            "purpose": "Keep evaluator-disputed badcases separate from the five root-cause labels.",
+            "statuses": [
+                "valid_badcase",
+                "needs_human_review_evaluator_disputed",
+                "not_badcase_evaluator_error",
+            ],
+            "human_review_context_fields": [
+                "query",
+                "judged_answer",
+                "workflow_input",
+                "workflow_output",
+                "evaluator_claim",
+                "key_prompt_evidence",
+                "why_evaluator_may_be_wrong",
+            ],
+            "rules": [
+                "Use needs_human_review_evaluator_disputed when evaluator factual correctness conflicts with prompt evidence.",
+                "Use not_badcase_evaluator_error only after human confirmation or explicit human label.",
+            ],
+        },
         "docs": docs,
         "report_rule": "Human reports must cite title/link/snippet. Doc ids may be shown for audit, but never as the only evidence.",
     }
@@ -310,66 +331,42 @@ def synthesize_report_markdown(
     recall_docs = _artifact_docs(facts, "origin_doc_list") + _artifact_docs(facts, "origin_faq_list")
     replay_prompt_docs = _experiment_artifacts(replay, "prompt_docs")
     key_docs = _dedupe_docs(prompt_docs + replay_prompt_docs + recall_docs, limit=5)
+    evaluator_text = "；".join(
+        f"{item['signal']}={item['status']}：{item['reason']}" for item in evaluator_signals
+    )
+    if not evaluator_text:
+        evaluator_text = "未提供评估器信号，当前只能基于 trace answer 和证据链做低/中置信判断。"
+    answer_text = _short(facts.get("answer"), 700) or "未采集到历史答案。"
+    recall_status = _experiment_status_line("recall experiment", recall).removeprefix("- ")
+    rerank_status = _experiment_status_line("rerank experiment", rerank).removeprefix("- ")
+    replay_status = _experiment_status_line("replay experiment", replay).removeprefix("- ")
 
     lines: list[str] = [
-        "# FindReason Judgement Summary",
+        "# FindReason Judgement",
         "",
-        "## 当前结论",
+        "## 当前判断",
         "",
-        "- candidate_cause: 待 Agent 判断",
-        "- 置信度: 待 Agent 判断",
+        "这份是自动合成的短版结论草稿。CLI 只整理现场证据，不硬选 cause；Agent 需要基于下面的答案症状、上游链路和实验结果，把第一段改成最终 judgement。",
         "",
-        "## Case 摘要",
+        f"这条 case 的问题是：{_short(query, 500) or '未采集到'}",
         "",
-        f"- log_id: `{historical_log_id}`",
-        f"- workspace_id: `{facts.get('workspace_id', '')}`",
-        f"- app_id: `{app_id}`",
-        f"- replay_log_id: {replay_log_line}",
-        f"- 用户问题: {_short(query, 500) or '未采集到'}",
-        f"- workflow rewrite: {_short(preprocess.get('rewrite_query'), 700)}",
-        f"- workflow keywords: {keywords}",
-        f"- 包装后的输出 / answer_hint: {_short(case.get('answer_hint'), 500) or '未提供'}",
+        f"历史答案是：{answer_text}",
         "",
-        "workflow 输入:",
+        f"评估器线索：{evaluator_text}",
         "",
-        f"`{_compact_json(workflow_input, 600)}`",
+        "## 现场事实",
         "",
-        "workflow 输出:",
-        "",
-        f"`{_compact_json(workflow_output, 700)}`",
-        "",
-        "## 评估器信号",
-        "",
+        f"- log_id=`{historical_log_id}`，workspace_id=`{facts.get('workspace_id', '')}`，app_id=`{app_id}`，replay_log_id={replay_log_line}",
+        f"- workflow 输入：`{_compact_json(workflow_input, 600)}`",
+        f"- workflow 输出：`{_compact_json(workflow_output, 700)}`",
+        f"- preprocess：rewrite 是「{_short(preprocess.get('rewrite_query'), 300) or '未采集到'}」；keywords 是 {keywords}",
+        f"- recall：共 `{counts.get('recall', 0)}` 条，其中 origin_doc_list=`{counts.get('origin_doc_list', 0)}`、origin_faq_list=`{counts.get('origin_faq_list', 0)}`",
+        f"- rerank/prompt：rerank_docs=`{counts.get('rerank_docs', 0)}`，prompt_docs=`{counts.get('prompt_docs', 0)}`；missing_from_rerank={', '.join(map(str, missing_rerank)) or '无'}，missing_from_prompt={', '.join(map(str, missing_prompt)) or '无'}",
+        f"- 实验：{recall_status}；{rerank_status}；{replay_status}",
     ]
-    if evaluator_signals:
-        for item in evaluator_signals:
-            lines.append(f"- `{item['signal']}`: {item['status']}，{item['reason']}")
-    else:
-        lines.append("- 未提供评估器信号；最终判断需要 Agent 基于答案与证据对齐。")
-    lines.extend(
-        [
-            "",
-            "## 答案症状入口",
-            "",
-            f"- trace answer: {_short(facts.get('answer'), 700) or '未采集到'}",
-            f"- wrong_citation_observed: `{citation.get('wrong_citation', False)}`",
-            "- answer_issue_types: 待基于 trace answer、评估器信号和 prompt evidence 对齐后填写。",
-            "",
-            "## 上游证据链",
-            "",
-            f"- preprocess: rewrite=`{_short(preprocess.get('rewrite_query'), 180)}`；keywords={keywords}",
-            f"- recall: `{counts.get('recall', 0)}`，origin_doc_list=`{counts.get('origin_doc_list', 0)}`，origin_faq_list=`{counts.get('origin_faq_list', 0)}`",
-            f"- rerank_docs: `{counts.get('rerank_docs', 0)}`；prompt_docs: `{counts.get('prompt_docs', 0)}`",
-            f"- rerank survival: missing_from_rerank={', '.join(map(str, missing_rerank)) or '无'}；missing_from_prompt={', '.join(map(str, missing_prompt)) or '无'}",
-            _experiment_status_line("recall experiment", recall),
-            _experiment_status_line("rerank experiment", rerank),
-            _experiment_status_line("replay experiment", replay),
-            f"- replay answer: {_short(replay.get('answer'), 500) or '未运行或未采集到'}",
-            "",
-            "## 关键证据",
-            "",
-        ]
-    )
+    if replay.get("answer"):
+        lines.append(f"- replay answer：{_short(replay.get('answer'), 500)}")
+    lines.extend(["", "## 关键证据", ""])
     if key_docs:
         for doc in key_docs:
             lines.extend(_concise_doc_line(doc, "prompt/recall"))
@@ -378,18 +375,17 @@ def synthesize_report_markdown(
     lines.extend(
         [
             "",
-            "## 证据充分性判断",
+            "## 当前还不能直接裁决的地方",
             "",
-            "- required_assertions: 待 Agent 将用户问题拆成正确答案必须覆盖的断言。",
-            "- support_level: 待对关键证据标注 `direct_support` / `partial_support` / `adjacent_support` / `insufficient` / `contradictory`。",
-            "- missing_authoritative_evidence: 待说明当前证据组合仍缺哪条权威文档或业务规则。",
-            "- 判断边界: replay 证据变好只能说明当前版本证据链改善；是否足以产出严谨业务答案，需要逐条断言检查。",
+            "自动合成只整理到证据层，还没有完成答案症状抽取和 required assertions 对齐，所以这里不直接给 `candidate_cause`。如果后续对齐发现关键断言已经在 prompt 中有直接支撑，但答案仍漏答、错引、越界或编造，才适合落到 `answer_failure`；如果 prompt 里本身没有足够权威支撑，就应该回溯知识、recall 或 rerank。",
+            "",
+            "## 人工复核维度",
+            "",
+            "`badcase_review_status` 独立于五类 root cause。若评估器事实正确性结论与 prompt evidence 对不上，先标 `needs_human_review_evaluator_disputed`，并给出 query、judged answer、workflow input/output、evaluator claim、关键 prompt 证据和怀疑误判原因；`not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。",
             "",
             "## 本地证据包",
             "",
-            f"- `case_facts.json`: 历史 trace 事实和归一化 artifacts。",
-            f"- `recall_experiment.json` / `rerank_experiment.json` / `replay_experiment.json`: 本次实验结果。",
-            f"- `{evidence_index_path}`: 可索引证据包；给机器和复盘用，不要求人工逐行阅读。",
+            f"`case_facts.json` 保存历史 trace 事实；`recall_experiment.json`、`rerank_experiment.json`、`replay_experiment.json` 保存实验结果；`{evidence_index_path}` 是可索引证据包。它们是复盘底座，不是给用户阅读的最终答案。",
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
