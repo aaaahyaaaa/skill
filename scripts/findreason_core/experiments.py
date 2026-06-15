@@ -328,6 +328,22 @@ def run_recall_experiment(
 
 def run_replay_experiment(facts: dict[str, Any], *, query: str | None = None, app_id: str | None = None) -> dict[str, Any]:
     envelope = _base_envelope("replay", facts)
+    trace = facts.get("trace") if isinstance(facts.get("trace"), dict) else {}
+    if trace.get("has_middle_node_trace"):
+        envelope.update(
+            {
+                "status": "ok",
+                "mode": "skipped_authoritative_trace",
+                "counts": facts.get("counts") if isinstance(facts.get("counts"), dict) else {},
+                "artifacts": {},
+                "answer": "",
+                "reasoning": "",
+                "trace_completeness": {"replay_skipped": True, "historical_middle_node_trace": True},
+                "node_traces": [],
+                "notes": "检测到原始 trace 中间节点证据，未执行 workflow replay；归因以历史现场证据为权威，replay 文件仅记录跳过状态。",
+            }
+        )
+        return envelope
     case = _case_from_facts(facts)
     replay_query = query or case["query"]
     replay_app_id = app_id or case["app_id"]

@@ -6,7 +6,7 @@
 
 默认用本地 Markdown + JSON：
 
-- `agent_judgement.md`：每条 case 的唯一短版人读 judgement 结论文件，适合直接改写成 Agent 最终回复。
+- `agent_judgement.md`：每条 case 的唯一短版人读 judgement 结论文件，适合直接改写成 Agent 最终回复。它应该像一次清楚的复盘结论，不应该像固定字段表、提示词或 checklist。
 - `evidence_index.json`：本地可索引证据包，适合后续批量检索、对账和复盘。
 
 不要同时维护 `summary.md` / `summary` 和 `agent_judgement.md` 两份人读结论；summary 是 `agent_judgement.md` 内的第一段能力，不是独立产物。两份结论容易在 candidate cause、置信度和证据解释上漂移。
@@ -25,7 +25,7 @@
 
 ## 必填字段
 
-最终给用户的回复和 `agent_judgement.md` 必须保持短版结构，建议 5-7 个短段落或短列表。字段不必机械套模板，但每条 case 至少覆盖：
+最终给用户的回复和 `agent_judgement.md` 必须保持短版结构，建议 5-7 个短段落或短列表。下面这些信息要覆盖，但不要机械套模板，也不要为了凑字段牺牲可读性：
 
 - `log_id`
 - `workspace_id`
@@ -39,6 +39,8 @@
 - 证据充分性判断：required assertions、关键证据的 support level、仍缺的权威证据
 - 反证意识：每个关键候选根因的支持证据、已跑实验、可推翻证据、当前判断；不要求输出大表格
 - 归因整理：最终候选 cause、置信度、仍缺证据或人工复核理由
+- `badcase_review_status`：`valid_badcase`、`needs_human_review_evaluator_disputed` 或 `not_badcase_evaluator_error`
+- `human_review_reason` 与 `human_review_context`：当评估器事实正确性结论可能有误时必须提供，供人工判断该 case 是否真的算 badcase
 
 ## 证据展示
 
@@ -74,6 +76,8 @@
 步骤：
 
 - 将用户问题拆成 required assertions，即正确答案必须覆盖的具体断言。
+- `chat_history` 只能用于判断上下文是否丢进 Workflow 输入，并通过上下文增强 query 的 recall / replay 对照验证 `workflow_input_loss`；不能用于支撑 `answer_failure` 的答案正误判断。
+- `answer_failure` 只在必要断言已经进入 `prompt_docs` / `qaPromptDocs`，但答案仍漏答、误答、错引、越界、编造或把弱证据写强时成立。
 - 对关键证据标注支撑等级：`direct_support`、`partial_support`、`adjacent_support`、`insufficient`、`contradictory`。
 - 说明每条证据支撑了哪条 required assertion，哪些断言仍未被权威支撑。
 - 区分“证据足以解释 replay 为什么更好”和“证据足以产出严谨业务答案”。前者不等于后者。
@@ -92,3 +96,13 @@
 - `answer_failure`
 
 如果证据不能支撑唯一主因，应写低置信或人工复核，不要强行落标签。
+
+## Badcase 复核状态
+
+`badcase_review_status` 独立于五类 cause，用于处理“评估器可能误判，该 case 可能不算 badcase”的情况。
+
+- `valid_badcase`：评估器或人工指出的问题与证据链一致，按五类 cause 继续归因。
+- `needs_human_review_evaluator_disputed`：评估器事实正确性结论与 prompt evidence、Workflow 输出或人工标注存在明显冲突，需要人工确认是否真是 badcase。
+- `not_badcase_evaluator_error`：仅在人工确认或明确人工标注后使用，表示评估器判断有误，该样本不应进入 badcase 根因统计。
+
+请求人工复核时，必须提供足够上下文：query、judged answer、Workflow input/output、evaluator claim、关键 prompt 证据、为什么怀疑评估器误判。不要只写“需人工复核”。

@@ -139,7 +139,7 @@ def test_collect_evidence_extracts_recall_template_for_experiment(monkeypatch: p
     assert templates[0]["headers"]["Authorization"] == "Bearer <redacted>"
 
 
-def test_agent_brief_contains_symptom_to_experiment_contract() -> None:
+def test_agent_brief_is_case_specific_working_note() -> None:
     from findreason_core.agent_judgement_contract import judgement_brief_markdown
 
     brief = judgement_brief_markdown(
@@ -148,7 +148,12 @@ def test_agent_brief_contains_symptom_to_experiment_contract() -> None:
             "log_id": "log",
             "workspace_id": "138",
             "app_id": "1001883",
-            "case": {"query": "query"},
+            "case": {
+                "query": "query",
+                "answer_hint": "包装后的答案",
+                "chat_history": json.dumps([{"role": "user", "content": "用户补充了一个重要上下文"}], ensure_ascii=False),
+                "judgement": "factual_correctness=score:0; reason:评估器认为事实错误",
+            },
             "counts": {"recall": 2, "origin_doc_list": 1, "origin_faq_list": 1, "rerank_docs": 1, "prompt_docs": 1},
             "trace": {
                 "has_middle_node_trace": True,
@@ -174,18 +179,29 @@ def test_agent_brief_contains_symptom_to_experiment_contract() -> None:
         }
     )
 
-    assert "Do not jump to an earliest failing stage" in brief
-    assert "Candidate explanations" in brief
-    assert "Evidence to check" in brief
-    assert "Historical trace is the badcase scene" in brief
-    assert "workflow input" in brief
-    assert "wrapped_output / answer_hint" in brief
+    assert "# Agent Brief" in brief
+    assert "这是一份给 Agent 快速进入现场的工作单" in brief
+    assert "用户问：query" in brief
+    assert "审计锚点" in brief
+    assert "Workflow 摘要" in brief
+    assert "被评估答案 / answer_hint" in brief
+    assert "评估器线索是低置信诊断线索" in brief
+    assert "chat_history 只用于判断 `workflow_input_loss`" in brief
+    assert "上下文增强 query" in brief
+    assert "不得用 chat_history 支撑 `answer_failure`" in brief
+    assert "`badcase_review_status`" in brief
+    assert "needs_human_review_evaluator_disputed" in brief
     assert "Doc A" in brief
     assert "https://example.com/doc-a" in brief
     assert "This is the cited support snippet" in brief
-    assert "hypothesis -> experiment -> falsification -> current judgement" in brief
-    assert "evidence sufficiency" in brief
-    assert "required assertions" in brief
+    assert "Workflow 现场" not in brief
+    assert "证据链速览" not in brief
+    assert "```json" not in brief
+    assert "origin_doc_list" not in brief
+    assert "rerank_docs" not in brief
+    assert "Required Report Contract" not in brief
+    assert "Symptom To Root Cause Seeds" not in brief
+    assert "Do not jump to an earliest failing stage" not in brief
 
 
 def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> None:
@@ -253,23 +269,29 @@ def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> No
     index = json.loads((tmp_path / "evidence_index.json").read_text(encoding="utf-8"))
 
     assert result["status"] == "ok"
-    assert "# FindReason Judgement Summary" in report
-    assert "candidate_cause: 待 Agent 判断" in report
-    assert "置信度: 待 Agent 判断" in report
-    assert "Case 摘要" in report
-    assert "workflow 输入" in report
-    assert "workflow 输出" in report
-    assert "包装后的输出" in report
+    assert "# FindReason Judgement" in report
+    assert "自动合成的短版结论草稿" in report
+    assert "candidate_cause: 待 Agent 判断" not in report
+    assert "置信度: 待 Agent 判断" not in report
+    assert "审计锚点" in report
+    assert "被评估目标" in report
     assert "factual_correctness" in report
-    assert "上游证据链" in report
     assert "Readable Doc" in report
     assert "https://example.com/doc" in report
     assert "Readable support snippet" in report
-    assert "证据充分性判断" in report
-    assert "required_assertions" in report
-    assert "direct_support" in report
-    assert "missing_authoritative_evidence" in report
-    assert "本地证据包" in report
+    assert "评估器与复核" in report
+    assert "badcase_review_status" in report
+    assert "现场事实" not in report
+    assert "workflow 输入：`" not in report
+    assert "workflow 输出：`" not in report
+    assert "preprocess：" not in report
+    assert "recall：共" not in report
+    assert "rerank/prompt：" not in report
+    assert "实验：recall" not in report
+    assert "本地证据包" not in report
+    assert "case_facts.json" not in report
+    assert "Required Report Contract" not in report
+    assert "Symptom To Root Cause Seeds" not in report
     assert "Agent 最终回复要求" not in report
     assert "给用户输出短版结论" not in report
     assert "明确写 `candidate_cause`" not in report
@@ -279,13 +301,8 @@ def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> No
     assert "Prompt 代表证据" not in report
     assert len(report.splitlines()) <= 100
     assert index["report_rule"].startswith("Human reports must cite")
-    assert index["sufficiency_review_contract"]["support_levels"] == [
-        "direct_support",
-        "partial_support",
-        "adjacent_support",
-        "insufficient",
-        "contradictory",
-    ]
+    assert "sufficiency_review_contract" not in index
+    assert "badcase_review_contract" not in index
     assert result["outputs"]["agent_judgement"].endswith("agent_judgement.md")
 
 
@@ -414,6 +431,39 @@ def test_recall_experiment_executes_trace_template_with_query(
     assert posted["headers"]["Authorization"] == "Bearer unit-token"
     assert "primary_cause" not in result
     assert "candidate_cause" not in result
+
+
+def test_replay_experiment_skips_when_authoritative_trace_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import findreason_core.experiments as experiments
+    from findreason_core.evidence_kernel import write_json
+    from findreason_core.experiments import run_experiment
+
+    facts = {
+        "schema_version": "agent-judgement-v4",
+        "log_id": "log",
+        "workspace_id": "138",
+        "app_id": "1001883",
+        "case": {"query": "query"},
+        "trace": {"has_middle_node_trace": True},
+        "counts": {"origin_doc_list": 1, "origin_faq_list": 0, "recall": 1, "rerank_docs": 1, "prompt_docs": 1},
+    }
+    facts_file = tmp_path / "case_facts.json"
+    write_json(facts_file, facts)
+
+    async def fail_if_called(request: object) -> object:
+        raise AssertionError("live replay should be skipped for authoritative historical trace")
+
+    monkeypatch.setattr(experiments, "replay_workflow", fail_if_called)
+
+    result = run_experiment(experiment_type="replay", facts_file=str(facts_file), output_dir=str(tmp_path))
+
+    assert result["status"] == "ok"
+    assert result["mode"] == "skipped_authoritative_trace"
+    assert result["counts"] == facts["counts"]
+    assert result["artifacts"] == {}
+    assert json.loads((tmp_path / "replay_experiment.json").read_text(encoding="utf-8"))["mode"] == "skipped_authoritative_trace"
 
 
 def test_v3_hard_judgement_path_is_disabled() -> None:

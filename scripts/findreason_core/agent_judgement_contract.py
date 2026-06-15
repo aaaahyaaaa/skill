@@ -132,6 +132,14 @@ def _selected_workflow_io(case_facts: dict[str, Any]) -> tuple[Any, Any]:
     return item.get("input", ""), item.get("output", "")
 
 
+def _workflow_query(workflow_input: Any) -> str:
+    if not isinstance(workflow_input, dict):
+        return ""
+    sys_input = workflow_input.get("sys") if isinstance(workflow_input.get("sys"), dict) else {}
+    query = sys_input.get("query") or workflow_input.get("query")
+    return str(query or "").strip()
+
+
 def _evaluator_summary(text: str) -> list[str]:
     rows: list[str] = []
     for match in re.finditer(r"([a-zA-Z_]+)=score:(\d+); reason:([^\n]+)", text or ""):
@@ -142,6 +150,10 @@ def _evaluator_summary(text: str) -> list[str]:
     if text:
         return [f"- raw_evaluator_note: {_short(text, 500)}"]
     return ["- 未提供评估器信号。"]
+
+
+def _has_text(value: Any) -> bool:
+    return bool(str(value or "").strip())
 
 
 def _artifact_docs(case_facts: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -167,90 +179,80 @@ def judgement_brief_markdown(case_facts: dict[str, Any]) -> str:
     trace = case_facts.get("trace") if isinstance(case_facts.get("trace"), dict) else {}
     preprocess = case_facts.get("preprocess") if isinstance(case_facts.get("preprocess"), dict) else {}
     workflow_input, workflow_output = _selected_workflow_io(case_facts)
+    prompt_docs = _artifact_docs(case_facts, "prompt_docs")
+    recall_docs = _artifact_docs(case_facts, "origin_doc_list") + _artifact_docs(case_facts, "origin_faq_list")
+    evidence_samples = prompt_docs[:4] if prompt_docs else recall_docs[:4]
+    evaluator_lines = _evaluator_summary(str(case.get("judgement") or ""))
+    answer_hint = case.get("answer_hint") or ""
+    chat_history = case.get("chat_history") or ""
+    query = (
+        str(case.get("query") or case.get("query_hint") or "").strip()
+        or _workflow_query(workflow_input)
+        or _short(preprocess.get("rewrite_query"), 300)
+        or "未采集到"
+    )
     lines = [
-        "# FindReason Agent Judgement Brief",
+        "# Agent Brief",
         "",
-        "## Case",
+        "这是一份给 Agent 快速进入现场的工作单，不是最终报告。最终给人读的结论写在 `agent_judgement.md`。",
+        "",
+        "## 现场一句话",
+        "",
+        f"用户问：{query}",
+        "",
+        f"历史答案：{_short(case_facts.get('answer'), 600) or '未采集到'}",
+        "",
+        "## 被评估目标",
+        "",
+        f"- 被评估答案 / answer_hint: {_short(answer_hint, 700) or '未提供'}",
+        f"- chat_history: {'已提供，仅用于 workflow_input_loss 对照' if _has_text(chat_history) else '未提供'}",
+        "",
+        "## 基本信息",
         "",
         f"- log_id: `{case_facts.get('log_id', '')}`",
         f"- workspace_id: `{case_facts.get('workspace_id', '')}`",
         f"- app_id: `{case_facts.get('app_id', '')}`",
-        f"- original_query: {case.get('query') or case.get('query_hint') or ''}",
-        f"- workflow_rewrite: {_short(preprocess.get('rewrite_query'), 500)}",
-        f"- workflow_keywords: {', '.join(map(str, preprocess.get('keywords') or [])) or '未采集到'}",
-        f"- wrapped_output / answer_hint: {_short(case.get('answer_hint'), 500) or '未提供'}",
-        f"- trace_answer_excerpt: {_short(case_facts.get('answer'), 500)}",
+        f"- trace_source: {trace.get('source', 'openplat_trace_detail')}",
+        f"- has_middle_node_trace: `{trace.get('has_middle_node_trace')}`",
         "",
-        "### Workflow IO",
+        "## Workflow 现场",
         "",
-        "workflow input:",
+        "输入：",
         "```json",
         _json_preview(workflow_input),
         "```",
-        "workflow output:",
+        "输出：",
         "```json",
         _json_preview(workflow_output),
         "```",
         "",
-        "### Evaluator Signals",
+        "## 评估器线索",
         "",
-        *_evaluator_summary(str(case.get("judgement") or "")),
+        "- 评估器线索是低置信诊断线索，不是事实正确性的最终裁决。",
+        *evaluator_lines,
         "",
-        "## Evidence Facts",
+        "## 证据链速览",
         "",
-        f"- trace_source: {trace.get('source', 'openplat_trace_detail')}",
-        f"- has_middle_node_trace: `{trace.get('has_middle_node_trace')}`",
+        f"- rewrite: {_short(preprocess.get('rewrite_query'), 500) or '未采集到'}",
+        f"- keywords: {', '.join(map(str, preprocess.get('keywords') or [])) or '未采集到'}",
         f"- recall: `{counts.get('recall', 0)}` (origin_doc_list=`{counts.get('origin_doc_list', 0)}`, origin_faq_list=`{counts.get('origin_faq_list', 0)}`)",
         f"- rerank_docs: `{counts.get('rerank_docs', 0)}`",
         f"- prompt_docs: `{counts.get('prompt_docs', 0)}`",
         "",
-        "### Readable Evidence Samples",
+        "## 可读证据样例",
         "",
-        "Reports must not cite raw doc id arrays alone. Use title plus link or snippet.",
+        *[line for doc in evidence_samples for line in _doc_lines(doc)],
         "",
-        "Prompt evidence samples:",
-        *[line for doc in _artifact_docs(case_facts, "prompt_docs")[:5] for line in _doc_lines(doc)],
+        "## 归因时先想这几件事",
         "",
-        "## Required Report Contract",
-        "",
-        "- Include original query, workflow input, workflow output, wrapped output, log_id, app_id, workspace_id, and evaluator signal summary.",
-        "- Include a `hypothesis -> experiment -> falsification -> current judgement` section.",
-        "- Include evidence sufficiency: required assertions, support level for key evidence, and missing authoritative evidence.",
-        "- Include attribution organization across the 5 compressed causes: `workflow_input_loss`, `suspected_knowledge_missing`, `retrieval_miss`, `rerank_drop`, `answer_failure`.",
-        "- Save local JSON artifacts for indexing; use Fornax by log_id for raw historical trace audit.",
-        "- If replay returns a new log_id or trace_id, surface it in the report; otherwise explicitly say replay returned no new log_id.",
-        "- Human evidence must show document title and link or an actual cited snippet. Doc ids may appear for audit, but never as the only evidence.",
-        "- Distinguish evidence that explains replay improvement from evidence that is sufficient for a rigorous business answer.",
-        "",
-        "## Agent Reasoning Contract",
-        "",
-        "Do not jump to an earliest failing stage. Start from answer symptoms, propose multiple candidate explanations, then use experiments to support or falsify each explanation.",
-        "",
-        "Historical trace is the badcase scene. Replay is a current-version counterfactual experiment; use it to compare evidence availability, but do not overwrite the historical recall/rerank/prompt/answer facts.",
-        "",
-        "For each candidate explanation, write:",
-        "",
-        "1. Symptom observed in the answer or evaluator note.",
-        "2. Candidate root cause and why it is plausible.",
-        "3. Evidence already supporting it.",
-        "4. Evidence that would falsify it.",
-        "5. Next recall / rerank / replay experiment.",
-        "",
-        "## Symptom To Root Cause Seeds",
-        "",
+        "- 先写清楚答案具体错在哪里，再判断是不是上游导致。",
+        "- chat_history 只用于判断 `workflow_input_loss`：对比用户上下文是否进入 Workflow input/rewrite/keywords。",
+        "- 如怀疑 `workflow_input_loss`，用上下文增强 query 做 recall/replay 对照，检查是否召回更多能明确回答问题的直接支撑文档。",
+        "- 判断 `answer_failure` 只看被评估答案、Workflow input/rewrite、评估器信号和 prompt_docs；不得用 chat_history 支撑 `answer_failure`。",
+        "- 如果核心断言在 prompt_docs 中有直接支撑，但答案仍漏答、错引、越界或编造，优先考虑 `answer_failure`。",
+        "- 如果证据只是相邻主题或不够权威，保留 `suspected_knowledge_missing` 或低置信复核。",
+        "- 证据链判断要按同一条 required assertion 串起来，不要只比较 doc id。",
+        "- 如果评估器事实正确性结论与 prompt evidence 对不上，设置 `badcase_review_status` 为 `needs_human_review_evaluator_disputed`，并给出 query、judged answer、workflow input/output、evaluator claim、关键 prompt 证据和误判理由供人工复核。",
+        "- `not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。",
     ]
-    for item in SYMPTOM_TO_ROOT_CAUSE_SEEDS:
-        lines.extend(
-            [
-                f"### {item['stage_hint']}",
-                "",
-                "- Symptom patterns:",
-                *[f"  - {text}" for text in item["symptom_patterns"]],
-                "- Candidate explanations:",
-                *[f"  - {text}" for text in item["candidate_explanations"]],
-                "- Evidence to check:",
-                *[f"  - {text}" for text in item["evidence_to_check"]],
-                "",
-            ]
-        )
     return "\n".join(lines).rstrip() + "\n"
