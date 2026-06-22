@@ -24,6 +24,7 @@ collect evidence
 - 如果证据不足，报告应写“不足以判断”的原因，而不是强行落标签。
 - 报告必须展示可读证据：文档标题 + 实际链接或援引片段；不要只贴 `prompt_doc_ids` 这类裸 id 数组。
 - 默认本地 JSON 作为可索引证据包，Fornax 按历史 `log_id` 回查原始 trace，飞书文档只作为分享/发布层。
+- 默认执行面是本地脚本 + 宿主 LLM：优先 `--trace-file` 和本地 JSON/Markdown 产物；OpenPlat trace detail、live recall/replay、飞书文档发布都只是显式可选能力。
 
 ## 当前文档
 

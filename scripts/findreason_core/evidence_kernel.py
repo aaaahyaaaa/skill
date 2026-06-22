@@ -212,6 +212,10 @@ def normalize_case_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "host_agent",
             "source_row",
             "case_id",
+            "version_id",
+            "versionId",
+            "app_version",
+            "appVersion",
         ):
             if key in payload:
                 case[key] = payload[key]
@@ -268,6 +272,7 @@ def build_case_facts(
             "chat_history": case.get("chat_history") or "",
             "source_row": case.get("source_row") or "",
             "case_id": case.get("case_id") or "",
+            "version_id": case.get("version_id") or case.get("versionId") or case.get("app_version") or case.get("appVersion") or "",
         },
         "trace": {
             "source": "openplat_trace_detail",
@@ -352,7 +357,7 @@ def schema_payload() -> dict[str, Any]:
                 "options": {
                     "recall": ["--query", "--timeout-seconds"],
                     "rerank": ["--target-doc-id"],
-                    "replay": ["--query", "--app-id", "--timeout-seconds"],
+                    "replay": ["--query", "--app-id", "--version-id", "--timeout-seconds"],
                 },
                 "outputs": ["<type>_experiment.json"],
             },
@@ -362,7 +367,7 @@ def schema_payload() -> dict[str, Any]:
                 "outputs": ["agent_judgement.md", "evidence_index.json"],
                 "constraints": [
                     "The report must be concise and directly readable as an Agent final-response draft.",
-                    "The report must include candidate cause placeholder, confidence placeholder, answer symptoms, upstream evidence summary, evidence sufficiency review, key evidence snippets, local evidence bundle paths, log_id, app_id, workspace_id, evaluator signal summary, and attribution organization.",
+                    "The report must include answer symptoms, upstream evidence summary, evidence sufficiency review, key evidence snippets, log_id, app_id, workspace_id, evaluator signal summary, and attribution organization.",
                     "Evidence sufficiency must distinguish evidence that explains replay improvement from evidence that is enough for a rigorous business answer.",
                     "The report must cite documents with title plus link or snippet; doc ids alone are not acceptable human evidence.",
                     "The local JSON artifacts remain the searchable evidence store; do not make users read raw JSON for the final judgement.",
@@ -379,4 +384,29 @@ def schema_payload() -> dict[str, Any]:
         "experiment_inputs": ["recall_templates"],
         "human_aliases": {"recall": "origin_doc_list + origin_faq_list"},
         "report_outputs": ["agent_judgement.md", "evidence_index.json"],
+        "execution_modes": {
+            "default_preferred": "local_scripts_plus_llm",
+            "local_trace": "Use collect-evidence --trace-file with local trace JSON to avoid live trace fetching.",
+            "online_opt_in": "Use OpenPlat trace detail, live recall/searchDoc, OpenPlat app detail, workspace info, and open-exec workflow replay only when explicitly needed.",
+        },
+        "live_dependencies": [
+            {
+                "name": "OpenPlat trace detail API",
+                "required": False,
+                "used_by": "collect-evidence without --trace-file",
+                "local_replacement": "--trace-file",
+            },
+            {
+                "name": "recall/searchDoc HTTP endpoint from trace template",
+                "required": False,
+                "used_by": "run-experiment --type recall --query",
+                "local_replacement": "omit --query to produce a local recall experiment plan",
+            },
+            {
+                "name": "OpenPlat app detail API, workspace info API, and open-exec workflow replay API",
+                "required": False,
+                "used_by": "run-experiment --type replay when historical trace lacks middle-node evidence",
+                "local_replacement": "authoritative historical trace with middle-node evidence",
+            },
+        ],
     }

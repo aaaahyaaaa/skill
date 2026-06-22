@@ -65,10 +65,12 @@ python -m findreason collect-evidence \
 ```bash
 python -m findreason run-experiment --type recall --facts-file /tmp/findreason-case/case_facts.json --query "<实验 query>" --output-dir /tmp/findreason-case
 python -m findreason run-experiment --type rerank --facts-file /tmp/findreason-case/case_facts.json --target-doc-id <doc_id> --output-dir /tmp/findreason-case
-python -m findreason run-experiment --type replay --facts-file /tmp/findreason-case/case_facts.json --query "<真实用户问题>" --app-id <app_id> --output-dir /tmp/findreason-case
+python -m findreason run-experiment --type replay --facts-file /tmp/findreason-case/case_facts.json --query "<真实用户问题>" --app-id <app_id> --version-id <version_id> --output-dir /tmp/findreason-case
 ```
 
 不传 `--query` 时，recall 实验只输出 query variant 规划；传入 `--query` 且 trace 中有 recall/searchDoc 请求模板时，代码会复用模板执行一次 query override。rerank 实验输出 doc-id 生存观察，不直接等价为同断言丢失。
+
+`--version-id` / `--app-version` 只用于 replay 的 app-detail 解析。用户提供时会作为 `appVersion` 传给 `/open-plat/api/app/get-app-detail`；用户没有提供时不传 `appVersion`，由平台接口返回最新版本。
 
 报告合成入口：
 

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class Stage(str, Enum):
@@ -25,13 +25,17 @@ class EvidenceDoc(BaseModel):
 
 
 class CaseInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     query: str = Field(..., min_length=1)
     query_hint: Optional[str] = None
     judgement: str = ""
     workspace_id: str = Field(..., min_length=1)
     app_id: str = Field(..., min_length=1)
+    version_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("version_id", "versionId", "app_version", "appVersion"),
+    )
     retrieve_query_list: List[str] = Field(default_factory=list)
     case_id: Optional[str] = None
     source_row: Optional[str] = None

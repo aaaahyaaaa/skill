@@ -1,6 +1,6 @@
 {
   "name": "findreason-rag-attribution",
-  "version": "0.4.0-agent-judgement",
+  "version": "0.4.2-no-batch-run",
   "schema_version": "agent-judgement-v4",
   "runtime": "python",
   "entrypoint": "python -m findreason",
@@ -30,7 +30,7 @@
       "id": "run_experiment_replay",
       "command": "run-experiment --type replay",
       "description": "Replay workflow as a current-version experiment and return normalized recall/rerank/prompt/answer evidence.",
-      "inputs": ["facts_file", "query", "app_id", "output_dir"],
+      "inputs": ["facts_file", "query", "app_id", "version_id", "app_version", "output_dir"],
       "outputs": ["replay_experiment.json"]
     },
     {
@@ -60,9 +60,29 @@
     "references/recall_chain.md",
     "references/report_contract.md"
   ],
+  "execution_modes": {
+    "default_preferred": "local_scripts_plus_llm",
+    "local_trace": "Use collect-evidence --trace-file with local trace JSON to avoid live trace fetching.",
+    "online_opt_in": "Use OpenPlat trace detail, live recall/searchDoc, OpenPlat app detail, workspace info, and open-exec workflow replay only when explicitly needed."
+  },
   "live_dependencies": [
-    "OpenPlat trace detail API",
-    "bytedcli RDS query for workflow replay resolution",
-    "open-exec workflow replay API"
+    {
+      "name": "OpenPlat trace detail API",
+      "required": false,
+      "used_by": "collect-evidence without --trace-file",
+      "local_replacement": "--trace-file"
+    },
+    {
+      "name": "recall/searchDoc HTTP endpoint from trace template",
+      "required": false,
+      "used_by": "run-experiment --type recall --query",
+      "local_replacement": "omit --query to produce a local recall experiment plan"
+    },
+    {
+      "name": "OpenPlat app detail API, workspace info API, and open-exec workflow replay API",
+      "required": false,
+      "used_by": "run-experiment --type replay when historical trace lacks middle-node evidence",
+      "local_replacement": "authoritative historical trace with middle-node evidence"
+    }
   ]
 }
