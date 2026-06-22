@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import subprocess
 from typing import Any
 
 import httpx
@@ -13,11 +11,9 @@ from .models import AttributionRequest, EvidenceDoc, WorkflowReplayEvidence
 DEFAULT_WORKFLOW_REPLAY_URL = ""
 OPEN_PLAT_ZS_OPEN_TOKEN = "37160d0535224506965a54e58e0685c4"
 WORKFLOW_OPEN_EXEC_BASE_URL = "https://zhishang.bytedance.net"
-WORKFLOW_RDS_DATABASE = "zs_open"
+OPEN_PLAT_APP_DETAIL_URL = "https://zhishang.bytedance.net/open-plat/api/app/get-app-detail"
 OPEN_PLAT_WORKSPACE_INFO_URL = "https://zhishang.bytedance.net/open-plat/api/workspace/get-workspace-info"
-BYTEDCLI_BIN = "bytedcli"
-WORKFLOW_RDS_TIMEOUT_SECONDS = 30.0
-WORKFLOW_PUBLISHED_STATUS = "1"
+OPEN_PLAT_TIMEOUT_SECONDS = 30.0
 MAX_REPLAY_VALUE_CHARS = 12000
 FAQ_RECALL_SOURCES = {"featured_search"}
 DOC_RECALL_SOURCES = {"doc_search", "self_dataset_search", "suite_dataset"}
@@ -58,51 +54,22 @@ def _numeric_id(value: Any, field_name: str) -> str:
     return text
 
 
-def _run_bytedcli_query(database: str, sql: str) -> list[dict[str, Any]]:
-    env = os.environ.copy()
-    env.setdefault("NPM_CONFIG_REGISTRY", "http://bnpm.byted.org")
-    commands = [[BYTEDCLI_BIN, "--json", "rds", "db", "query", database, sql]]
-    commands.append(
-        [
-            "npx",
-            "-y",
-            "@bytedance-dev/bytedcli@latest",
-            "--json",
-            "rds",
-            "db",
-            "query",
-            database,
-            sql,
-        ]
-    )
-    last_error = ""
-    completed = None
-    for command in commands:
-        try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=WORKFLOW_RDS_TIMEOUT_SECONDS, env=env, check=False)
-        except FileNotFoundError as exc:
-            last_error = str(exc)
-            continue
-        if completed.returncode == 0:
-            break
-        last_error = completed.stderr.strip() or completed.stdout.strip() or f"exit={completed.returncode}"
-    if completed is None:
-        raise WorkflowResolverError(f"bytedcli not found: {last_error[:500]}")
-    if completed.returncode != 0:
-        raise WorkflowResolverError(f"bytedcli RDS query failed: {last_error[:500]}")
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise WorkflowResolverError(f"bytedcli RDS query returned non-json output: {completed.stdout[:300]}") from exc
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
-        data = payload.get("data")
-        if isinstance(data, dict) and isinstance(data.get("data"), list):
-            return [item for item in data["data"] if isinstance(item, dict)]
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-    raise WorkflowResolverError("bytedcli RDS query returned an unsupported payload shape")
+def _optional_numeric_id(value: Any, field_name: str) -> str | None:
+    text = str(value or "").strip()
+    return _numeric_id(text, field_name) if text else None
+
+
+def _bearer_token(token: str) -> str:
+    text = str(token or "").strip()
+    return text if text.lower().startswith("bearer ") else f"Bearer {text}"
+
+
+def _openplat_headers(token: str) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "x-zs-plt-open": "zs_open",
+        "Authorization": _bearer_token(token),
+    }
 
 
 def _find_list_key(value: Any, keys: set[str]) -> list[Any] | None:
@@ -354,56 +321,59 @@ def _parse_workflow_config(value: Any) -> dict[str, Any]:
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError as exc:
-            raise WorkflowResolverError("applications_wip.workflow_config_v2 is not valid JSON") from exc
+            raise WorkflowResolverError("workflowConfigV2 is not valid JSON") from exc
         if isinstance(parsed, dict):
             return parsed
-    raise WorkflowResolverError("applications_wip.workflow_config_v2 is empty or unsupported")
+    raise WorkflowResolverError("workflowConfigV2 is empty or unsupported")
 
 
 def resolve_workflow(request: AttributionRequest, version_id: str | None = None) -> dict[str, Any]:
     case_input = request.case_input
     workspace_id = _numeric_id(case_input.workspace_id, "workspace_id")
     app_id = _numeric_id(case_input.app_id, "app_id")
-    database = WORKFLOW_RDS_DATABASE
-    app_rows = _run_bytedcli_query(
-        database,
-        (
-            "select id, workspace_id, name, status, version_id "
-            f"from applications where workspace_id = {workspace_id} and id = {app_id} limit 1"
-        ),
-    )
-    if not app_rows:
-        raise WorkflowResolverError(f"applications not found for workspace_id={workspace_id}, app_id={app_id} in {database}")
-    version = version_id
+    version = _optional_numeric_id(version_id or case_input.version_id, "version_id")
+    bootstrap_token, bootstrap_source = _openplat_bootstrap_token()
+    if not bootstrap_token:
+        raise WorkflowResolverError("OpenPlat bootstrap token is not configured")
+    params: dict[str, str] = {"appId": app_id, "workspaceId": workspace_id}
     if version:
-        version = _numeric_id(version, "version_id")
-        wip_where = f"workspace_id = {workspace_id} and app_id = {app_id} and version_id = {version}"
-    else:
-        published_status = _numeric_id(WORKFLOW_PUBLISHED_STATUS, "WORKFLOW_PUBLISHED_STATUS")
-        wip_where = f"workspace_id = {workspace_id} and app_id = {app_id} and status = {published_status}"
-    wip_rows = _run_bytedcli_query(
-        database,
-        (
-            "select id, app_id, workspace_id, name, status, version_id, workflow_config_v2 "
-            f"from applications_wip where {wip_where} order by id desc limit 1"
-        ),
-    )
-    if not wip_rows:
-        raise WorkflowResolverError(f"applications_wip not found for workspace_id={workspace_id}, app_id={app_id}, version={version or 'published'} in {database}")
-    app_row = app_rows[0]
-    wip_row = wip_rows[0]
-    workflow_config = _parse_workflow_config(wip_row.get("workflow_config_v2"))
+        params["appVersion"] = version
+    try:
+        with httpx.Client(timeout=OPEN_PLAT_TIMEOUT_SECONDS) as client:
+            response = client.get(
+                OPEN_PLAT_APP_DETAIL_URL,
+                params=params,
+                headers=_openplat_headers(bootstrap_token),
+            )
+    except Exception as exc:
+        raise WorkflowResolverError(f"OpenPlat app detail lookup failed: {_safe_error(exc)}") from exc
+    if response.status_code >= 400:
+        raise WorkflowResolverError(f"OpenPlat app detail HTTP {response.status_code}: {response.text[:500]}")
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise WorkflowResolverError(f"OpenPlat app detail returned non-json output: {response.text[:300]}") from exc
+    if not isinstance(payload, dict):
+        raise WorkflowResolverError("OpenPlat app detail returned an unsupported payload shape")
+    code = payload.get("code")
+    if code not in (None, 0):
+        raise WorkflowResolverError(f"OpenPlat app detail returned code={code}; msg={str(payload.get('msg') or '')[:300]}")
+    app_detail = payload.get("data")
+    if not isinstance(app_detail, dict):
+        raise WorkflowResolverError(f"OpenPlat app detail returned no data for workspace_id={workspace_id}, app_id={app_id}")
+    workflow_config = _parse_workflow_config(app_detail.get("workflowConfigV2") or app_detail.get("workflow_config_v2"))
     input_schema = _extract_start_schema(workflow_config)
     workflow_config_summary = _workflow_config_summary(workflow_config)
     return {
-        "source": "rds",
-        "database": database,
-        "workspace_id": str(app_row.get("workspace_id") or workspace_id),
-        "app_id": str(app_row.get("id") or app_id),
-        "app_name": str(app_row.get("name") or wip_row.get("name") or ""),
-        "version_id": str(wip_row.get("version_id") or app_row.get("version_id") or ""),
-        "wip_id": str(wip_row.get("id") or ""),
-        "status": wip_row.get("status"),
+        "source": "openplat_app_detail",
+        "endpoint": OPEN_PLAT_APP_DETAIL_URL,
+        "request_params": params,
+        "auth_token_source": f"openplat_bootstrap:{bootstrap_source}",
+        "workspace_id": str(app_detail.get("workspaceId") or app_detail.get("workspace_id") or workspace_id),
+        "app_id": str(app_detail.get("appId") or app_detail.get("app_id") or app_id),
+        "app_name": str(app_detail.get("name") or ""),
+        "version_id": str(app_detail.get("versionId") or app_detail.get("version_id") or version or ""),
+        "status": app_detail.get("versionType") if "versionType" in app_detail else app_detail.get("status"),
         "input_schema": input_schema,
         "workflow_config": workflow_config_summary,
     }
@@ -891,10 +861,7 @@ async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, st
             response = await client.get(
                 OPEN_PLAT_WORKSPACE_INFO_URL,
                 params={"workspaceId": workspace_id},
-                headers={
-                    "x-zs-plt-open": "zs_open",
-                    "Authorization": f"Bearer {bootstrap_token}",
-                },
+                headers=_openplat_headers(bootstrap_token),
             )
         if response.status_code >= 400:
             raise WorkflowResolverError(f"workspace info HTTP {response.status_code}: {response.text[:500]}")

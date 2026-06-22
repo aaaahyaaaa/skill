@@ -1,4 +1,4 @@
 interface:
   display_name: "FindReason RAG Attribution"
   short_description: "Run FindReason badcase attribution from pasted cases or Fornax traces"
-  default_prompt: "Use $findreason-rag-attribution to inspect trace artifacts, run needed recall/rerank/replay experiments, then give the user a concise judgement summary with candidate_cause, confidence, answer symptoms, upstream evidence, key snippets, and missing evidence. Keep JSON artifacts for audit; do not make the user read them."
+  default_prompt: "Use $findreason-rag-attribution through local python -m findreason scripts first. Prefer local case files, local trace JSON, and --trace-file; do not rely on Fornax, bytedcli, browser, MCP, or sub-agent tools unless the user explicitly asks for live fetching or publishing. Inspect generated case_facts.json, agent_brief.md, experiment JSON, and agent_judgement.md, then give a concise judgement summary with candidate_cause, confidence, answer symptoms, upstream evidence, key snippets, and missing evidence."

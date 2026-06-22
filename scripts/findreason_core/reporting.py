@@ -260,43 +260,6 @@ def build_evidence_index(
         "case_id": (facts.get("case") or {}).get("case_id") if isinstance(facts.get("case"), dict) else "",
         "replay_log_ids": replay_log_ids,
         "indexing_recommendation": "Use local JSON artifacts as the authoritative searchable evidence bundle; use Fornax by historical log_id for raw trace audit. Publish Markdown/Feishu docs for human review, not as the only evidence store.",
-        "sufficiency_review_contract": {
-            "purpose": "Agent reviews whether evidence is enough to produce a rigorous business answer, not just whether it explains the attribution.",
-            "support_levels": [
-                "direct_support",
-                "partial_support",
-                "adjacent_support",
-                "insufficient",
-                "contradictory",
-            ],
-            "agent_fields": [
-                "required_assertions",
-                "supports_assertions",
-                "support_level",
-                "missing_authoritative_evidence",
-            ],
-        },
-        "badcase_review_contract": {
-            "purpose": "Keep evaluator-disputed badcases separate from the five root-cause labels.",
-            "statuses": [
-                "valid_badcase",
-                "needs_human_review_evaluator_disputed",
-                "not_badcase_evaluator_error",
-            ],
-            "human_review_context_fields": [
-                "query",
-                "judged_answer",
-                "workflow_input",
-                "workflow_output",
-                "evaluator_claim",
-                "key_prompt_evidence",
-                "why_evaluator_may_be_wrong",
-            ],
-            "rules": [
-                "Use needs_human_review_evaluator_disputed when evaluator factual correctness conflicts with prompt evidence.",
-                "Use not_badcase_evaluator_error only after human confirmation or explicit human label.",
-            ],
-        },
         "docs": docs,
         "report_rule": "Human reports must cite title/link/snippet. Doc ids may be shown for audit, but never as the only evidence.",
     }
@@ -354,18 +317,21 @@ def synthesize_report_markdown(
         "",
         f"评估器线索：{evaluator_text}",
         "",
-        "## 现场事实",
+        "## 审计锚点",
         "",
         f"- log_id=`{historical_log_id}`，workspace_id=`{facts.get('workspace_id', '')}`，app_id=`{app_id}`，replay_log_id={replay_log_line}",
-        f"- workflow 输入：`{_compact_json(workflow_input, 600)}`",
-        f"- workflow 输出：`{_compact_json(workflow_output, 700)}`",
-        f"- preprocess：rewrite 是「{_short(preprocess.get('rewrite_query'), 300) or '未采集到'}」；keywords 是 {keywords}",
-        f"- recall：共 `{counts.get('recall', 0)}` 条，其中 origin_doc_list=`{counts.get('origin_doc_list', 0)}`、origin_faq_list=`{counts.get('origin_faq_list', 0)}`",
-        f"- rerank/prompt：rerank_docs=`{counts.get('rerank_docs', 0)}`，prompt_docs=`{counts.get('prompt_docs', 0)}`；missing_from_rerank={', '.join(map(str, missing_rerank)) or '无'}，missing_from_prompt={', '.join(map(str, missing_prompt)) or '无'}",
-        f"- 实验：{recall_status}；{rerank_status}；{replay_status}",
+        f"- Workflow 摘要：输入 `{_compact_json(workflow_input, 360)}`；输出 `{_compact_json(workflow_output, 360)}`",
+        f"- 上游摘要：rewrite「{_short(preprocess.get('rewrite_query'), 200) or '未采集到'}」；keywords {keywords}",
+        f"- 证据生存：召回 `{counts.get('recall', 0)}` 条，重排 `{counts.get('rerank_docs', 0)}` 条，进入 prompt `{counts.get('prompt_docs', 0)}` 条；重排缺失 {', '.join(map(str, missing_rerank)) or '无'}，prompt 缺失 {', '.join(map(str, missing_prompt)) or '无'}",
+        "",
+        "## 被评估目标",
+        "",
+        f"- 原始 query：{_short(query, 500) or '未采集到'}",
+        f"- 被评估答案 / answer_hint：{_short(case.get('answer_hint'), 700) or answer_text}",
+        f"- trace answer：{answer_text}",
+        f"- replay answer：{_short(replay.get('answer'), 500) if replay.get('answer') else '未返回'}",
+        f"- 实验状态：{recall_status}；{rerank_status}；{replay_status}",
     ]
-    if replay.get("answer"):
-        lines.append(f"- replay answer：{_short(replay.get('answer'), 500)}")
     lines.extend(["", "## 关键证据", ""])
     if key_docs:
         for doc in key_docs:
@@ -375,17 +341,13 @@ def synthesize_report_markdown(
     lines.extend(
         [
             "",
+            "## 评估器与复核",
+            "",
+            "`badcase_review_status` 独立于五类 root cause。若评估器事实正确性结论与 prompt evidence 对不上，先标 `needs_human_review_evaluator_disputed`，并给出 query、judged answer、Workflow input/output、evaluator claim、关键 prompt 证据和怀疑误判原因；`not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。",
+            "",
             "## 当前还不能直接裁决的地方",
             "",
             "自动合成只整理到证据层，还没有完成答案症状抽取和 required assertions 对齐，所以这里不直接给 `candidate_cause`。如果后续对齐发现关键断言已经在 prompt 中有直接支撑，但答案仍漏答、错引、越界或编造，才适合落到 `answer_failure`；如果 prompt 里本身没有足够权威支撑，就应该回溯知识、recall 或 rerank。",
-            "",
-            "## 人工复核维度",
-            "",
-            "`badcase_review_status` 独立于五类 root cause。若评估器事实正确性结论与 prompt evidence 对不上，先标 `needs_human_review_evaluator_disputed`，并给出 query、judged answer、workflow input/output、evaluator claim、关键 prompt 证据和怀疑误判原因；`not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。",
-            "",
-            "## 本地证据包",
-            "",
-            f"`case_facts.json` 保存历史 trace 事实；`recall_experiment.json`、`rerank_experiment.json`、`replay_experiment.json` 保存实验结果；`{evidence_index_path}` 是可索引证据包。它们是复盘底座，不是给用户阅读的最终答案。",
         ]
     )
     return "\n".join(lines).rstrip() + "\n"

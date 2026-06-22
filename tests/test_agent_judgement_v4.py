@@ -99,6 +99,39 @@ def trace_with_recall_template() -> dict:
     return trace
 
 
+def test_cli_does_not_expose_batch_commands() -> None:
+    import argparse
+    import importlib.util
+
+    cli_path = SKILL_ROOT / "scripts" / "findreason.py"
+    spec = importlib.util.spec_from_file_location("_findreason_cli_no_batch_test", cli_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    parser = module.build_parser()
+    subparsers = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+
+    assert "batch-run" not in subparsers.choices
+    assert "batch-summarize" not in subparsers.choices
+    version_args = parser.parse_args(
+        [
+            "run-experiment",
+            "--type",
+            "replay",
+            "--facts-file",
+            "/tmp/case_facts.json",
+            "--query",
+            "query",
+            "--app-id",
+            "1001883",
+            "--app-version",
+            "7",
+        ]
+    )
+    assert version_args.version_id == "7"
+
+
 def test_collect_evidence_builds_case_facts_without_hard_cause(monkeypatch: pytest.MonkeyPatch) -> None:
     from findreason_core.evidence_kernel import build_case_facts
 
@@ -464,6 +497,165 @@ def test_replay_experiment_skips_when_authoritative_trace_exists(
     assert result["counts"] == facts["counts"]
     assert result["artifacts"] == {}
     assert json.loads((tmp_path / "replay_experiment.json").read_text(encoding="utf-8"))["mode"] == "skipped_authoritative_trace"
+
+
+def test_resolve_workflow_uses_openplat_app_detail_with_user_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    import findreason_core.workflow_replay as workflow_replay
+    from findreason_core.models import AttributionRequest, CaseInput
+
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, object]:
+            return {
+                "code": 0,
+                "data": {
+                    "appId": 1001883,
+                    "workspaceId": 138,
+                    "name": "接口应用",
+                    "versionId": 7,
+                    "versionType": 1,
+                    "workflowConfigV2": json.dumps(
+                        {
+                            "nodes": [
+                                {
+                                    "id": "start",
+                                    "type": "Start",
+                                    "data": {
+                                        "output_params": [
+                                            {"key": "query", "type": "String", "required": True}
+                                        ]
+                                    },
+                                }
+                            ],
+                            "edges": [],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, timeout: int) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def get(self, endpoint: str, *, params: dict[str, object], headers: dict[str, str]) -> FakeResponse:
+            calls.append({"endpoint": endpoint, "params": params, "headers": headers, "timeout": self.timeout})
+            return FakeResponse()
+
+    monkeypatch.setattr(workflow_replay.httpx, "Client", FakeClient)
+
+    request = AttributionRequest(
+        case_input=CaseInput(query="query", workspace_id="138", app_id="1001883", version_id="7")
+    )
+
+    resolved = workflow_replay.resolve_workflow(request)
+
+    assert resolved["source"] == "openplat_app_detail"
+    assert resolved["app_id"] == "1001883"
+    assert resolved["workspace_id"] == "138"
+    assert resolved["version_id"] == "7"
+    assert resolved["app_name"] == "接口应用"
+    assert resolved["input_schema"][0]["key"] == "query"
+    assert calls[0]["params"] == {"appId": "1001883", "workspaceId": "138", "appVersion": "7"}
+    assert calls[0]["headers"]["Authorization"] == "Bearer 37160d0535224506965a54e58e0685c4"
+    assert calls[0]["headers"]["x-zs-plt-open"] == "zs_open"
+
+
+def test_resolve_workflow_omits_app_version_when_user_does_not_provide_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    import findreason_core.workflow_replay as workflow_replay
+    from findreason_core.models import AttributionRequest, CaseInput
+
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, object]:
+            return {
+                "code": 0,
+                "data": {
+                    "appId": 1001883,
+                    "workspaceId": 138,
+                    "name": "最新版本应用",
+                    "versionId": 9,
+                    "versionType": 0,
+                    "workflowConfigV2": json.dumps({"nodes": [], "edges": []}, ensure_ascii=False),
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, timeout: int) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def get(self, endpoint: str, *, params: dict[str, object], headers: dict[str, str]) -> FakeResponse:
+            calls.append({"endpoint": endpoint, "params": params, "headers": headers})
+            return FakeResponse()
+
+    monkeypatch.setattr(workflow_replay.httpx, "Client", FakeClient)
+
+    request = AttributionRequest(case_input=CaseInput(query="query", workspace_id="138", app_id="1001883"))
+
+    resolved = workflow_replay.resolve_workflow(request)
+
+    assert resolved["source"] == "openplat_app_detail"
+    assert resolved["version_id"] == "9"
+    assert calls[0]["params"] == {"appId": "1001883", "workspaceId": "138"}
+
+
+def test_replay_experiment_passes_version_id_from_facts_to_workflow_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import findreason_core.experiments as experiments
+    from findreason_core.evidence_kernel import write_json
+    from findreason_core.experiments import run_experiment
+
+    seen: dict[str, object] = {}
+    facts = {
+        "schema_version": "agent-judgement-v4",
+        "log_id": "log",
+        "workspace_id": "138",
+        "app_id": "1001883",
+        "case": {"query": "query", "version_id": "7"},
+        "trace": {"has_middle_node_trace": False},
+    }
+    facts_file = tmp_path / "case_facts.json"
+    write_json(facts_file, facts)
+
+    async def fake_replay_workflow(request: object) -> object:
+        seen["version_id"] = getattr(request.case_input, "version_id", None)
+        enriched = request.model_copy(deep=True)
+        enriched.workflow_replay.status = "ok"
+        enriched.workflow_replay.extracted_evidence = {
+            "origin_doc_list": [],
+            "origin_faq_list": [],
+            "rerank_docs": [],
+            "prompt_docs": [],
+        }
+        return enriched
+
+    monkeypatch.setattr(experiments, "replay_workflow", fake_replay_workflow)
+
+    result = run_experiment(experiment_type="replay", facts_file=str(facts_file), output_dir=str(tmp_path))
+
+    assert result["status"] == "ok"
+    assert seen["version_id"] == "7"
 
 
 def test_v3_hard_judgement_path_is_disabled() -> None:

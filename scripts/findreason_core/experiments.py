@@ -19,10 +19,22 @@ def _case_from_facts(facts: dict[str, Any]) -> dict[str, Any]:
         "query": case.get("query") or case.get("query_hint") or "unknown query",
         "workspace_id": facts.get("workspace_id") or case.get("workspace_id") or "",
         "app_id": facts.get("app_id") or case.get("app_id") or "",
+        "version_id": (
+            facts.get("version_id")
+            or facts.get("versionId")
+            or facts.get("app_version")
+            or facts.get("appVersion")
+            or case.get("version_id")
+            or case.get("versionId")
+            or case.get("app_version")
+            or case.get("appVersion")
+            or ""
+        ),
     }
 
 
 def _base_envelope(experiment_type: str, facts: dict[str, Any]) -> dict[str, Any]:
+    case = _case_from_facts(facts)
     return {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "experiment_result",
@@ -30,6 +42,7 @@ def _base_envelope(experiment_type: str, facts: dict[str, Any]) -> dict[str, Any
         "log_id": facts.get("log_id", ""),
         "workspace_id": facts.get("workspace_id", ""),
         "app_id": facts.get("app_id", ""),
+        "version_id": case.get("version_id", ""),
         "code_role": "run experiment and return observations; do not select root cause",
     }
 
@@ -326,7 +339,13 @@ def run_recall_experiment(
     return envelope
 
 
-def run_replay_experiment(facts: dict[str, Any], *, query: str | None = None, app_id: str | None = None) -> dict[str, Any]:
+def run_replay_experiment(
+    facts: dict[str, Any],
+    *,
+    query: str | None = None,
+    app_id: str | None = None,
+    version_id: str | None = None,
+) -> dict[str, Any]:
     envelope = _base_envelope("replay", facts)
     trace = facts.get("trace") if isinstance(facts.get("trace"), dict) else {}
     if trace.get("has_middle_node_trace"):
@@ -347,6 +366,7 @@ def run_replay_experiment(facts: dict[str, Any], *, query: str | None = None, ap
     case = _case_from_facts(facts)
     replay_query = query or case["query"]
     replay_app_id = app_id or case["app_id"]
+    replay_version_id = version_id or case.get("version_id") or None
     if not replay_query or replay_query == "unknown query" or not replay_app_id:
         envelope.update(
             {
@@ -361,8 +381,11 @@ def run_replay_experiment(facts: dict[str, Any], *, query: str | None = None, ap
             query=replay_query,
             workspace_id=str(case["workspace_id"]),
             app_id=str(replay_app_id),
+            version_id=str(replay_version_id) if replay_version_id else None,
         )
     )
+    if replay_version_id:
+        envelope["version_id"] = str(replay_version_id)
     enriched = asyncio.run(replay_workflow(request))
     replay = enriched.workflow_replay
     extracted = replay.extracted_evidence if isinstance(replay.extracted_evidence, dict) else {}
@@ -380,6 +403,7 @@ def run_replay_experiment(facts: dict[str, Any], *, query: str | None = None, ap
             "auth_token_source": replay.auth_token_source,
             "error": replay.error,
             "notes": replay.notes,
+            "resolved_app": replay.resolved_app,
             "counts": normalized["counts"],
             "artifacts": normalized["artifacts"],
             "answer": extracted.get("answer", ""),
@@ -398,6 +422,7 @@ def run_experiment(
     output_dir: str | None = None,
     query: str | None = None,
     app_id: str | None = None,
+    version_id: str | None = None,
     target_doc_ids: list[str] | None = None,
     timeout_seconds: int = 90,
 ) -> dict[str, Any]:
@@ -407,7 +432,7 @@ def run_experiment(
     elif experiment_type == "rerank":
         result = run_rerank_experiment(facts, target_doc_ids=target_doc_ids)
     elif experiment_type == "replay":
-        result = run_replay_experiment(facts, query=query, app_id=app_id)
+        result = run_replay_experiment(facts, query=query, app_id=app_id, version_id=version_id)
     else:
         result = {
             "schema_version": SCHEMA_VERSION,
