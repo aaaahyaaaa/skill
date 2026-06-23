@@ -577,9 +577,27 @@ def _select_trace_segment(spans: list[dict[str, Any]]) -> tuple[dict[str, Any] |
         return None, [], {}
     best_index = max(range(len(segments)), key=lambda index: analyses[index]["score"])
     best_analysis = analyses[best_index]
-    if best_analysis.get("score", 0) <= 0:
+    if best_analysis.get("score", 0) > 0:
+        return segments[best_index], analyses, best_analysis
+    evidence_index = max(
+        range(len(segments)),
+        key=lambda index: (
+            analyses[index]["origin_doc_count"]
+            + analyses[index]["origin_faq_count"]
+            + analyses[index]["rerank_doc_count"]
+            + analyses[index]["prompt_doc_count"]
+        ),
+    )
+    evidence_analysis = analyses[evidence_index]
+    evidence_count = (
+        evidence_analysis["origin_doc_count"]
+        + evidence_analysis["origin_faq_count"]
+        + evidence_analysis["rerank_doc_count"]
+        + evidence_analysis["prompt_doc_count"]
+    )
+    if evidence_count <= 0:
         return None, analyses, {}
-    return segments[best_index], analyses, best_analysis
+    return segments[evidence_index], analyses, evidence_analysis
 
 
 def _normalize_url(value: str) -> str:

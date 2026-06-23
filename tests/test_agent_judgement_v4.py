@@ -99,6 +99,82 @@ def trace_with_recall_template() -> dict:
     return trace
 
 
+def trace_with_zero_score_workflow_segment() -> dict:
+    return {
+        "data": {
+            "spans": [
+                {
+                    "span_id": "workflow",
+                    "span_type": "workflow",
+                    "input": json.dumps({"sys": {"query": "如何进行千川乘方全店推广"}}, ensure_ascii=False),
+                    "output": json.dumps({"end": "测试答案"}, ensure_ascii=False),
+                },
+                {
+                    "span_id": "recall-sub-query",
+                    "parent_id": "workflow",
+                    "span_type": "recall_sub_query",
+                    "span_name": "RecallSubQuery",
+                    "output": json.dumps({"query": "如何进行千川乘方全店推广"}, ensure_ascii=False),
+                },
+                {
+                    "span_id": "rag-recall",
+                    "parent_id": "workflow",
+                    "span_type": "ZhiShangRAGRecall",
+                    "span_name": "知商召回1",
+                    "output": json.dumps(
+                        {
+                            "origin_doc_list": [
+                                {
+                                    "id": "201294",
+                                    "identifier": "2953471",
+                                    "title": "千川乘方产品手册",
+                                    "content": "点击：乘方-选择商品-全店托管。系统自动优选全店潜力商品进行投放。",
+                                }
+                            ],
+                            "origin_faq_list": [
+                                {
+                                    "id": "2176387",
+                                    "identifier": "727404",
+                                    "type": 4,
+                                    "title": "千川乘方核心优势",
+                                    "content": "使用乘方即可享受电商技术服务费减免至0.6%",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "span_id": "rag-rerank",
+                    "parent_id": "workflow",
+                    "span_type": "ZhiShangRAGRerank",
+                    "span_name": "知商重排1",
+                    "output": json.dumps(
+                        {
+                            "rerank_docs": [
+                                {
+                                    "id": "201294",
+                                    "identifier": "2953471",
+                                    "title": "千川乘方产品手册",
+                                    "content": "点击：乘方-选择商品-全店托管。系统自动优选全店潜力商品进行投放。",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "span_id": "end",
+                    "parent_id": "workflow",
+                    "span_type": "End",
+                    "span_name": "结束",
+                    "output": json.dumps({"end": "测试答案"}, ensure_ascii=False),
+                },
+            ]
+        }
+    }
+
+
 def test_cli_does_not_expose_batch_commands() -> None:
     import argparse
     import importlib.util
@@ -265,6 +341,26 @@ def test_collect_evidence_extracts_recall_template_for_experiment(monkeypatch: p
     assert templates[0]["endpoint"].endswith("/api/sirius_plugin/v1/recall")
     assert templates[0]["request_body"]["oriQuery"] == "old query"
     assert templates[0]["headers"]["Authorization"] == "Bearer <redacted>"
+
+
+def test_collect_evidence_uses_workflow_segment_recall_when_score_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findreason_core.evidence_kernel import build_case_facts
+
+    monkeypatch.setenv("FINDREASON_TRACE_WORKFLOW_MAPPING", "false")
+    facts = build_case_facts(
+        workspace_id="138",
+        log_id="segment-log",
+        app_id="1001883",
+        case={"query": "如何进行千川乘方全店推广"},
+        trace_payload=trace_with_zero_score_workflow_segment(),
+        trace_meta={"source": "unit"},
+    )
+
+    assert facts["counts"] == {"origin_doc_list": 1, "origin_faq_list": 1, "recall": 2, "rerank_docs": 1, "prompt_docs": 0}
+    assert facts["artifacts"]["origin_doc_list"][0]["title"] == "千川乘方产品手册"
+    assert facts["artifacts"]["origin_faq_list"][0]["title"] == "千川乘方核心优势"
+    assert facts["trace"]["summary"]["selected_workflow_segment"]["workflow_span_id"] == "workflow"
+    assert facts["raw_trace_evidence"]["origin_doc_list_raw"][0]["identifier"] == "2953471"
 
 
 def test_agent_brief_is_case_specific_working_note() -> None:
