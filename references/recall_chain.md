@@ -99,7 +99,7 @@ FindReason 报告里使用人读名称 `recall`，但审计时必须保留 trace
 4. 非 API 请求且用户部门属于高权限列表时，公共路径可默认扩到 `L1,L2,L3`。
 5. 其他公共知识路径默认 `L1,L2`，或使用 `params.public_doc_levels`。
 
-所以判断 `retrieval_miss` 时，不要只看“知识是否存在”。还要看 trace 里的 label、密级、caller、auth_codes、cognition_tag 是否把正确知识过滤掉。
+所以判断 `召回遗漏`（旧 slug: `retrieval_miss`）时，不要只看“知识是否存在”。还要看 trace 里的 label、密级、caller、auth_codes、cognition_tag 是否把正确知识过滤掉。
 
 ## Rerank And Prompt
 

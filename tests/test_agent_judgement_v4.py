@@ -132,6 +132,101 @@ def test_cli_does_not_expose_batch_commands() -> None:
     assert version_args.version_id == "7"
 
 
+def test_reference_case_playbooks_cover_trace_acquisition_modes() -> None:
+    cases_dir = SKILL_ROOT / "references" / "cases"
+    expected = {
+        "019eee75-local-trace-workflow-input-loss.md": [
+            "019eee75-59cc-7b82-9dae-368f21808b14",
+            "local_trace_json",
+            "--trace-file",
+            "workflow_input_loss",
+            "输入侧问题",
+            "验证 query",
+            "python3 -m findreason collect-evidence",
+        ],
+        "019eef8d-rerun-input-knowledge-missing.md": [
+            "019eef8d-bf8e-7e90-a605-98a95d636ed9",
+            "rerun_from_original_input",
+            "暂停计划、预算撞线、密集上调ROI",
+            "suspected_knowledge_missing",
+            "知识缺失或证据不足",
+            "replay_experiment.json",
+        ],
+        "019ece69-logid-trace-retrieval-miss.md": [
+            "019ece69-e987-7212-b341-222bcd4ff6ec",
+            "logid_trace_fetch",
+            "021780901906425fdbddc03001b0c040000000000000034bbaafd",
+            "208332",
+            "retrieval_miss",
+            "召回遗漏",
+        ],
+    }
+
+    for filename, required_strings in expected.items():
+        text = (cases_dir / filename).read_text(encoding="utf-8")
+        for heading in [
+            "## 适用场景",
+            "## 执行链路",
+            "## 证据链",
+            "## 候选根因",
+            "## 最终 judgement",
+            "## 反证与下一步",
+        ]:
+            assert heading in text
+        for required in required_strings:
+            assert required in text
+
+    skill_text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert "references/cases/" in skill_text
+    openai_yaml = (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
+    assert "python3 -m findreason" in openai_yaml
+    assert "local python -m findreason" not in openai_yaml
+
+
+def test_cause_taxonomy_contract_is_chinese_with_guardrails() -> None:
+    files = [
+        SKILL_ROOT / "SKILL.md",
+        SKILL_ROOT / "references" / "report_contract.md",
+        SKILL_ROOT / "references" / "evidence_kernel.md",
+        SKILL_ROOT / "scripts" / "findreason_core" / "agent_judgement_contract.py",
+        SKILL_ROOT / "agents" / "openai.yaml",
+    ]
+    text = "\n".join(path.read_text(encoding="utf-8") for path in files)
+
+    for label in [
+        "输入侧问题",
+        "知识缺失或证据不足",
+        "召回遗漏",
+        "重排丢失",
+        "答案生成错误",
+        "无明显错误/评估器不准，需人工进一步核实",
+    ]:
+        assert label in text
+
+    for old_slug in [
+        "workflow_input_loss",
+        "suspected_knowledge_missing",
+        "retrieval_miss",
+        "rerank_drop",
+        "answer_failure",
+        "evaluator_disputed_no_obvious_error",
+    ]:
+        assert old_slug in text
+
+    assert "中文 cause 为主" in text
+    assert "旧 slug" in text
+    assert "根据验证点改写后的 query" in text
+    assert "召回改善、排序改善，或 replay / 最终结果改善" in text
+    assert "只能写成低置信候选或待验证点" in text
+    assert "人工复核点" in text
+    assert "不要求固定范式" in text
+    assert "评估器输出暂无" in text
+    assert "不是第 6 类证据" in text
+    assert "不能作为“看不出来”的兜底" in text
+    assert "顶层 cause 只能从 5 类中选择" not in text
+    assert "独立于五类 root cause" not in text
+
+
 def test_collect_evidence_builds_case_facts_without_hard_cause(monkeypatch: pytest.MonkeyPatch) -> None:
     from findreason_core.evidence_kernel import build_case_facts
 
@@ -219,11 +314,16 @@ def test_agent_brief_is_case_specific_working_note() -> None:
     assert "Workflow 摘要" in brief
     assert "被评估答案 / answer_hint" in brief
     assert "评估器线索是低置信诊断线索" in brief
-    assert "chat_history 只用于判断 `workflow_input_loss`" in brief
-    assert "上下文增强 query" in brief
-    assert "不得用 chat_history 支撑 `answer_failure`" in brief
+    assert "chat_history 只用于判断 `输入侧问题`" in brief
+    assert "旧 slug: `workflow_input_loss`" in brief
+    assert "根据验证点改写后的 query" in brief
+    assert "召回改善、排序改善，或 replay / 最终结果改善" in brief
+    assert "不得用 chat_history 支撑 `答案生成错误`" in brief
+    assert "旧 slug: `answer_failure`" in brief
     assert "`badcase_review_status`" in brief
-    assert "needs_human_review_evaluator_disputed" in brief
+    assert "evaluator_disputed_no_obvious_error" in brief
+    assert "人工复核点" in brief
+    assert "评估器输出暂无" in brief
     assert "Doc A" in brief
     assert "https://example.com/doc-a" in brief
     assert "This is the cited support snippet" in brief
@@ -314,6 +414,14 @@ def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> No
     assert "Readable support snippet" in report
     assert "评估器与复核" in report
     assert "badcase_review_status" in report
+    assert "中文 cause 为主" in report
+    assert "输入侧问题" in report
+    assert "无明显错误/评估器不准，需人工进一步核实" in report
+    assert "人工复核点" in report
+    assert "评估器输出暂无" in report
+    assert "第 6 类证据" in report
+    assert "召回改善、排序改善，或 replay / 最终结果改善" in report
+    assert "五类 root cause" not in report
     assert "现场事实" not in report
     assert "workflow 输入：`" not in report
     assert "workflow 输出：`" not in report

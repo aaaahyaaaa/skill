@@ -38,10 +38,49 @@ Agent 负责：
 5. 运行 `synthesize-brief` 生成短版 judgement summary 和证据索引。
 6. Agent 基于事实和实验结果给用户输出短版结论，风格类似一次清晰复盘回复；不要要求用户阅读 JSON 或长报告。
 
+## Cause 枚举
+
+最终报告以中文 cause 为主，旧 slug 只作为兼容别名：
+
+- `输入侧问题`（旧 slug: `workflow_input_loss`）
+- `知识缺失或证据不足`（旧 slug: `suspected_knowledge_missing`）
+- `召回遗漏`（旧 slug: `retrieval_miss`）
+- `重排丢失`（旧 slug: `rerank_drop`）
+- `答案生成错误`（旧 slug: `answer_failure`）
+- `无明显错误/评估器不准，需人工进一步核实`（slug: `evaluator_disputed_no_obvious_error`）
+
+`输入侧问题` 覆盖整个链路输入侧的失真：Workflow input 构造丢上下文、限定词/实体/子问题丢失、rewrite 错误或不完整、keywords / query variants 未保真、多意图未拆解等。但它不能只凭“看起来改写丢了”就作为主因。只有根据验证点改写后的 query 能够在实验中带来召回改善、排序改善，或 replay / 最终结果改善时，才能把主因上调为 `输入侧问题`。如果改写 query 没改善实验结果，只能写成低置信候选或待验证点。
+
+第 6 类 `无明显错误/评估器不准，需人工进一步核实` 不能作为“看不出来”的兜底。只有在前 5 类都没有明显证据，且评估器结论与 prompt evidence、Workflow 输出、被评估答案或人工标注之间存在可说明的冲突时，才能归到该类。报告必须显式写出人工复核点；不要求固定范式，但要讲清楚为什么怀疑评估器不准、人工需要复核哪里、复核后可能如何改变结论。`评估器输出暂无` 本身不是第 6 类证据，应继续看链路证据或写低置信待补证。
+
+## Trace 获取模式
+
+遇到“找不到原始 trace”时不要停在找文件。先按已有输入判断属于哪种模式，再进入对应案例：
+
+- 本地已有 trace JSON：优先 `--trace-file`，见 `references/cases/019eee75-local-trace-workflow-input-loss.md`。
+- 原始 Fornax trace 不可用，只有原始输入 / app / workspace：先定位已有再生产物；没有产物时用 replay 重跑原始输入，见 `references/cases/019eef8d-rerun-input-knowledge-missing.md`。
+- 可以通过 workspace + log_id 获取 trace：直接 `collect-evidence` 拉取，再按 target doc 深挖，见 `references/cases/019ece69-logid-trace-retrieval-miss.md`。
+
+这三个案例是完整分析过程示例，不是模板答案。复用时必须替换具体 log_id、query、run 目录和 target doc；最终 cause 仍然要由当前证据决定。
+
+## 工具最小化原则
+
+默认只使用本地 Python 脚本、用户提供的本地文件和宿主 LLM 推理；不要把 Fornax、飞书、bytedcli、浏览器、MCP、子 Agent 等能力当作 skill 的必需执行面。外部能力只作为显式可选补充，并且必须能被本地文件输入替代。
+
+当前真实依赖分层：
+
+- 必需：本地 `python3 -m findreason` CLI、`case_facts.json`、`agent_brief.md`、`*_experiment.json`、`agent_judgement.md`。
+- 可选线上接口：`collect-evidence` 在未提供 `--trace-file` 时会用 OpenPlat trace detail API 拉取 trace；有本地 trace 时优先传 `--trace-file`。
+- 可选 live recall：`run-experiment --type recall --query ...` 在 trace 中有 recall/searchDoc 请求模板时，会用 `httpx` 复用模板调用线上 recall/searchDoc；不传 `--query` 时只生成本地实验计划。
+- 可选 live replay：`run-experiment --type replay` 只有在历史 trace 缺少中间节点证据时才尝试当前版本 workflow replay，内部只走接口链路：OpenPlat app detail API 获取 `workflowConfigV2`、OpenPlat workspace info API 获取 workspace 级 `authInfo.apiKey`、open-exec workflow API 执行重跑；历史 trace 足够时会跳过 replay。
+- 发布层：飞书文档只用于用户明确要求分享/评审发布时；归因本身不要依赖飞书文档作为唯一证据库。
+
+因此，最稳的默认路径是：单 case 本地 case 文件 + 本地 trace 文件 + LLM 读 `agent_brief.md` / `agent_judgement.md` 完成最终判断。只有用户明确要“重新拉线上 trace / 重跑 recall / 重跑 workflow”时，才启用对应可选能力。
+
 ## 命令
 
 ```bash
-python -m findreason collect-evidence \
+python3 -m findreason collect-evidence \
   --workspace-id <workspace_id> \
   --log-id <log_id> \
   --app-id <app_id> \
@@ -52,7 +91,7 @@ python -m findreason collect-evidence \
 如果已有本地 trace JSON，可跳过线上拉取：
 
 ```bash
-python -m findreason collect-evidence \
+python3 -m findreason collect-evidence \
   --workspace-id <workspace_id> \
   --log-id <log_id> \
   --trace-file /path/to/trace.json \
@@ -63,9 +102,9 @@ python -m findreason collect-evidence \
 实验入口：
 
 ```bash
-python -m findreason run-experiment --type recall --facts-file /tmp/findreason-case/case_facts.json --query "<实验 query>" --output-dir /tmp/findreason-case
-python -m findreason run-experiment --type rerank --facts-file /tmp/findreason-case/case_facts.json --target-doc-id <doc_id> --output-dir /tmp/findreason-case
-python -m findreason run-experiment --type replay --facts-file /tmp/findreason-case/case_facts.json --query "<真实用户问题>" --app-id <app_id> --version-id <version_id> --output-dir /tmp/findreason-case
+python3 -m findreason run-experiment --type recall --facts-file /tmp/findreason-case/case_facts.json --query "<实验 query>" --output-dir /tmp/findreason-case
+python3 -m findreason run-experiment --type rerank --facts-file /tmp/findreason-case/case_facts.json --target-doc-id <doc_id> --output-dir /tmp/findreason-case
+python3 -m findreason run-experiment --type replay --facts-file /tmp/findreason-case/case_facts.json --query "<真实用户问题>" --app-id <app_id> --version-id <version_id> --output-dir /tmp/findreason-case
 ```
 
 不传 `--query` 时，recall 实验只输出 query variant 规划；传入 `--query` 且 trace 中有 recall/searchDoc 请求模板时，代码会复用模板执行一次 query override。rerank 实验输出 doc-id 生存观察，不直接等价为同断言丢失。
@@ -75,7 +114,7 @@ python -m findreason run-experiment --type replay --facts-file /tmp/findreason-c
 报告合成入口：
 
 ```bash
-python -m findreason synthesize-brief \
+python3 -m findreason synthesize-brief \
   --facts-file /tmp/findreason-case/case_facts.json \
   --experiment-dir /tmp/findreason-case \
   --output-dir /tmp/findreason-case
@@ -89,7 +128,7 @@ python -m findreason synthesize-brief \
 查看 v4 manifest：
 
 ```bash
-python -m findreason schema
+python3 -m findreason schema
 ```
 
 ## 现场侦查
@@ -97,8 +136,9 @@ python -m findreason schema
 先看表象，再找根因，不要一开始就落标签。
 
 - 输入表象：用户真实问题、评估器上下文、Workflow 原始输入、rewrite、keywords 是否一致。
-- `chat_history` 只能用于判断 `workflow_input_loss`：对比用户上下文是否进入 Workflow input / rewrite / keywords；不得用它支撑 `answer_failure` 的答案正误判断。
-- 如果怀疑 `workflow_input_loss`，用上下文增强 query 做 recall / replay 对照，检查是否比原 query 召回更多能明确回答问题的直接支撑文档。
+- `chat_history` 只能用于判断 `输入侧问题`（旧 slug: `workflow_input_loss`）：对比用户上下文是否进入 Workflow input / rewrite / keywords；不得用它支撑 `答案生成错误`（旧 slug: `answer_failure`）的答案正误判断。
+- 如果怀疑 `输入侧问题`，必须根据验证点改写后的 query 做 recall / rerank / replay 对照，检查是否带来召回改善、排序改善，或 replay / 最终结果改善。
+- 如果只是发现 Workflow input、rewrite、keywords 可能少了信息，但改写 query 没改善实验结果，只能把 `输入侧问题` 写成低置信候选或待验证点，不能直接判主因。
 - 答案表象：漏答、错引、越界、自相矛盾、无依据断言、把弱证据写成强结论。
 - 证据生存：同一必要断言是否从 `recall` 进入 `rerank_docs`，再进入 `prompt_docs` / `qaPromptDocs`。
 - 召回边界：报告里可叫 `recall`，但审计时要区分 `origin_doc_list` 与 `origin_faq_list`；线上链路可能来自旧 `/searchDoc`，也可能来自新拆分 `/recall` 能力，以 trace 为准。
@@ -124,17 +164,18 @@ python -m findreason schema
 - 证据对照：trace facts / recall / rerank / replay 分别支持或反驳什么。
 - 证据充分性判断：列出 required assertions，给关键证据标注 `direct_support`、`partial_support`、`adjacent_support`、`insufficient` 或 `contradictory`，并说明是否足以产出严谨业务答案。
 - 反证意识：关键候选根因要写支持证据、已跑实验、什么会推翻它、当前判断；不要求用大表格。
-- 归因整理：最终候选 cause 必须落在 `workflow_input_loss`、`suspected_knowledge_missing`、`retrieval_miss`、`rerank_drop`、`answer_failure` 这 5 类之一；证据不足时写低置信或人工复核，不强行裁决。
+- 归因整理：最终候选 cause 必须落在 6 个中文 cause 之一：`输入侧问题`、`知识缺失或证据不足`、`召回遗漏`、`重排丢失`、`答案生成错误`、`无明显错误/评估器不准，需人工进一步核实`；旧英文 slug 只作为兼容别名。
 - 当前 judgement：最可信根因、置信度、仍缺的证据。
-- `badcase_review_status`：`valid_badcase`、`needs_human_review_evaluator_disputed` 或 `not_badcase_evaluator_error`。这个字段独立于五类 cause，用于表达评估器是否可能误判。
-- 如果使用 `needs_human_review_evaluator_disputed`，必须给出 `human_review_reason` 和 `human_review_context`，至少包含 query、judged answer、Workflow input/output、evaluator claim、关键 prompt 证据、为什么怀疑评估器误判。
+- `badcase_review_status`：`valid_badcase`、`needs_human_review_evaluator_disputed` 或 `not_badcase_evaluator_error`。这个字段独立于 cause，用于表达评估器是否可能误判或人工是否已确认。
+- 如果 cause 是 `无明显错误/评估器不准，需人工进一步核实`，报告必须显式写出人工复核点；不要求固定范式，但要讲清楚为什么怀疑评估器不准、人工需要复核哪里、复核后可能如何改变结论。
+- 如果使用 `needs_human_review_evaluator_disputed`，必须给出足够人工复核上下文，例如 query、judged answer、Workflow input/output、evaluator claim、关键 prompt 证据、为什么怀疑评估器误判。
 - `not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。
 - 下一步实验：如果证据不足，明确下一步该跑什么。
 
 证据充分性要求：
 
 - 先把正确答案应覆盖的点拆成 required assertions。
-- `answer_failure` 的 required assertions 只能来自 judged answer、当前 Workflow 输入 / rewrite、评估器信号和 prompt evidence；不要从 `chat_history` 补充答案正误依据。
+- `答案生成错误`（旧 slug: `answer_failure`）的 required assertions 只能来自 judged answer、当前 Workflow 输入 / rewrite、评估器信号和 prompt evidence；不要从 `chat_history` 补充答案正误依据。
 - 对每条关键证据说明它支撑了哪条断言，以及支撑等级：`direct_support` 表示直接支撑；`partial_support` 表示只能支撑一部分；`adjacent_support` 表示主题相关但不能直接下结论；`insufficient` 表示看似相关但不能使用；`contradictory` 表示与其他证据冲突。
 - 明确区分“证据足以解释为什么 replay 比历史答案好”和“证据足以产出严谨业务答案”。前者不等于后者。
 - 如果证据组合有用但不完整，要写出仍缺的权威证据，例如“缺少明确说明是否自动扣费/自动续费/到期后如何处理的业务规则”。
@@ -158,4 +199,5 @@ python -m findreason schema
 - `references/evidence_kernel.md`：代码证据内核的边界。
 - `references/recall_chain.md`：线上召回、重排、进入 prompt 的字段和接口链路。
 - `references/report_contract.md`：报告字段、证据索引、可读证据展示的硬约束。
+- `references/cases/`：三类 trace 获取模式的完整分析案例。
 - `references/README.md`：当前 reference 索引。

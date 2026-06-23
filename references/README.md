@@ -21,6 +21,8 @@ collect evidence
 - 代码只产出事实和实验结果，不替 Agent 选择根因。
 - Agent 先做 answer symptom extraction，再从表象生成多个候选解释。
 - 每个候选解释都要有支持证据、反证证据和下一步实验。
+- 最终报告以中文 cause 为主，旧 slug 只作为兼容别名；`输入侧问题` 必须通过验证 query 的召回改善、排序改善或 replay / 最终结果改善来上调主因。
+- `无明显错误/评估器不准，需人工进一步核实`（slug: `evaluator_disputed_no_obvious_error`）不能作为“看不出来”的兜底；报告要写清人工复核点，`评估器输出暂无` 本身不是第 6 类证据。
 - 如果证据不足，报告应写“不足以判断”的原因，而不是强行落标签。
 - 报告必须展示可读证据：文档标题 + 实际链接或援引片段；不要只贴 `prompt_doc_ids` 这类裸 id 数组。
 - 默认本地 JSON 作为可索引证据包，Fornax 按历史 `log_id` 回查原始 trace，飞书文档只作为分享/发布层。
@@ -34,6 +36,9 @@ collect evidence
 - `recall_chain.md`：召回、重排、进入 prompt 的真实链路、字段解释和排查抓手。
 - `report_contract.md`：报告必填字段、证据索引、可读证据展示和归因表约束。
 - `capabilities.json`：v4 CLI capability manifest。
+- `cases/019eee75-local-trace-workflow-input-loss.md`：本地 trace JSON 已有时的完整归因案例。
+- `cases/019eef8d-rerun-input-knowledge-missing.md`：原始 Fornax trace 不可用、需按原始输入/再生产物重跑时的完整归因案例。
+- `cases/019ece69-logid-trace-retrieval-miss.md`：可通过 workspace + log_id 拉 trace，并深挖 expected doc 的完整归因案例。
 
 ## 已退出主流程
 

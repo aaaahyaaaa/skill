@@ -40,7 +40,7 @@
 - 反证意识：每个关键候选根因的支持证据、已跑实验、可推翻证据、当前判断；不要求输出大表格
 - 归因整理：最终候选 cause、置信度、仍缺证据或人工复核理由
 - `badcase_review_status`：`valid_badcase`、`needs_human_review_evaluator_disputed` 或 `not_badcase_evaluator_error`
-- `human_review_reason` 与 `human_review_context`：当评估器事实正确性结论可能有误时必须提供，供人工判断该 case 是否真的算 badcase
+- 人工复核点：当 cause 是 `无明显错误/评估器不准，需人工进一步核实`，或评估器事实正确性结论可能有误时必须写清。这里不要求固定范式，但必须讲清楚为什么怀疑评估器不准、人工需要复核哪里、复核后可能如何改变结论。
 
 ## 证据展示
 
@@ -76,8 +76,9 @@
 步骤：
 
 - 将用户问题拆成 required assertions，即正确答案必须覆盖的具体断言。
-- `chat_history` 只能用于判断上下文是否丢进 Workflow 输入，并通过上下文增强 query 的 recall / replay 对照验证 `workflow_input_loss`；不能用于支撑 `answer_failure` 的答案正误判断。
-- `answer_failure` 只在必要断言已经进入 `prompt_docs` / `qaPromptDocs`，但答案仍漏答、误答、错引、越界、编造或把弱证据写强时成立。
+- `chat_history` 只能用于判断上下文是否进入 Workflow 输入、rewrite、keywords 或 query variants，并通过根据验证点改写后的 query 对照验证 `输入侧问题`（旧 slug: `workflow_input_loss`）；不能用于支撑 `答案生成错误`（旧 slug: `answer_failure`）的答案正误判断。
+- `输入侧问题` 只有在改写后的 query 带来召回改善、排序改善，或 replay / 最终结果改善时，才能上调为主因；否则只能写成低置信候选或待验证点。
+- `答案生成错误` 只在必要断言已经进入 `prompt_docs` / `qaPromptDocs`，但答案仍漏答、误答、错引、越界、编造或把弱证据写强时成立。
 - 对关键证据标注支撑等级：`direct_support`、`partial_support`、`adjacent_support`、`insufficient`、`contradictory`。
 - 说明每条证据支撑了哪条 required assertion，哪些断言仍未被权威支撑。
 - 区分“证据足以解释 replay 为什么更好”和“证据足以产出严谨业务答案”。前者不等于后者。
@@ -87,22 +88,25 @@
 
 报告中的归因整理可以用短段落，不要为了形式输出大而空的表格。每个候选解释至少说明：它解释了哪个表象、什么证据支持、已跑什么实验、什么证据会推翻它、当前是否保留。
 
-顶层 cause 只能从 5 类中选择：
+顶层 cause 只能从 6 个中文 cause 中选择，旧 slug 只作为兼容别名：
 
-- `workflow_input_loss`
-- `suspected_knowledge_missing`
-- `retrieval_miss`
-- `rerank_drop`
-- `answer_failure`
+- `输入侧问题`（旧 slug: `workflow_input_loss`）
+- `知识缺失或证据不足`（旧 slug: `suspected_knowledge_missing`）
+- `召回遗漏`（旧 slug: `retrieval_miss`）
+- `重排丢失`（旧 slug: `rerank_drop`）
+- `答案生成错误`（旧 slug: `answer_failure`）
+- `无明显错误/评估器不准，需人工进一步核实`（slug: `evaluator_disputed_no_obvious_error`）
 
 如果证据不能支撑唯一主因，应写低置信或人工复核，不要强行落标签。
 
+`无明显错误/评估器不准，需人工进一步核实` 不能作为“看不出来”的兜底。只有在前 5 类都没有明显证据，且评估器结论与 prompt evidence、Workflow 输出、被评估答案或人工标注之间存在可说明的冲突时，才能归到该类。`评估器输出暂无` 本身不是第 6 类证据；这种情况应继续看链路证据，或写低置信待补证。
+
 ## Badcase 复核状态
 
-`badcase_review_status` 独立于五类 cause，用于处理“评估器可能误判，该 case 可能不算 badcase”的情况。
+`badcase_review_status` 独立于 cause，用于处理“评估器可能误判，该 case 可能不算 badcase”的情况。
 
-- `valid_badcase`：评估器或人工指出的问题与证据链一致，按五类 cause 继续归因。
+- `valid_badcase`：评估器或人工指出的问题与证据链一致，按中文 cause 继续归因。
 - `needs_human_review_evaluator_disputed`：评估器事实正确性结论与 prompt evidence、Workflow 输出或人工标注存在明显冲突，需要人工确认是否真是 badcase。
 - `not_badcase_evaluator_error`：仅在人工确认或明确人工标注后使用，表示评估器判断有误，该样本不应进入 badcase 根因统计。
 
-请求人工复核时，必须提供足够上下文：query、judged answer、Workflow input/output、evaluator claim、关键 prompt 证据、为什么怀疑评估器误判。不要只写“需人工复核”。
+请求人工复核时，必须显式写出人工复核点。这里不要求固定范式，但要讲清楚为什么怀疑评估器不准、人工需要复核哪里、复核后可能如何改变结论。不要只写“需人工复核”。
