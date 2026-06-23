@@ -1,0 +1,14 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e864735fbdabcf5d300124b7e2c94b12629c496f",
+  "prompts": {},
+  "humans": {
+    "h_cfc5d77fc99a38": {
+      "author": "hanye.1027 <hanye.1027@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
