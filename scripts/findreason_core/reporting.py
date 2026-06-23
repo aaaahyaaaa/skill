@@ -343,11 +343,17 @@ def synthesize_report_markdown(
             "",
             "## 评估器与复核",
             "",
-            "`badcase_review_status` 独立于五类 root cause。若评估器事实正确性结论与 prompt evidence 对不上，先标 `needs_human_review_evaluator_disputed`，并给出 query、judged answer、Workflow input/output、evaluator claim、关键 prompt 证据和怀疑误判原因；`not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。",
+            "最终报告以中文 cause 为主，旧 slug 只作为兼容别名：`输入侧问题` / `workflow_input_loss`、`知识缺失或证据不足` / `suspected_knowledge_missing`、`召回遗漏` / `retrieval_miss`、`重排丢失` / `rerank_drop`、`答案生成错误` / `answer_failure`、`无明显错误/评估器不准，需人工进一步核实` / `evaluator_disputed_no_obvious_error`。",
+            "",
+            "`输入侧问题` 只有在根据验证点改写后的 query 带来召回改善、排序改善，或 replay / 最终结果改善时，才能上调为主因；如果只是看起来 Workflow input、rewrite、keywords 少了信息，只能写成低置信候选或待验证点。",
+            "",
+            "`无明显错误/评估器不准，需人工进一步核实` 不能作为“看不出来”的兜底。若归到第 6 类，必须显式写出人工复核点；不要求固定范式，但要讲清楚为什么怀疑评估器不准、人工需要复核哪里、复核后可能如何改变结论。`评估器输出暂无` 本身不是第 6 类证据。",
+            "",
+            "`badcase_review_status` 独立于 cause；`not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。",
             "",
             "## 当前还不能直接裁决的地方",
             "",
-            "自动合成只整理到证据层，还没有完成答案症状抽取和 required assertions 对齐，所以这里不直接给 `candidate_cause`。如果后续对齐发现关键断言已经在 prompt 中有直接支撑，但答案仍漏答、错引、越界或编造，才适合落到 `answer_failure`；如果 prompt 里本身没有足够权威支撑，就应该回溯知识、recall 或 rerank。",
+            "自动合成只整理到证据层，还没有完成答案症状抽取和 required assertions 对齐，所以这里不直接给 `candidate_cause`。如果后续对齐发现关键断言已经在 prompt 中有直接支撑，但答案仍漏答、错引、越界或编造，才适合落到 `答案生成错误`；如果 prompt 里本身没有足够权威支撑，就应该回溯知识、recall 或 rerank。",
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
