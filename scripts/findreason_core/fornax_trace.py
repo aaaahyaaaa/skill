@@ -40,6 +40,8 @@ RAG_NODE_TYPES = {
     "ZhiShangRAGQA",
 }
 
+PROMPT_DOC_KEYS = {"prompt_docs", "promptDocs", "qaPromptDocs"}
+
 
 class FornaxTraceIngestRequest(BaseModel):
     trace_file: str
@@ -363,6 +365,54 @@ def _evidence_docs(raw_docs: Any, source_prefix: str) -> list[EvidenceDoc]:
     return [_evidence_doc(doc, index + 1, source_prefix) for index, doc in enumerate(raw_docs) if isinstance(doc, dict)]
 
 
+def _raw_doc_dedupe_key(doc: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        str(doc.get("id") or ""),
+        str(doc.get("identifier") or ""),
+        str(doc.get("chunkId") or doc.get("chunk_id") or ""),
+        str(doc.get("title") or doc.get("doc_title") or ""),
+        str(doc.get("content") or doc.get("text") or "")[:200],
+    )
+
+
+def _dedupe_raw_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for doc in docs:
+        key = _raw_doc_dedupe_key(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(doc)
+    return deduped
+
+
+def _collect_prompt_docs_from_value(value: Any) -> list[dict[str, Any]]:
+    decoded = _decode_jsonish(value)
+    docs: list[dict[str, Any]] = []
+    if isinstance(decoded, dict):
+        for key, child in decoded.items():
+            if key in PROMPT_DOC_KEYS:
+                prompt_docs = _decode_jsonish(child)
+                if isinstance(prompt_docs, list):
+                    docs.extend(item for item in prompt_docs if isinstance(item, dict))
+                elif isinstance(prompt_docs, dict):
+                    docs.append(prompt_docs)
+            else:
+                docs.extend(_collect_prompt_docs_from_value(child))
+    elif isinstance(decoded, list):
+        for item in decoded:
+            docs.extend(_collect_prompt_docs_from_value(item))
+    return _dedupe_raw_docs(docs)
+
+
+def _collect_prompt_docs_from_spans(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = []
+    for span in spans:
+        docs.extend(_collect_prompt_docs_from_value(_span_output(span)))
+    return _dedupe_raw_docs(docs)
+
+
 def _raw_doc_lists(recall_output: Any, rerank_output: Any, qa_output: Any, end_output: Any = None) -> dict[str, list[dict[str, Any]]]:
     recall = recall_output if isinstance(recall_output, dict) else {}
     rerank = rerank_output if isinstance(rerank_output, dict) else {}
@@ -384,6 +434,16 @@ def _children_by_parent(spans: list[dict[str, Any]]) -> dict[str, list[dict[str,
         if parent_id:
             children.setdefault(parent_id, []).append(span)
     return children
+
+
+def _descendant_spans(children_map: dict[str, list[dict[str, Any]]], parent_id: str) -> list[dict[str, Any]]:
+    descendants: list[dict[str, Any]] = []
+    queue = list(children_map.get(parent_id, []))
+    while queue:
+        child = queue.pop(0)
+        descendants.append(child)
+        queue.extend(children_map.get(str(child.get("span_id") or ""), []))
+    return descendants
 
 
 def _first_child(children: list[dict[str, Any]], *span_types: str) -> dict[str, Any] | None:
@@ -414,6 +474,7 @@ def _workflow_segments(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     for workflow_span in [span for span in spans if _span_type(span) == "workflow"]:
         children = children_map.get(str(workflow_span.get("span_id") or ""), [])
+        all_children = _descendant_spans(children_map, str(workflow_span.get("span_id") or ""))
         start_span = _first_child(children, "Start")
         recall_span = _first_child(children, "ZhiShangRAGRecall")
         rerank_span = _first_child(children, "ZhiShangRAGRerank")
@@ -429,6 +490,7 @@ def _workflow_segments(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "rerank_span": rerank_span,
                 "qa_span": qa_span,
                 "end_span": end_span,
+                "all_child_spans": all_children,
             }
         )
     return segments
@@ -510,12 +572,15 @@ def _segment_query(segment: dict[str, Any]) -> str:
 
 
 def _segment_raw_docs(segment: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    return _raw_doc_lists(
+    raw_docs = _raw_doc_lists(
         _span_output(segment.get("recall_span")),
         _span_output(segment.get("rerank_span")),
         _span_output(segment.get("qa_span")),
         _span_output(segment.get("end_span")),
     )
+    if not raw_docs["prompt_docs"]:
+        raw_docs["prompt_docs"] = _collect_prompt_docs_from_spans(segment.get("all_child_spans") or [])
+    return raw_docs
 
 
 def _doc_key_overlaps(doc: dict[str, Any], docs: list[dict[str, Any]]) -> bool:
@@ -764,6 +829,10 @@ def ingest_fornax_trace(payload: Any, request: FornaxTraceIngestRequest) -> Forn
     fornax_space_id = _first_nonempty(request.fornax_space_id, _first_tag(spans, "fornax_space_id"))
 
     raw_docs = _raw_doc_lists(recall_output, rerank_output, qa_output, end_output)
+    if not raw_docs["prompt_docs"] and selected_segment:
+        raw_docs["prompt_docs"] = _collect_prompt_docs_from_spans(selected_segment.get("all_child_spans") or [])
+    if not raw_docs["prompt_docs"]:
+        raw_docs["prompt_docs"] = _collect_prompt_docs_from_spans(spans)
     dropped_relevant_docs = selected_segment_summary.get("dropped_relevant_docs", []) if selected_segment_summary else []
     selected_dropped_doc_ids = [str(doc.get("id")) for doc in dropped_relevant_docs if doc.get("id")]
     final_top_docs = selected_segment_summary.get("final_top_docs", []) if selected_segment_summary else []

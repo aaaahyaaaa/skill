@@ -99,6 +99,84 @@ def trace_with_recall_template() -> dict:
     return trace
 
 
+def trace_with_model_prompt_docs_only() -> dict:
+    return {
+        "data": {
+            "spans": [
+                {
+                    "span_id": "workflow",
+                    "span_type": "workflow",
+                    "input": json.dumps({"sys": {"query": "巨量千川人群管理中怎么创建人群包"}}, ensure_ascii=False),
+                    "output": json.dumps({"end": "测试答案"}, ensure_ascii=False),
+                },
+                {
+                    "span_id": "rag-recall",
+                    "parent_id": "workflow",
+                    "span_type": "ZhiShangRAGRecall",
+                    "span_name": "知商召回1",
+                    "output": json.dumps(
+                        {
+                            "origin_doc_list": [
+                                {
+                                    "id": "3641558",
+                                    "identifier": "210445",
+                                    "title": "巨量千川_「人群分析」产品使用手册",
+                                    "content": "点击确认创建人群包。",
+                                }
+                            ],
+                            "origin_faq_list": [],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "span_id": "rag-rerank",
+                    "parent_id": "workflow",
+                    "span_type": "ZhiShangRAGRerank",
+                    "span_name": "知商重排1",
+                    "output": json.dumps(
+                        {
+                            "rerank_docs": [
+                                {
+                                    "id": "3641558",
+                                    "identifier": "210445",
+                                    "title": "巨量千川_「人群分析」产品使用手册",
+                                    "content": "点击确认创建人群包。",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "span_id": "model",
+                    "parent_id": "workflow",
+                    "span_type": "model",
+                    "span_name": "LLM",
+                    "output": json.dumps(
+                        {
+                            "prompt_docs": [
+                                {
+                                    "id": "3641558",
+                                    "identifier": "210445",
+                                    "chunkId": "19",
+                                    "type": 2,
+                                    "recallSource": "self_dataset_search",
+                                    "title": "巨量千川_「人群分析」产品使用手册",
+                                    "content": "点击确认创建人群包。",
+                                }
+                            ],
+                            "docs": [{"title": "model side docs"}],
+                            "doc_string": "model prompt text",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ]
+        }
+    }
+
+
 def trace_with_zero_score_workflow_segment() -> dict:
     return {
         "data": {
@@ -321,6 +399,24 @@ def test_collect_evidence_builds_case_facts_without_hard_cause(monkeypatch: pyte
     assert facts["agent_contract"]["hard_selection_disabled"] is True
     assert "primary_cause" not in facts
     assert "candidate_cause" not in json.dumps(facts, ensure_ascii=False)
+
+
+def test_collect_evidence_falls_back_to_model_span_prompt_docs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findreason_core.evidence_kernel import build_case_facts
+
+    monkeypatch.setenv("FINDREASON_TRACE_WORKFLOW_MAPPING", "false")
+    facts = build_case_facts(
+        workspace_id="138",
+        log_id="model-prompt-docs-log",
+        app_id="1001883",
+        case={"query": "巨量千川人群管理中怎么创建人群包"},
+        trace_payload=trace_with_model_prompt_docs_only(),
+        trace_meta={"source": "unit"},
+    )
+
+    assert facts["counts"] == {"origin_doc_list": 1, "origin_faq_list": 0, "recall": 1, "rerank_docs": 1, "prompt_docs": 1}
+    assert facts["artifacts"]["prompt_docs"][0]["id"] == "210445"
+    assert facts["trace"]["summary"]["selected_workflow_segment"]["prompt_doc_count"] == 1
 
 
 def test_collect_evidence_extracts_recall_template_for_experiment(monkeypatch: pytest.MonkeyPatch) -> None:
