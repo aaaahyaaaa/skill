@@ -99,6 +99,84 @@ def trace_with_recall_template() -> dict:
     return trace
 
 
+def trace_with_model_prompt_docs_only() -> dict:
+    return {
+        "data": {
+            "spans": [
+                {
+                    "span_id": "workflow",
+                    "span_type": "workflow",
+                    "input": json.dumps({"sys": {"query": "巨量千川人群管理中怎么创建人群包"}}, ensure_ascii=False),
+                    "output": json.dumps({"end": "测试答案"}, ensure_ascii=False),
+                },
+                {
+                    "span_id": "rag-recall",
+                    "parent_id": "workflow",
+                    "span_type": "ZhiShangRAGRecall",
+                    "span_name": "知商召回1",
+                    "output": json.dumps(
+                        {
+                            "origin_doc_list": [
+                                {
+                                    "id": "3641558",
+                                    "identifier": "210445",
+                                    "title": "巨量千川_「人群分析」产品使用手册",
+                                    "content": "点击确认创建人群包。",
+                                }
+                            ],
+                            "origin_faq_list": [],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "span_id": "rag-rerank",
+                    "parent_id": "workflow",
+                    "span_type": "ZhiShangRAGRerank",
+                    "span_name": "知商重排1",
+                    "output": json.dumps(
+                        {
+                            "rerank_docs": [
+                                {
+                                    "id": "3641558",
+                                    "identifier": "210445",
+                                    "title": "巨量千川_「人群分析」产品使用手册",
+                                    "content": "点击确认创建人群包。",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+                {
+                    "span_id": "model",
+                    "parent_id": "workflow",
+                    "span_type": "model",
+                    "span_name": "LLM",
+                    "output": json.dumps(
+                        {
+                            "prompt_docs": [
+                                {
+                                    "id": "3641558",
+                                    "identifier": "210445",
+                                    "chunkId": "19",
+                                    "type": 2,
+                                    "recallSource": "self_dataset_search",
+                                    "title": "巨量千川_「人群分析」产品使用手册",
+                                    "content": "点击确认创建人群包。",
+                                }
+                            ],
+                            "docs": [{"title": "model side docs"}],
+                            "doc_string": "model prompt text",
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ]
+        }
+    }
+
+
 def trace_with_zero_score_workflow_segment() -> dict:
     return {
         "data": {
@@ -170,6 +248,123 @@ def trace_with_zero_score_workflow_segment() -> dict:
                     "span_name": "结束",
                     "output": json.dumps({"end": "测试答案"}, ensure_ascii=False),
                 },
+            ]
+        }
+    }
+
+
+def fake_resolved_workflow_config() -> dict:
+    nodes = [
+        {"id": "start", "type": "Start", "name": "开始", "order": 0, "input_keys": [], "output_keys": ["query"]},
+        {"id": "pre", "type": "ZhiShangRAGPreprocess", "name": "知商预处理1", "order": 1, "input_keys": ["query"], "output_keys": ["query", "keywords"]},
+        {"id": "recall", "type": "ZhiShangRAGRecall", "name": "知商召回1", "order": 2, "input_keys": ["query"], "output_keys": ["origin_doc_list", "origin_faq_list"]},
+        {"id": "rerank", "type": "ZhiShangRAGRerank", "name": "知商重排1", "order": 3, "input_keys": ["docs"], "output_keys": ["rerank_docs"]},
+        {"id": "qa", "type": "ZhiShangRAGQA", "name": "知商问答1", "order": 4, "input_keys": ["docs"], "output_keys": ["answer", "qaPromptDocs"]},
+        {"id": "end", "type": "End", "name": "结束", "order": 5, "input_keys": ["answer"], "output_keys": ["end"]},
+    ]
+    edges = [
+        {"source": "start", "target": "pre", "type": ""},
+        {"source": "pre", "target": "recall", "type": ""},
+        {"source": "recall", "target": "rerank", "type": ""},
+        {"source": "rerank", "target": "qa", "type": ""},
+        {"source": "qa", "target": "end", "type": ""},
+    ]
+    return {
+        "source": "unit_app_detail",
+        "mapping_status": "workflow_config_loaded",
+        "app_name": "RAG 问答",
+        "version_id": "32",
+        "workflow_config": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "node_order": [node["id"] for node in nodes],
+            "global_config": {},
+        },
+    }
+
+
+def fake_custom_resolved_workflow_config() -> dict:
+    nodes = [
+        {"id": "start", "type": "Start", "name": "开始", "order": 0, "input_keys": [], "output_keys": ["query"]},
+        {"id": "recall", "type": "ZhiShangRAGRecall", "name": "知商召回1", "order": 1, "input_keys": ["query"], "output_keys": ["origin_doc_list"]},
+        {"id": "rerank", "type": "ZhiShangRAGRerank", "name": "知商重排1", "order": 2, "input_keys": ["docs"], "output_keys": ["rerank_docs"]},
+        {"id": "script1", "type": "Script", "name": "脚本1", "order": 3, "input_keys": ["docs"], "output_keys": ["prompt_docs"]},
+        {"id": "model", "type": "Model", "name": "大模型1", "order": 4, "input_keys": ["prompt"], "output_keys": ["answer", "prompt_docs"]},
+        {"id": "post", "type": "Script", "name": "脚本2(后处理)", "order": 5, "input_keys": ["answer"], "output_keys": ["end"]},
+        {"id": "end", "type": "End", "name": "结束", "order": 6, "input_keys": ["end"], "output_keys": ["end"]},
+    ]
+    edges = [
+        {"source": "start", "target": "recall", "type": ""},
+        {"source": "recall", "target": "rerank", "type": ""},
+        {"source": "rerank", "target": "script1", "type": ""},
+        {"source": "script1", "target": "model", "type": ""},
+        {"source": "model", "target": "post", "type": ""},
+        {"source": "post", "target": "end", "type": ""},
+    ]
+    return {
+        "source": "unit_app_detail",
+        "mapping_status": "workflow_config_loaded",
+        "app_name": "千川线上 AB 实验专用",
+        "version_id": "8",
+        "workflow_config": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "node_order": [node["id"] for node in nodes],
+            "global_config": {},
+        },
+    }
+
+
+def span(span_id: str, span_type: str, node_id: str, output: dict | None = None, *, parent_id: str = "workflow", name: str = "", input_payload: dict | None = None) -> dict:
+    return {
+        "span_id": span_id,
+        "parent_id": parent_id,
+        "span_type": span_type,
+        "span_name": name,
+        "custom_tags": {"zhishang.node_id": node_id},
+        "input": json.dumps(input_payload or {}, ensure_ascii=False),
+        "output": json.dumps(output or {}, ensure_ascii=False),
+    }
+
+
+def standard_app_detail_trace(*, include_prompt: bool = True) -> dict:
+    qa_output = {"answer": "点击确认完成创建"}
+    if include_prompt:
+        qa_output["qaPromptDocs"] = [
+            {"id": "3641558", "identifier": "210445", "title": "巨量千川_「人群分析」产品使用手册", "content": "点击确认创建人群包。"}
+        ]
+    return {
+        "data": {
+            "spans": [
+                {"span_id": "workflow", "span_type": "workflow", "input": json.dumps({"sys": {"query": "怎么创建人群包"}}, ensure_ascii=False), "output": json.dumps({"end": "点击确认完成创建"}, ensure_ascii=False)},
+                span("start-span", "Start", "start", {"query": "怎么创建人群包"}, name="开始"),
+                span("pre-span", "ZhiShangRAGPreprocess", "pre", {"query": "怎么创建人群包", "keywords": ["人群包"]}, name="知商预处理1"),
+                span("recall-span", "ZhiShangRAGRecall", "recall", {"origin_doc_list": [{"id": "3641558", "identifier": "210445", "title": "巨量千川_「人群分析」产品使用手册", "content": "点击确认创建人群包。"}], "origin_faq_list": []}, name="知商召回1"),
+                span("rerank-span", "ZhiShangRAGRerank", "rerank", {"rerank_docs": [{"id": "3641558", "identifier": "210445", "title": "巨量千川_「人群分析」产品使用手册", "content": "点击确认创建人群包。"}]}, name="知商重排1"),
+                span("qa-span", "ZhiShangRAGQA", "qa", qa_output, name="知商问答1"),
+                span("end-span", "End", "end", {"end": "点击确认完成创建"}, name="结束"),
+            ]
+        }
+    }
+
+
+def custom_app_detail_trace() -> dict:
+    prompt_doc = {"id": "3641558", "identifier": "210445", "title": "巨量千川_「人群分析」产品使用手册", "content": "点击确认创建人群包。"}
+    return {
+        "data": {
+            "spans": [
+                {"span_id": "workflow", "span_type": "workflow", "input": json.dumps({"sys": {"query": "怎么创建人群包"}}, ensure_ascii=False), "output": json.dumps({"end": "点击确认完成创建"}, ensure_ascii=False)},
+                span("start-span", "Start", "start", {"query": "怎么创建人群包"}, name="开始"),
+                span("recall-span", "ZhiShangRAGRecall", "recall", {"origin_doc_list": [prompt_doc], "origin_faq_list": []}, name="知商召回1"),
+                span("rerank-span", "ZhiShangRAGRerank", "rerank", {"rerank_docs": [prompt_doc]}, name="知商重排1"),
+                span("script-span", "Script", "script1", {"prompt_docs": [prompt_doc], "prompt": "整理证据"}, name="脚本1"),
+                span("model-span", "model", "model", {"prompt_docs": [prompt_doc], "answer": "点击确认完成创建"}, name="大模型1"),
+                span("post-span", "Script", "post", {"end": "点击确认完成创建"}, name="脚本2(后处理)"),
+                span("end-span", "End", "end", {"end": "点击确认完成创建"}, name="结束"),
             ]
         }
     }
@@ -321,6 +516,127 @@ def test_collect_evidence_builds_case_facts_without_hard_cause(monkeypatch: pyte
     assert facts["agent_contract"]["hard_selection_disabled"] is True
     assert "primary_cause" not in facts
     assert "candidate_cause" not in json.dumps(facts, ensure_ascii=False)
+
+
+def test_collect_evidence_falls_back_to_model_span_prompt_docs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findreason_core.evidence_kernel import build_case_facts
+
+    monkeypatch.setenv("FINDREASON_TRACE_WORKFLOW_MAPPING", "false")
+    facts = build_case_facts(
+        workspace_id="138",
+        log_id="model-prompt-docs-log",
+        app_id="1001883",
+        case={"query": "巨量千川人群管理中怎么创建人群包"},
+        trace_payload=trace_with_model_prompt_docs_only(),
+        trace_meta={"source": "unit"},
+    )
+
+    assert facts["counts"] == {"origin_doc_list": 1, "origin_faq_list": 0, "recall": 1, "rerank_docs": 1, "prompt_docs": 1}
+    assert facts["artifacts"]["prompt_docs"][0]["id"] == "210445"
+    assert facts["trace"]["summary"]["selected_workflow_segment"]["prompt_doc_count"] == 1
+
+
+def test_collect_evidence_builds_app_detail_driven_workflow_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findreason_core import fornax_trace
+    from findreason_core.evidence_kernel import build_case_facts
+
+    monkeypatch.setattr(fornax_trace, "_resolve_workflow_mapping", lambda workspace_id, app_id: fake_resolved_workflow_config())
+    facts = build_case_facts(
+        workspace_id="138",
+        log_id="standard-workflow-log",
+        app_id="1001883",
+        case={"query": "怎么创建人群包"},
+        trace_payload=standard_app_detail_trace(),
+        trace_meta={"source": "unit"},
+    )
+
+    trace = facts["trace"]
+    assert trace["workflow_topology"]["source"] == "unit_app_detail"
+    assert trace["workflow_topology"]["mapping_status"] == "mapped_by_zhishang_node_id"
+    assert trace["workflow_topology"]["node_count"] == 6
+    qa_node = next(item for item in trace["node_evidence_map"] if item["node"]["id"] == "qa")
+    assert qa_node["node"]["type"] == "ZhiShangRAGQA"
+    assert qa_node["node"]["name"] == "知商问答1"
+    assert qa_node["trace_spans"][0]["span_id"] == "qa-span"
+    assert qa_node["evidence_counts"]["prompt_docs"] == 1
+    assert trace["prompt_observation"]["status"] == "rag_qa_prompt_docs_found"
+    assert trace["agent_span_read_plan"]
+    assert "candidate_cause" not in json.dumps(trace["agent_span_read_plan"], ensure_ascii=False)
+
+
+def test_collect_evidence_maps_custom_script_model_postprocess_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findreason_core import fornax_trace
+    from findreason_core.evidence_kernel import build_case_facts
+
+    monkeypatch.setattr(fornax_trace, "_resolve_workflow_mapping", lambda workspace_id, app_id: fake_custom_resolved_workflow_config())
+    facts = build_case_facts(
+        workspace_id="138",
+        log_id="custom-workflow-log",
+        app_id="1001883",
+        case={"query": "怎么创建人群包"},
+        trace_payload=custom_app_detail_trace(),
+        trace_meta={"source": "unit"},
+    )
+
+    trace = facts["trace"]
+    model_node = next(item for item in trace["node_evidence_map"] if item["node"]["id"] == "model")
+    post_node = next(item for item in trace["node_evidence_map"] if item["node"]["id"] == "post")
+    assert model_node["node"]["type"] == "Model"
+    assert model_node["node"]["name"] == "大模型1"
+    assert model_node["evidence_counts"]["prompt_docs"] == 1
+    assert post_node["node"]["name"] == "脚本2(后处理)"
+    assert post_node["evidence_counts"]["answer"] == 1
+    assert trace["prompt_observation"]["status"] == "model_span_prompt_docs_found"
+    answer_plan = next(item for item in trace["agent_span_read_plan"] if item["cause"] == "答案生成错误")
+    answer_plan_text = json.dumps(answer_plan, ensure_ascii=False)
+    assert "大模型1" in answer_plan_text
+    assert "脚本2(后处理)" in answer_plan_text
+
+
+def test_collect_evidence_marks_prompt_not_observed_without_claiming_filtered(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findreason_core import fornax_trace
+    from findreason_core.agent_judgement_contract import judgement_brief_markdown
+    from findreason_core.evidence_kernel import build_case_facts
+
+    monkeypatch.setattr(fornax_trace, "_resolve_workflow_mapping", lambda workspace_id, app_id: fake_resolved_workflow_config())
+    facts = build_case_facts(
+        workspace_id="138",
+        log_id="no-prompt-log",
+        app_id="1001883",
+        case={"query": "怎么创建人群包"},
+        trace_payload=standard_app_detail_trace(include_prompt=False),
+        trace_meta={"source": "unit"},
+    )
+
+    assert facts["trace"]["prompt_observation"]["status"] == "not_observed"
+    brief = judgement_brief_markdown(facts)
+    assert "prompt_observation: `not_observed`" in brief
+    assert "全部" not in brief or "过滤" not in brief
+
+
+def test_collect_evidence_falls_back_when_app_detail_node_id_unmatched(monkeypatch: pytest.MonkeyPatch) -> None:
+    from findreason_core import fornax_trace
+    from findreason_core.agent_judgement_contract import judgement_brief_markdown
+    from findreason_core.evidence_kernel import build_case_facts
+
+    monkeypatch.setattr(fornax_trace, "_resolve_workflow_mapping", lambda workspace_id, app_id: fake_resolved_workflow_config())
+    trace = standard_app_detail_trace()
+    for item in trace["data"]["spans"]:
+        if isinstance(item, dict) and isinstance(item.get("custom_tags"), dict):
+            item["custom_tags"]["zhishang.node_id"] = f"missing-{item['custom_tags']['zhishang.node_id']}"
+    facts = build_case_facts(
+        workspace_id="138",
+        log_id="mapping-fallback-log",
+        app_id="1001883",
+        case={"query": "怎么创建人群包"},
+        trace_payload=trace,
+        trace_meta={"source": "unit"},
+    )
+
+    assert facts["trace"]["workflow_topology"]["mapping_status"] == "node_id_unmatched_fallback_span_type"
+    assert any(item["mapping_status"] == "unmapped_trace_span_fallback" for item in facts["trace"]["node_evidence_map"])
+    brief = judgement_brief_markdown(facts)
+    assert "mapping_status: `node_id_unmatched_fallback_span_type`" in brief
 
 
 def test_collect_evidence_extracts_recall_template_for_experiment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -709,7 +1025,14 @@ def test_resolve_workflow_uses_openplat_app_detail_with_user_version(monkeypatch
 
     calls: list[dict[str, object]] = []
 
-    class FakeResponse:
+    class FakeWorkspaceResponse:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, object]:
+            return {"code": 0, "data": {"authInfo": {"apiKey": "workspace-api-key"}}}
+
+    class FakeAppDetailResponse:
         status_code = 200
         text = ""
 
@@ -752,9 +1075,11 @@ def test_resolve_workflow_uses_openplat_app_detail_with_user_version(monkeypatch
         def __exit__(self, *args: object) -> None:
             return None
 
-        def get(self, endpoint: str, *, params: dict[str, object], headers: dict[str, str]) -> FakeResponse:
+        def get(self, endpoint: str, *, params: dict[str, object], headers: dict[str, str]) -> object:
             calls.append({"endpoint": endpoint, "params": params, "headers": headers, "timeout": self.timeout})
-            return FakeResponse()
+            if endpoint == workflow_replay.OPEN_PLAT_WORKSPACE_INFO_URL:
+                return FakeWorkspaceResponse()
+            return FakeAppDetailResponse()
 
     monkeypatch.setattr(workflow_replay.httpx, "Client", FakeClient)
 
@@ -770,9 +1095,16 @@ def test_resolve_workflow_uses_openplat_app_detail_with_user_version(monkeypatch
     assert resolved["version_id"] == "7"
     assert resolved["app_name"] == "接口应用"
     assert resolved["input_schema"][0]["key"] == "query"
-    assert calls[0]["params"] == {"appId": "1001883", "workspaceId": "138", "appVersion": "7"}
+    assert resolved["auth_token_source"] == "workspace_api_key:workspace_info_api:fixed_source_constant"
+    assert calls[0]["endpoint"] == workflow_replay.OPEN_PLAT_WORKSPACE_INFO_URL
+    assert calls[0]["params"] == {"workspaceId": "138"}
     assert calls[0]["headers"]["Authorization"] == "Bearer 37160d0535224506965a54e58e0685c4"
     assert calls[0]["headers"]["x-zs-plt-open"] == "zs_open"
+    assert calls[1]["endpoint"] == workflow_replay.OPEN_PLAT_APP_DETAIL_URL
+    assert calls[1]["params"] == {"appId": "1001883", "workspaceId": "138", "appVersion": "7"}
+    assert calls[1]["headers"]["Authorization"] == "Bearer workspace-api-key"
+    assert calls[1]["headers"]["workspaceId"] == "138"
+    assert "x-zs-plt-open" not in calls[1]["headers"]
 
 
 def test_resolve_workflow_omits_app_version_when_user_does_not_provide_it(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -781,7 +1113,14 @@ def test_resolve_workflow_omits_app_version_when_user_does_not_provide_it(monkey
 
     calls: list[dict[str, object]] = []
 
-    class FakeResponse:
+    class FakeWorkspaceResponse:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, object]:
+            return {"code": 0, "data": {"authInfo": {"apiKey": "workspace-api-key"}}}
+
+    class FakeAppDetailResponse:
         status_code = 200
         text = ""
 
@@ -808,9 +1147,11 @@ def test_resolve_workflow_omits_app_version_when_user_does_not_provide_it(monkey
         def __exit__(self, *args: object) -> None:
             return None
 
-        def get(self, endpoint: str, *, params: dict[str, object], headers: dict[str, str]) -> FakeResponse:
+        def get(self, endpoint: str, *, params: dict[str, object], headers: dict[str, str]) -> object:
             calls.append({"endpoint": endpoint, "params": params, "headers": headers})
-            return FakeResponse()
+            if endpoint == workflow_replay.OPEN_PLAT_WORKSPACE_INFO_URL:
+                return FakeWorkspaceResponse()
+            return FakeAppDetailResponse()
 
     monkeypatch.setattr(workflow_replay.httpx, "Client", FakeClient)
 
@@ -820,7 +1161,11 @@ def test_resolve_workflow_omits_app_version_when_user_does_not_provide_it(monkey
 
     assert resolved["source"] == "openplat_app_detail"
     assert resolved["version_id"] == "9"
-    assert calls[0]["params"] == {"appId": "1001883", "workspaceId": "138"}
+    assert calls[0]["params"] == {"workspaceId": "138"}
+    assert calls[1]["params"] == {"appId": "1001883", "workspaceId": "138"}
+    assert calls[1]["headers"]["Authorization"] == "Bearer workspace-api-key"
+    assert calls[1]["headers"]["workspaceId"] == "138"
+    assert "x-zs-plt-open" not in calls[1]["headers"]
 
 
 def test_replay_experiment_passes_version_id_from_facts_to_workflow_replay(

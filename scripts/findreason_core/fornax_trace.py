@@ -40,6 +40,12 @@ RAG_NODE_TYPES = {
     "ZhiShangRAGQA",
 }
 
+PROMPT_DOC_KEYS = {"prompt_docs", "promptDocs", "qaPromptDocs"}
+ORIGIN_DOC_KEYS = {"origin_doc_list", "originDocList"}
+ORIGIN_FAQ_KEYS = {"origin_faq_list", "originFaqList"}
+RERANK_DOC_KEYS = {"rerank_docs", "rerankDocs"}
+ANSWER_KEYS = {"answer", "end", "output"}
+
 
 class FornaxTraceIngestRequest(BaseModel):
     trace_file: str
@@ -254,6 +260,61 @@ def _trace_node_mapping(spans: list[dict[str, Any]], resolved_app: dict[str, Any
     return entries, "fallback_span_type"
 
 
+def _workflow_edges(resolved_app: dict[str, Any]) -> list[dict[str, Any]]:
+    config = resolved_app.get("workflow_config") if isinstance(resolved_app.get("workflow_config"), dict) else {}
+    edges = config.get("edges") if isinstance(config.get("edges"), list) else []
+    return [edge for edge in edges if isinstance(edge, dict)]
+
+
+def _node_identity_from_parts(*parts: Any) -> str:
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _infer_node_role(node: dict[str, Any], spans: list[dict[str, Any]]) -> str:
+    identity = _node_identity_from_parts(
+        node.get("type"),
+        node.get("name"),
+        node.get("id"),
+        *[span.get("span_type") or span.get("type") for span in spans],
+        *[span.get("span_name") or span.get("name") for span in spans],
+    )
+    role_patterns = [
+        ("start_input", ("start", "开始")),
+        ("rag_preprocess", ("preprocess", "ragpreprocess", "预处理")),
+        ("rag_recall", ("recall", "ragrecall", "召回")),
+        ("rag_rerank", ("rerank", "ragrerank", "重排")),
+        ("rag_answer", ("ragqa", "qa", "问答")),
+        ("postprocess", ("postprocess", "后处理")),
+        ("llm_answer", ("model", "llm", "大模型")),
+        ("script", ("script", "脚本")),
+        ("branch_control", ("condition", "branch", "intent", "classify", "if", "条件", "判断", "意图", "分类")),
+        ("external_tool", ("http", "api", "mcp", "tool", "工具")),
+        ("end_output", ("end", "结束")),
+    ]
+    for role, patterns in role_patterns:
+        if any(pattern in identity for pattern in patterns):
+            return role
+    return "unknown"
+
+
+def _node_role_description(role: str) -> str:
+    descriptions = {
+        "start_input": "Workflow 入口输入，优先用于核查用户问题、业务上下文和 schema 映射是否失真。",
+        "rag_preprocess": "RAG 预处理节点，优先用于核查 rewrite、keywords、filters 和输入侧信息保真。",
+        "rag_recall": "RAG 召回节点，优先用于核查原始召回文档、FAQ、召回请求和查询变体。",
+        "rag_rerank": "RAG 重排节点，优先用于核查召回候选到 rerank 输出的生存情况。",
+        "rag_answer": "知商 RAG 问答节点，优先用于核查 qaPromptDocs/prompt_docs 与答案生成。",
+        "llm_answer": "大模型节点，优先用于核查最终模型实际输入、prompt evidence 和生成答案。",
+        "script": "脚本节点，可能改写 query、拼接 prompt、过滤证据或包装输出；需结合真实 input/output 判断作用。",
+        "postprocess": "后处理节点，可能清洗、裁剪或包装最终答案；需核查是否改变模型原始输出。",
+        "branch_control": "条件、意图分类或路由节点，优先用于核查分支选择是否影响后续证据链。",
+        "external_tool": "外部 API/HTTP/MCP/工具节点，优先用于核查外部调用请求、响应和权限/过滤行为。",
+        "end_output": "Workflow 结束输出节点，优先用于核查最终返回给调用方的内容。",
+        "unknown": "未能从真实节点信息和 trace span 推断职责，Agent 需要直接查看 input/output。",
+    }
+    return descriptions.get(role, descriptions["unknown"])
+
+
 def _role_identity(entry: dict[str, Any]) -> str:
     node = entry.get("mapped_node") if isinstance(entry.get("mapped_node"), dict) else {}
     parts = [
@@ -363,6 +424,452 @@ def _evidence_docs(raw_docs: Any, source_prefix: str) -> list[EvidenceDoc]:
     return [_evidence_doc(doc, index + 1, source_prefix) for index, doc in enumerate(raw_docs) if isinstance(doc, dict)]
 
 
+def _raw_doc_dedupe_key(doc: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    return (
+        str(doc.get("id") or ""),
+        str(doc.get("identifier") or ""),
+        str(doc.get("chunkId") or doc.get("chunk_id") or ""),
+        str(doc.get("title") or doc.get("doc_title") or ""),
+        str(doc.get("content") or doc.get("text") or "")[:200],
+    )
+
+
+def _dedupe_raw_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for doc in docs:
+        key = _raw_doc_dedupe_key(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(doc)
+    return deduped
+
+
+def _collect_prompt_docs_from_value(value: Any) -> list[dict[str, Any]]:
+    decoded = _decode_jsonish(value)
+    docs: list[dict[str, Any]] = []
+    if isinstance(decoded, dict):
+        for key, child in decoded.items():
+            if key in PROMPT_DOC_KEYS:
+                prompt_docs = _decode_jsonish(child)
+                if isinstance(prompt_docs, list):
+                    docs.extend(item for item in prompt_docs if isinstance(item, dict))
+                elif isinstance(prompt_docs, dict):
+                    docs.append(prompt_docs)
+            else:
+                docs.extend(_collect_prompt_docs_from_value(child))
+    elif isinstance(decoded, list):
+        for item in decoded:
+            docs.extend(_collect_prompt_docs_from_value(item))
+    return _dedupe_raw_docs(docs)
+
+
+def _collect_prompt_docs_from_spans(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = []
+    for span in spans:
+        docs.extend(_collect_prompt_docs_from_value(_span_output(span)))
+    return _dedupe_raw_docs(docs)
+
+
+def _top_level_keys(value: Any) -> list[str]:
+    decoded = _decode_jsonish(value)
+    if isinstance(decoded, dict):
+        return [str(key) for key in decoded.keys()]
+    return []
+
+
+def _payload_item_count(value: Any) -> int:
+    decoded = _decode_jsonish(value)
+    if isinstance(decoded, list):
+        return len(decoded)
+    if isinstance(decoded, dict):
+        return 1
+    if decoded in (None, "", []):
+        return 0
+    return 1
+
+
+def _payload_sample_titles(value: Any, limit: int = 3) -> list[str]:
+    decoded = _decode_jsonish(value)
+    items = decoded if isinstance(decoded, list) else [decoded] if isinstance(decoded, dict) else []
+    titles: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("doc_title") or item.get("name") or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+def _payload_text_preview(value: Any, limit: int = 180) -> str:
+    decoded = _decode_jsonish(value)
+    if isinstance(decoded, (dict, list)):
+        text = json.dumps(decoded, ensure_ascii=False, default=str)
+    else:
+        text = str(decoded or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[: limit - 3].rstrip() + "..."
+    return text
+
+
+def _walk_key_observations(value: Any, candidate_keys: set[str], path: str = "$") -> list[dict[str, Any]]:
+    decoded = _decode_jsonish(value)
+    observations: list[dict[str, Any]] = []
+    if isinstance(decoded, dict):
+        for key, child in decoded.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if key in candidate_keys:
+                observations.append(
+                    {
+                        "key": key,
+                        "path": child_path,
+                        "count": _payload_item_count(child),
+                        "sample_titles": _payload_sample_titles(child),
+                        "preview": _payload_text_preview(child, 220) if key in ANSWER_KEYS else "",
+                    }
+                )
+            observations.extend(_walk_key_observations(child, candidate_keys, child_path))
+    elif isinstance(decoded, list):
+        for index, item in enumerate(decoded[:100]):
+            observations.extend(_walk_key_observations(item, candidate_keys, f"{path}[{index}]"))
+    return observations
+
+
+def _node_trace_spans(node_id: str, node_mapping: list[dict[str, Any]], spans_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    matched: list[dict[str, Any]] = []
+    for entry in node_mapping:
+        if str(entry.get("node_id") or "") != str(node_id or ""):
+            continue
+        span = spans_by_id.get(str(entry.get("span_id") or ""))
+        if span:
+            matched.append(span)
+    return matched
+
+
+def _unmapped_trace_spans(node_mapping: list[dict[str, Any]], spans_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    for entry in node_mapping:
+        if entry.get("mapped"):
+            continue
+        span = spans_by_id.get(str(entry.get("span_id") or ""))
+        if span and _span_type(span) != "workflow":
+            spans.append(span)
+    return spans
+
+
+def _node_observations_for_spans(spans: list[dict[str, Any]]) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    key_sets = {
+        "origin_doc_list": ORIGIN_DOC_KEYS,
+        "origin_faq_list": ORIGIN_FAQ_KEYS,
+        "rerank_docs": RERANK_DOC_KEYS,
+        "prompt_docs": PROMPT_DOC_KEYS,
+        "answer": ANSWER_KEYS,
+    }
+    counts = {key: 0 for key in key_sets}
+    locations: list[dict[str, Any]] = []
+    for span in spans:
+        for channel, payload in (("input", _span_input(span)), ("output", _span_output(span))):
+            for evidence_kind, candidate_keys in key_sets.items():
+                for observation in _walk_key_observations(payload, candidate_keys):
+                    counts[evidence_kind] += int(observation.get("count") or 0)
+                    locations.append(
+                        {
+                            "span_id": span.get("span_id"),
+                            "span_type": span.get("span_type") or span.get("type"),
+                            "span_name": span.get("span_name") or span.get("name"),
+                            "channel": channel,
+                            "evidence_kind": evidence_kind,
+                            **observation,
+                        }
+                    )
+    return counts, locations
+
+
+def _span_summary(span: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "span_id": span.get("span_id"),
+        "parent_id": span.get("parent_id"),
+        "span_type": span.get("span_type") or span.get("type"),
+        "span_name": span.get("span_name") or span.get("name"),
+        "node_id": _span_node_id(span),
+        "status": span.get("status"),
+        "status_code": span.get("status_code"),
+        "duration": span.get("duration"),
+        "service_name": span.get("service_name"),
+        "input_keys": _top_level_keys(_span_input(span)),
+        "output_keys": _top_level_keys(_span_output(span)),
+    }
+
+
+def _node_identity_text(item: dict[str, Any]) -> str:
+    node = item.get("node") if isinstance(item.get("node"), dict) else {}
+    spans = item.get("trace_spans") if isinstance(item.get("trace_spans"), list) else []
+    return _node_identity_from_parts(
+        node.get("id"),
+        node.get("type"),
+        node.get("name"),
+        item.get("inferred_role"),
+        *[span.get("span_type") for span in spans if isinstance(span, dict)],
+        *[span.get("span_name") for span in spans if isinstance(span, dict)],
+    )
+
+
+def _prompt_source_status(item: dict[str, Any]) -> str:
+    identity = _node_identity_text(item)
+    if "zhishangragqa" in identity or "ragqa" in identity or "问答" in identity:
+        return "rag_qa_prompt_docs_found"
+    if "model" in identity or "llm" in identity or "大模型" in identity:
+        return "model_span_prompt_docs_found"
+    if "script" in identity or "脚本" in identity or "postprocess" in identity or "后处理" in identity:
+        return "script_or_postprocess_prompt_docs_found"
+    return "custom_node_prompt_docs_found"
+
+
+def _build_prompt_observation(node_evidence_map: list[dict[str, Any]]) -> dict[str, Any]:
+    prompt_locations: list[dict[str, Any]] = []
+    empty_prompt_key_seen = False
+    for item in node_evidence_map:
+        node = item.get("node") if isinstance(item.get("node"), dict) else {}
+        for location in item.get("evidence_locations") or []:
+            if not isinstance(location, dict) or location.get("evidence_kind") != "prompt_docs":
+                continue
+            count = int(location.get("count") or 0)
+            if count <= 0:
+                empty_prompt_key_seen = True
+            prompt_locations.append(
+                {
+                    "node_id": node.get("id") or item.get("node_id"),
+                    "node_type": node.get("type"),
+                    "node_name": node.get("name"),
+                    "inferred_role": item.get("inferred_role"),
+                    "span_id": location.get("span_id"),
+                    "span_type": location.get("span_type"),
+                    "span_name": location.get("span_name"),
+                    "channel": location.get("channel"),
+                    "key": location.get("key"),
+                    "path": location.get("path"),
+                    "count": count,
+                    "sample_titles": location.get("sample_titles") or [],
+                    "source_status": _prompt_source_status(item),
+                }
+            )
+    nonempty = [item for item in prompt_locations if int(item.get("count") or 0) > 0]
+    if nonempty:
+        status_priority = [
+            "rag_qa_prompt_docs_found",
+            "model_span_prompt_docs_found",
+            "script_or_postprocess_prompt_docs_found",
+            "custom_node_prompt_docs_found",
+        ]
+        observed_statuses = {str(item.get("source_status") or "") for item in nonempty}
+        status = next((candidate for candidate in status_priority if candidate in observed_statuses), "custom_node_prompt_docs_found")
+    elif empty_prompt_key_seen:
+        status = "confirmed_empty"
+    else:
+        status = "not_observed"
+    return {
+        "status": status,
+        "total_prompt_docs_observed": sum(int(item.get("count") or 0) for item in nonempty),
+        "locations": prompt_locations,
+        "note": (
+            "prompt_docs/qaPromptDocs 已在 trace 节点中观测到；Agent 仍需确认该节点是否是最终回答模型的真实输入。"
+            if nonempty
+            else "未观测到 prompt_docs/qaPromptDocs；这不等价于模型没有看到证据，需回查候选模型/脚本 span 的原始 input/output。"
+            if status == "not_observed"
+            else "观测到 prompt_docs/qaPromptDocs key，但内容为空；需结合真实 prompt-entry 节点确认是否为线上过滤结果。"
+        ),
+    }
+
+
+def _node_candidates_for_terms(
+    node_evidence_map: list[dict[str, Any]],
+    *,
+    terms: tuple[str, ...] = (),
+    evidence_kinds: tuple[str, ...] = (),
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in node_evidence_map:
+        identity = _node_identity_text(item)
+        counts = item.get("evidence_counts") if isinstance(item.get("evidence_counts"), dict) else {}
+        term_match = any(term.lower() in identity for term in terms) if terms else False
+        evidence_match = any(int(counts.get(kind) or 0) > 0 for kind in evidence_kinds) if evidence_kinds else False
+        if not term_match and not evidence_match:
+            continue
+        node = item.get("node") if isinstance(item.get("node"), dict) else {}
+        candidates.append(
+            {
+                "node_id": node.get("id") or item.get("node_id"),
+                "node_type": node.get("type"),
+                "node_name": node.get("name"),
+                "inferred_role": item.get("inferred_role"),
+                "role_description": item.get("role_description"),
+                "span_ids": [span.get("span_id") for span in item.get("trace_spans") or [] if isinstance(span, dict) and span.get("span_id")],
+                "evidence_counts": counts,
+            }
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
+
+
+def _build_agent_span_read_plan(node_evidence_map: list[dict[str, Any]], prompt_observation: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "cause": "输入侧问题",
+            "read_goal": "核查用户问题、workflow input、rewrite、keywords、条件/意图分支是否丢失关键上下文。",
+            "candidate_nodes": _node_candidates_for_terms(
+                node_evidence_map,
+                terms=("start", "开始", "preprocess", "预处理", "rewrite", "keyword", "condition", "条件", "intent", "意图", "classify", "分类"),
+            ),
+        },
+        {
+            "cause": "知识缺失或证据不足",
+            "read_goal": "核查 recall/prompt 证据是否足以支撑 required assertions；必要时结合宽召回实验。",
+            "candidate_nodes": _node_candidates_for_terms(
+                node_evidence_map,
+                terms=("recall", "召回", "qa", "问答", "model", "大模型"),
+                evidence_kinds=("origin_doc_list", "origin_faq_list", "prompt_docs"),
+            ),
+        },
+        {
+            "cause": "召回遗漏",
+            "read_goal": "核查召回节点、召回 HTTP/API span、query variants、filters 和 origin_doc_list/origin_faq_list。",
+            "candidate_nodes": _node_candidates_for_terms(
+                node_evidence_map,
+                terms=("recall", "召回", "http", "api"),
+                evidence_kinds=("origin_doc_list", "origin_faq_list"),
+            ),
+        },
+        {
+            "cause": "重排丢失",
+            "read_goal": "核查 rerank 输入输出、rerank_docs、prompt_docs，以及目标证据从 recall 到 rerank/prompt 的生存情况。",
+            "candidate_nodes": _node_candidates_for_terms(
+                node_evidence_map,
+                terms=("rerank", "重排"),
+                evidence_kinds=("rerank_docs", "prompt_docs"),
+            ),
+        },
+        {
+            "cause": "答案生成错误",
+            "read_goal": "核查最终回答模型或知商问答节点的真实 prompt evidence、answer/end/output 和后处理是否改写答案。",
+            "candidate_nodes": _node_candidates_for_terms(
+                node_evidence_map,
+                terms=("qa", "问答", "answer", "model", "llm", "大模型", "script", "脚本", "postprocess", "后处理", "end", "结束"),
+                evidence_kinds=("prompt_docs", "answer"),
+            ),
+            "prompt_observation_status": prompt_observation.get("status"),
+        },
+        {
+            "cause": "无明显错误/评估器不准，需人工进一步核实",
+            "read_goal": "核查 workflow 最终输出、包装后的 answer_hint、评估器 claim 和 prompt evidence 是否冲突。",
+            "candidate_nodes": _node_candidates_for_terms(
+                node_evidence_map,
+                terms=("end", "结束", "qa", "问答", "answer", "model", "大模型"),
+                evidence_kinds=("prompt_docs", "answer"),
+            ),
+        },
+    ]
+
+
+def _build_workflow_trace_diagnostics(
+    spans: list[dict[str, Any]],
+    resolved_app: dict[str, Any],
+    node_mapping: list[dict[str, Any]],
+    mapping_status: str,
+) -> dict[str, Any]:
+    spans_by_id = {str(span.get("span_id") or ""): span for span in spans}
+    config = resolved_app.get("workflow_config") if isinstance(resolved_app.get("workflow_config"), dict) else {}
+    config_nodes = config.get("nodes") if isinstance(config.get("nodes"), list) else []
+    edges = _workflow_edges(resolved_app)
+    node_evidence_map: list[dict[str, Any]] = []
+
+    for node in [item for item in config_nodes if isinstance(item, dict)]:
+        node_id = str(node.get("id") or "")
+        node_spans = _node_trace_spans(node_id, node_mapping, spans_by_id)
+        counts, locations = _node_observations_for_spans(node_spans)
+        role = _infer_node_role(node, node_spans)
+        node_evidence_map.append(
+            {
+                "node_id": node_id,
+                "node": {
+                    "id": node_id,
+                    "type": node.get("type") or "",
+                    "name": node.get("name") or "",
+                    "order": node.get("order"),
+                    "input_keys": node.get("input_keys") if isinstance(node.get("input_keys"), list) else [],
+                    "output_keys": node.get("output_keys") if isinstance(node.get("output_keys"), list) else [],
+                },
+                "inferred_role": role,
+                "role_description": _node_role_description(role),
+                "trace_spans": [_span_summary(span) for span in node_spans],
+                "evidence_counts": counts,
+                "evidence_locations": locations,
+                "mapping_status": "mapped_by_node_id" if node_spans else "node_without_trace_span",
+            }
+        )
+
+    for span in _unmapped_trace_spans(node_mapping, spans_by_id):
+        counts, locations = _node_observations_for_spans([span])
+        node = {
+            "id": _span_node_id(span) or f"unmapped:{span.get('span_id')}",
+            "type": span.get("span_type") or span.get("type") or "",
+            "name": span.get("span_name") or span.get("name") or "",
+            "order": None,
+            "input_keys": [],
+            "output_keys": [],
+        }
+        role = _infer_node_role(node, [span])
+        node_evidence_map.append(
+            {
+                "node_id": node["id"],
+                "node": node,
+                "inferred_role": role,
+                "role_description": _node_role_description(role),
+                "trace_spans": [_span_summary(span)],
+                "evidence_counts": counts,
+                "evidence_locations": locations,
+                "mapping_status": "unmapped_trace_span_fallback",
+            }
+        )
+
+    prompt_observation = _build_prompt_observation(node_evidence_map)
+    topology = {
+        "source": resolved_app.get("source") or "openplat_app_detail",
+        "mapping_status": mapping_status,
+        "mapping_error": resolved_app.get("mapping_error") or "",
+        "app_name": resolved_app.get("app_name") or "",
+        "version_id": resolved_app.get("version_id") or "",
+        "node_count": config.get("node_count", len(config_nodes) if isinstance(config_nodes, list) else 0),
+        "edge_count": config.get("edge_count", len(edges)),
+        "nodes": [
+            {
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "name": item.get("name"),
+                "order": item.get("order"),
+                "input_keys": item.get("input_keys", []),
+                "output_keys": item.get("output_keys", []),
+            }
+            for item in config_nodes
+            if isinstance(item, dict)
+        ],
+        "edges": edges,
+        "node_order": config.get("node_order", []),
+    }
+    return {
+        "workflow_topology": topology,
+        "node_evidence_map": node_evidence_map,
+        "prompt_observation": prompt_observation,
+        "agent_span_read_plan": _build_agent_span_read_plan(node_evidence_map, prompt_observation),
+    }
+
+
 def _raw_doc_lists(recall_output: Any, rerank_output: Any, qa_output: Any, end_output: Any = None) -> dict[str, list[dict[str, Any]]]:
     recall = recall_output if isinstance(recall_output, dict) else {}
     rerank = rerank_output if isinstance(rerank_output, dict) else {}
@@ -384,6 +891,16 @@ def _children_by_parent(spans: list[dict[str, Any]]) -> dict[str, list[dict[str,
         if parent_id:
             children.setdefault(parent_id, []).append(span)
     return children
+
+
+def _descendant_spans(children_map: dict[str, list[dict[str, Any]]], parent_id: str) -> list[dict[str, Any]]:
+    descendants: list[dict[str, Any]] = []
+    queue = list(children_map.get(parent_id, []))
+    while queue:
+        child = queue.pop(0)
+        descendants.append(child)
+        queue.extend(children_map.get(str(child.get("span_id") or ""), []))
+    return descendants
 
 
 def _first_child(children: list[dict[str, Any]], *span_types: str) -> dict[str, Any] | None:
@@ -414,6 +931,7 @@ def _workflow_segments(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     for workflow_span in [span for span in spans if _span_type(span) == "workflow"]:
         children = children_map.get(str(workflow_span.get("span_id") or ""), [])
+        all_children = _descendant_spans(children_map, str(workflow_span.get("span_id") or ""))
         start_span = _first_child(children, "Start")
         recall_span = _first_child(children, "ZhiShangRAGRecall")
         rerank_span = _first_child(children, "ZhiShangRAGRerank")
@@ -429,6 +947,7 @@ def _workflow_segments(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "rerank_span": rerank_span,
                 "qa_span": qa_span,
                 "end_span": end_span,
+                "all_child_spans": all_children,
             }
         )
     return segments
@@ -510,12 +1029,15 @@ def _segment_query(segment: dict[str, Any]) -> str:
 
 
 def _segment_raw_docs(segment: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    return _raw_doc_lists(
+    raw_docs = _raw_doc_lists(
         _span_output(segment.get("recall_span")),
         _span_output(segment.get("rerank_span")),
         _span_output(segment.get("qa_span")),
         _span_output(segment.get("end_span")),
     )
+    if not raw_docs["prompt_docs"]:
+        raw_docs["prompt_docs"] = _collect_prompt_docs_from_spans(segment.get("all_child_spans") or [])
+    return raw_docs
 
 
 def _doc_key_overlaps(doc: dict[str, Any], docs: list[dict[str, Any]]) -> bool:
@@ -718,6 +1240,7 @@ def ingest_fornax_trace(payload: Any, request: FornaxTraceIngestRequest) -> Forn
     app_id = _first_nonempty(request.app_id, _root_tag(spans, "zhishang.app_id", "appId", "app_id"), _first_tag(spans, "zhishang.app_id", "appId", "app_id"))
     resolved_app = _resolve_workflow_mapping(workspace_id, app_id)
     node_mapping, mapping_status = _trace_node_mapping(spans, resolved_app)
+    workflow_diagnostics = _build_workflow_trace_diagnostics(spans, resolved_app, node_mapping, mapping_status)
     preprocess_span = _find_mapped_span(spans, node_mapping, ("preprocess", "ragpreprocess", "预处理"), ("ZhiShangRAGPreprocess",), names=("预处理",))
     recall_span = _find_mapped_span(spans, node_mapping, ("recall", "ragrecall", "召回"), ("ZhiShangRAGRecall",), names=("召回",))
     rerank_span = _find_mapped_span(spans, node_mapping, ("rerank", "ragrerank", "重排"), ("ZhiShangRAGRerank",), names=("重排",))
@@ -764,6 +1287,10 @@ def ingest_fornax_trace(payload: Any, request: FornaxTraceIngestRequest) -> Forn
     fornax_space_id = _first_nonempty(request.fornax_space_id, _first_tag(spans, "fornax_space_id"))
 
     raw_docs = _raw_doc_lists(recall_output, rerank_output, qa_output, end_output)
+    if not raw_docs["prompt_docs"] and selected_segment:
+        raw_docs["prompt_docs"] = _collect_prompt_docs_from_spans(selected_segment.get("all_child_spans") or [])
+    if not raw_docs["prompt_docs"]:
+        raw_docs["prompt_docs"] = _collect_prompt_docs_from_spans(spans)
     dropped_relevant_docs = selected_segment_summary.get("dropped_relevant_docs", []) if selected_segment_summary else []
     selected_dropped_doc_ids = [str(doc.get("id")) for doc in dropped_relevant_docs if doc.get("id")]
     final_top_docs = selected_segment_summary.get("final_top_docs", []) if selected_segment_summary else []
@@ -888,6 +1415,7 @@ def ingest_fornax_trace(payload: Any, request: FornaxTraceIngestRequest) -> Forn
                 "mapping_status": mapping_status,
                 "workflow_segments": workflow_segment_summaries,
                 "selected_workflow_segment": selected_segment_summary,
+                **workflow_diagnostics,
                 "counts": {
                     "origin_doc_list": len(raw_docs["origin_doc_list"]),
                     "origin_faq_list": len(raw_docs["origin_faq_list"]),
@@ -929,6 +1457,10 @@ def ingest_fornax_trace(payload: Any, request: FornaxTraceIngestRequest) -> Forn
         "workflow_segment_count": len(workflow_segment_summaries),
         "workflow_segments": workflow_segment_summaries,
         "selected_workflow_segment": selected_segment_summary,
+        "workflow_topology": workflow_diagnostics["workflow_topology"],
+        "node_evidence_map": workflow_diagnostics["node_evidence_map"],
+        "prompt_observation": workflow_diagnostics["prompt_observation"],
+        "agent_span_read_plan": workflow_diagnostics["agent_span_read_plan"],
         "workflow_span_count": len(workflow_span_ios),
         "selected_workflow_span_id": next((item.get("span_id") for item in workflow_span_ios if item.get("selected")), ""),
         "mapping_status": mapping_status,
