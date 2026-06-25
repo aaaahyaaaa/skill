@@ -281,6 +281,10 @@ def build_case_facts(
             "has_middle_node_trace": bool(trace_summary.get("has_middle_node_trace")),
             "middle_node_types": trace_summary.get("middle_node_types", []),
             "workflow_span_ios": workflow_evidence.get("workflow_span_ios", []),
+            "workflow_topology": workflow_evidence.get("workflow_topology", trace_summary.get("workflow_topology", {})),
+            "node_evidence_map": workflow_evidence.get("node_evidence_map", trace_summary.get("node_evidence_map", [])),
+            "prompt_observation": workflow_evidence.get("prompt_observation", trace_summary.get("prompt_observation", {})),
+            "agent_span_read_plan": workflow_evidence.get("agent_span_read_plan", trace_summary.get("agent_span_read_plan", [])),
         },
         "preprocess": {
             "rewrite_query": attribution_request.preprocess.rewrite_query,
@@ -348,8 +352,14 @@ def schema_payload() -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "commands": {
             "collect-evidence": {
-                "purpose": "Fetch or read trace, parse RAG artifacts, and persist case facts for Agent judgement.",
+                "purpose": "Fetch or read trace, parse workflow-aware RAG artifacts, and persist case facts for Agent judgement.",
                 "outputs": ["case_facts.json", "agent_brief.md"],
+                "trace_outputs": [
+                    "workflow_topology",
+                    "node_evidence_map",
+                    "prompt_observation",
+                    "agent_span_read_plan",
+                ],
             },
             "run-experiment": {
                 "purpose": "Plan or run recall/rerank/replay experiments without selecting a root cause.",

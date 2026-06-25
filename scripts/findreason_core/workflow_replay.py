@@ -72,6 +72,14 @@ def _openplat_headers(token: str) -> dict[str, str]:
     }
 
 
+def _workspace_auth_headers(token: str, workspace_id: str) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": _bearer_token(token),
+        "workspaceId": workspace_id,
+    }
+
+
 def _find_list_key(value: Any, keys: set[str]) -> list[Any] | None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -332,9 +340,9 @@ def resolve_workflow(request: AttributionRequest, version_id: str | None = None)
     workspace_id = _numeric_id(case_input.workspace_id, "workspace_id")
     app_id = _numeric_id(case_input.app_id, "app_id")
     version = _optional_numeric_id(version_id or case_input.version_id, "version_id")
-    bootstrap_token, bootstrap_source = _openplat_bootstrap_token()
-    if not bootstrap_token:
-        raise WorkflowResolverError("OpenPlat bootstrap token is not configured")
+    workspace_token, workspace_token_source = resolve_workflow_auth_token_sync(workspace_id)
+    if not workspace_token:
+        raise WorkflowResolverError("OpenPlat workspace apiKey is not configured")
     params: dict[str, str] = {"appId": app_id, "workspaceId": workspace_id}
     if version:
         params["appVersion"] = version
@@ -343,7 +351,7 @@ def resolve_workflow(request: AttributionRequest, version_id: str | None = None)
             response = client.get(
                 OPEN_PLAT_APP_DETAIL_URL,
                 params=params,
-                headers=_openplat_headers(bootstrap_token),
+                headers=_workspace_auth_headers(workspace_token, workspace_id),
             )
     except Exception as exc:
         raise WorkflowResolverError(f"OpenPlat app detail lookup failed: {_safe_error(exc)}") from exc
@@ -368,7 +376,7 @@ def resolve_workflow(request: AttributionRequest, version_id: str | None = None)
         "source": "openplat_app_detail",
         "endpoint": OPEN_PLAT_APP_DETAIL_URL,
         "request_params": params,
-        "auth_token_source": f"openplat_bootstrap:{bootstrap_source}",
+        "auth_token_source": f"workspace_api_key:{workspace_token_source}",
         "workspace_id": str(app_detail.get("workspaceId") or app_detail.get("workspace_id") or workspace_id),
         "app_id": str(app_detail.get("appId") or app_detail.get("app_id") or app_id),
         "app_name": str(app_detail.get("name") or ""),
@@ -854,6 +862,31 @@ def _openplat_bootstrap_token() -> tuple[str, str]:
     return OPEN_PLAT_ZS_OPEN_TOKEN, "fixed_source_constant"
 
 
+def _workspace_api_key_from_payload(payload: Any, workspace_id: str) -> str:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    auth_info = data.get("authInfo") if isinstance(data, dict) else None
+    api_key = auth_info.get("apiKey") if isinstance(auth_info, dict) else None
+    if isinstance(api_key, str) and api_key.strip():
+        return api_key.strip()
+    code = payload.get("code") if isinstance(payload, dict) else None
+    raise WorkflowResolverError(f"workspace info returned no authInfo.apiKey for workspace_id={workspace_id}; code={code}")
+
+
+def resolve_workflow_auth_token_sync(workspace_id: str) -> tuple[str | None, str]:
+    bootstrap_token, bootstrap_source = _openplat_bootstrap_token()
+    if bootstrap_token:
+        with httpx.Client(timeout=30) as client:
+            response = client.get(
+                OPEN_PLAT_WORKSPACE_INFO_URL,
+                params={"workspaceId": workspace_id},
+                headers=_openplat_headers(bootstrap_token),
+            )
+        if response.status_code >= 400:
+            raise WorkflowResolverError(f"workspace info HTTP {response.status_code}: {response.text[:500]}")
+        return _workspace_api_key_from_payload(response.json(), workspace_id), f"workspace_info_api:{bootstrap_source}"
+    return None, "not_configured"
+
+
 async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, str]:
     bootstrap_token, bootstrap_source = _openplat_bootstrap_token()
     if bootstrap_token:
@@ -865,14 +898,7 @@ async def resolve_workflow_auth_token(workspace_id: str) -> tuple[str | None, st
             )
         if response.status_code >= 400:
             raise WorkflowResolverError(f"workspace info HTTP {response.status_code}: {response.text[:500]}")
-        payload = response.json()
-        data = payload.get("data") if isinstance(payload, dict) else None
-        auth_info = data.get("authInfo") if isinstance(data, dict) else None
-        api_key = auth_info.get("apiKey") if isinstance(auth_info, dict) else None
-        if isinstance(api_key, str) and api_key.strip():
-            return api_key.strip(), f"workspace_info_api:{bootstrap_source}"
-        code = payload.get("code") if isinstance(payload, dict) else None
-        raise WorkflowResolverError(f"workspace info returned no authInfo.apiKey for workspace_id={workspace_id}; code={code}")
+        return _workspace_api_key_from_payload(response.json(), workspace_id), f"workspace_info_api:{bootstrap_source}"
     return None, "not_configured"
 
 

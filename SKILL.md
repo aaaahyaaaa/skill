@@ -14,6 +14,7 @@ FindReason v4 不再让 CLI 选择单一 `primary_cause`，也不再用“最早
 代码负责：
 
 - 拉取、解析、固化 Fornax trace。
+- 通过 OpenPlat app-detail 解析 `workflowConfigV2`，输出真实 workflow 节点拓扑、节点证据映射和 prompt 观测状态。
 - 归一化 `origin_doc_list`、`origin_faq_list`、`rerank_docs`、`prompt_docs`。
 - 把 `origin_doc_list + origin_faq_list` 汇总为人读层的 `recall`，同时保留原始字段用于审计。具体线上召回链路见 `references/recall_chain.md`。
 - 运行或规划 recall / rerank / replay 实验。
@@ -28,15 +29,17 @@ Agent 负责：
 - 怎么规划下一步 probe / experiment。
 - 怎么写人读报告。
 - 不同阶段的边界、反思流程和最终 judgement。
+- 根据 `trace.node_evidence_map` / `trace.agent_span_read_plan` 决定哪些节点和 span 值得深读；不要把脚本的候选读取建议当成最终 cause。
 
 ## 主流程
 
 1. 用 `collect-evidence` 固化 trace 和 RAG artifacts。
-2. 读取 `case_facts.json` 与 `agent_brief.md`，先抽答案症状，再列候选根因。
-3. 对每个候选根因写明支持证据、反证证据和下一步实验。
-4. 需要时用 `run-experiment` 规划或运行 recall / rerank / replay 实验。
-5. 运行 `synthesize-brief` 生成短版 judgement summary 和证据索引。
-6. Agent 基于事实和实验结果给用户输出短版结论，风格类似一次清晰复盘回复；不要要求用户阅读 JSON 或长报告。
+2. 读取 `case_facts.json` 与 `agent_brief.md`，先看 `Workflow 节点诊断` 和 `按 cause 的 span 读取入口`，决定要深读哪些节点/span。
+3. 抽答案症状，再列候选根因。
+4. 对每个候选根因写明支持证据、反证证据和下一步实验。
+5. 需要时用 `run-experiment` 规划或运行 recall / rerank / replay 实验。
+6. 运行 `synthesize-brief` 生成短版 judgement summary 和证据索引。
+7. Agent 基于事实和实验结果给用户输出短版结论，风格类似一次清晰复盘回复；不要要求用户阅读 JSON 或长报告。
 
 ## Cause 枚举
 
@@ -72,7 +75,7 @@ Agent 负责：
 - 必需：本地 `python3 -m findreason` CLI、`case_facts.json`、`agent_brief.md`、`*_experiment.json`、`agent_judgement.md`。
 - 可选线上接口：`collect-evidence` 在未提供 `--trace-file` 时会用 OpenPlat trace detail API 拉取 trace；有本地 trace 时优先传 `--trace-file`。
 - 可选 live recall：`run-experiment --type recall --query ...` 在 trace 中有 recall/searchDoc 请求模板时，会用 `httpx` 复用模板调用线上 recall/searchDoc；不传 `--query` 时只生成本地实验计划。
-- 可选 live replay：`run-experiment --type replay` 只有在历史 trace 缺少中间节点证据时才尝试当前版本 workflow replay，内部只走接口链路：OpenPlat app detail API 获取 `workflowConfigV2`、OpenPlat workspace info API 获取 workspace 级 `authInfo.apiKey`、open-exec workflow API 执行重跑；历史 trace 足够时会跳过 replay。
+- 可选 live replay：`run-experiment --type replay` 只有在历史 trace 缺少中间节点证据时才尝试当前版本 workflow replay，内部只走接口链路：OpenPlat workspace info API 先用固定 open-api token 获取 workspace 级 `authInfo.apiKey`，再用该 workspace apiKey 和 `workspaceId` header 调 OpenPlat app detail API 获取 `workflowConfigV2`，最后用同一个 workspace apiKey 调 open-exec workflow API 执行重跑；历史 trace 足够时会跳过 replay。
 - 发布层：飞书文档只用于用户明确要求分享/评审发布时；归因本身不要依赖飞书文档作为唯一证据库。
 
 因此，最稳的默认路径是：单 case 本地 case 文件 + 本地 trace 文件 + LLM 读 `agent_brief.md` / `agent_judgement.md` 完成最终判断。只有用户明确要“重新拉线上 trace / 重跑 recall / 重跑 workflow”时，才启用对应可选能力。
@@ -111,6 +114,8 @@ python3 -m findreason run-experiment --type replay --facts-file /tmp/findreason-
 
 `--version-id` / `--app-version` 只用于 replay 的 app-detail 解析。用户提供时会作为 `appVersion` 传给 `/open-plat/api/app/get-app-detail`；用户没有提供时不传 `appVersion`，由平台接口返回最新版本。
 
+`/open-plat/api/app/get-app-detail` 不在固定 `x-zs-plt-open: zs_open` 白名单鉴权路径内。调用它时必须先通过 `/open-plat/api/workspace/get-workspace-info` 拿到 workspace 级 `authInfo.apiKey`，再带 `Authorization: Bearer <workspace apiKey>` 和 header `workspaceId: <workspace_id>` 请求 app-detail；query params 中仍保留 `workspaceId`、`appId` 和可选 `appVersion`。如果只用固定 open-api token 调 app-detail，入口 `AuthFilter` 会落到 Kani/cookie 登录态兜底，常见报错是「鉴权失败，用户登录状态异常」。
+
 报告合成入口：
 
 ```bash
@@ -141,6 +146,8 @@ python3 -m findreason schema
 - 如果只是发现 Workflow input、rewrite、keywords 可能少了信息，但改写 query 没改善实验结果，只能把 `输入侧问题` 写成低置信候选或待验证点，不能直接判主因。
 - 答案表象：漏答、错引、越界、自相矛盾、无依据断言、把弱证据写成强结论。
 - 证据生存：同一必要断言是否从 `recall` 进入 `rerank_docs`，再进入 `prompt_docs` / `qaPromptDocs`。
+- Workflow-aware 侦查：优先使用 `case_facts.json.trace.workflow_topology` 的 app-detail 真实节点信息；`node_evidence_map[].inferred_role` 只是辅助说明。Agent 应根据真实节点 type/name、span input/output 和证据字段位置决定深读哪些 span。
+- Prompt 观测：`trace.prompt_observation.status=not_observed` 只表示解析面未看到 `prompt_docs` / `qaPromptDocs`，不得直接写成“全部证据被过滤”或“模型零证据生成”。先回查 `agent_span_read_plan` 推荐的大模型、知商问答、脚本和后处理节点。
 - 召回边界：报告里可叫 `recall`，但审计时要区分 `origin_doc_list` 与 `origin_faq_list`；线上链路可能来自旧 `/searchDoc`，也可能来自新拆分 `/recall` 能力，以 trace 为准。
 - 知识边界：宽召回是否仍无权威支撑，还是只有相邻主题。
 - 证据充分性：把用户问题拆成 required assertions，判断关键证据组合是完整支撑、部分支撑还是只解释了 replay 改善；明确仍缺哪条权威文档或业务规则。

@@ -173,6 +173,69 @@ def _doc_lines(doc: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _workflow_diagnostic_lines(trace: dict[str, Any]) -> list[str]:
+    topology = trace.get("workflow_topology") if isinstance(trace.get("workflow_topology"), dict) else {}
+    node_map = trace.get("node_evidence_map") if isinstance(trace.get("node_evidence_map"), list) else []
+    prompt_observation = trace.get("prompt_observation") if isinstance(trace.get("prompt_observation"), dict) else {}
+    if not topology and not node_map:
+        return ["- 未采集到 app-detail 节点拓扑；如需深挖，先回查 raw trace 和 workflow span。"]
+
+    lines = [
+        f"- mapping_status: `{topology.get('mapping_status') or 'unknown'}`",
+        f"- app/version: {topology.get('app_name') or '未提供'} / {topology.get('version_id') or '未提供'}",
+        f"- 节点/边: `{topology.get('node_count', 0)}` / `{topology.get('edge_count', 0)}`",
+        f"- prompt_observation: `{prompt_observation.get('status') or 'not_observed'}`；{_short(prompt_observation.get('note'), 260)}",
+    ]
+    for item in node_map[:10]:
+        if not isinstance(item, dict):
+            continue
+        node = item.get("node") if isinstance(item.get("node"), dict) else {}
+        counts = item.get("evidence_counts") if isinstance(item.get("evidence_counts"), dict) else {}
+        spans = item.get("trace_spans") if isinstance(item.get("trace_spans"), list) else []
+        span_ids = [str(span.get("span_id")) for span in spans if isinstance(span, dict) and span.get("span_id")]
+        evidence_bits = []
+        if counts.get("origin_doc_list") or counts.get("origin_faq_list"):
+            evidence_bits.append(f"recall {int(counts.get('origin_doc_list') or 0) + int(counts.get('origin_faq_list') or 0)}")
+        if counts.get("rerank_docs"):
+            evidence_bits.append(f"rerank {counts.get('rerank_docs')}")
+        if counts.get("prompt_docs"):
+            evidence_bits.append(f"prompt {counts.get('prompt_docs')}")
+        if counts.get("answer"):
+            evidence_bits.append(f"answer {counts.get('answer')}")
+        lines.append(
+            "- "
+            f"{node.get('name') or '(unnamed)'}"
+            f" / type={node.get('type') or 'unknown'}"
+            f" / node_id={node.get('id') or ''}"
+            f" / inferred_role={item.get('inferred_role') or 'unknown'}"
+            f" / spans={', '.join(span_ids[:4]) or '未映射'}"
+            f" / evidence={', '.join(evidence_bits) or '未观测到关键证据字段'}"
+        )
+    if len(node_map) > 10:
+        lines.append(f"- 其余 `{len(node_map) - 10}` 个节点已省略；完整节点证据见 `case_facts.json.trace.node_evidence_map`。")
+    return lines
+
+
+def _agent_read_plan_lines(trace: dict[str, Any]) -> list[str]:
+    read_plan = trace.get("agent_span_read_plan") if isinstance(trace.get("agent_span_read_plan"), list) else []
+    if not read_plan:
+        return ["- 未生成按 cause 的 span 读取建议；请直接回查 workflow_topology 和 raw trace。"]
+    lines: list[str] = []
+    for item in read_plan:
+        if not isinstance(item, dict):
+            continue
+        candidates = item.get("candidate_nodes") if isinstance(item.get("candidate_nodes"), list) else []
+        node_names = []
+        for candidate in candidates[:4]:
+            if not isinstance(candidate, dict):
+                continue
+            label = str(candidate.get("node_name") or candidate.get("node_type") or candidate.get("node_id") or "").strip()
+            spans = ", ".join(str(span_id) for span_id in (candidate.get("span_ids") or [])[:3])
+            node_names.append(f"{label}{f'({spans})' if spans else ''}")
+        lines.append(f"- {item.get('cause')}: {', '.join(node_names) or '暂无候选节点'}")
+    return lines
+
+
 def judgement_brief_markdown(case_facts: dict[str, Any]) -> str:
     case = case_facts.get("case") if isinstance(case_facts.get("case"), dict) else {}
     counts = case_facts.get("counts") if isinstance(case_facts.get("counts"), dict) else {}
@@ -219,6 +282,16 @@ def judgement_brief_markdown(case_facts: dict[str, Any]) -> str:
         "",
         f"- 输入摘要：{_json_preview(workflow_input)}",
         f"- 输出摘要：{_json_preview(workflow_output)}",
+        "",
+        "## Workflow 节点诊断",
+        "",
+        "- 这里优先使用 app-detail 的真实节点信息；`inferred_role` 只是辅助说明，不是最终归因。",
+        *_workflow_diagnostic_lines(trace),
+        "",
+        "## 按 cause 的 span 读取入口",
+        "",
+        "- 这些是给 Agent 的候选读取入口，不是 CLI 的硬裁决。",
+        *_agent_read_plan_lines(trace),
         "",
         "## 评估器线索",
         "",
