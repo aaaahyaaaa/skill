@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterable
 
 
@@ -8,7 +9,18 @@ DOC_ID_KEYS = ("id", "doc_id", "docId", "record_id", "recordId", "identifier", "
 DOC_TITLE_KEYS = ("title", "doc_title", "docTitle", "name")
 DOC_CONTENT_KEYS = ("content", "text", "chunk", "chunk_text", "chunkText", "summary", "description")
 DOC_URL_KEYS = ("url", "link", "doc_url", "docUrl", "source_url", "sourceUrl")
-DOC_SCORE_KEYS = ("score", "rerank_score", "rerankScore", "similarity", "rank_score", "rankScore")
+DOC_SCORE_KEYS = (
+    "score",
+    "rerank_score",
+    "rerankScore",
+    "similarity",
+    "rank_score",
+    "rankScore",
+    "fineScore",
+    "fine_score",
+    "recallScore",
+    "recall_score",
+)
 
 
 def to_jsonable(value: Any) -> Any:
@@ -55,6 +67,29 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _doc_aliases(item: dict[str, Any], primary_id: str) -> list[str]:
+    aliases: list[str] = []
+
+    def add(value: Any) -> None:
+        if value in (None, ""):
+            return
+        text = str(value).strip()
+        if text and text not in aliases:
+            aliases.append(text)
+
+    add(primary_id)
+    for key in DOC_ID_KEYS:
+        add(item.get(key))
+    raw_aliases = item.get("doc_id_aliases") or item.get("docIdAliases") or item.get("aliases")
+    if isinstance(raw_aliases, list):
+        for value in raw_aliases:
+            add(value)
+    source_text = str(item.get("source") or "")
+    for match in re.finditer(r"(?:identifier|id|doc_id|record_id|knowledge_id)=([^|,\s]+)", source_text):
+        add(match.group(1))
+    return aliases
+
+
 def normalize_doc(value: Any, *, source: str = "", rank: int | None = None) -> dict[str, Any] | None:
     item = to_jsonable(decode_jsonish(value))
     if not isinstance(item, dict):
@@ -67,12 +102,14 @@ def normalize_doc(value: Any, *, source: str = "", rank: int | None = None) -> d
     resolved_source = str(source or item.get("source") or item.get("source_type") or "").strip()
     if not any((doc_id, title, content, url)):
         return None
+    raw_rank = _float_or_none(item.get("rank"))
     return {
         "id": doc_id,
+        "doc_id_aliases": _doc_aliases(item, doc_id),
         "title": title,
         "content": content,
         "url": url,
-        "rank": rank if rank is not None else _float_or_none(item.get("rank")),
+        "rank": raw_rank if raw_rank is not None else rank,
         "score": score,
         "source": resolved_source,
         "raw_keys": sorted(str(key) for key in item.keys())[:40],

@@ -401,6 +401,30 @@ def test_cli_does_not_expose_batch_commands() -> None:
         ]
     )
     assert version_args.version_id == "7"
+    recall_args = parser.parse_args(
+        [
+            "run-experiment",
+            "--type",
+            "recall",
+            "--facts-file",
+            "/tmp/case_facts.json",
+            "--query",
+            "workflow query",
+            "--context-query",
+            "context query",
+        ]
+    )
+    assert recall_args.context_query == ["context query"]
+    knowledge_args = parser.parse_args(
+        [
+            "run-experiment",
+            "--type",
+            "knowledge-detail",
+            "--facts-file",
+            "/tmp/case_facts.json",
+        ]
+    )
+    assert knowledge_args.type == "knowledge-detail"
 
 
 def test_reference_case_playbooks_cover_trace_acquisition_modes() -> None:
@@ -928,7 +952,7 @@ def test_recall_experiment_executes_trace_template_with_query(
     }
     facts_file = tmp_path / "case_facts.json"
     write_json(facts_file, facts)
-    posted: dict[str, object] = {}
+    posted: dict[str, object] = {"calls": []}
 
     async def fake_resolve_token(workspace_id: str) -> tuple[str, str]:
         assert workspace_id == "138"
@@ -964,6 +988,7 @@ def test_recall_experiment_executes_trace_template_with_query(
             posted["endpoint"] = endpoint
             posted["headers"] = headers
             posted["json"] = json
+            posted["calls"].append({"endpoint": endpoint, "headers": headers, "json": json})
             return FakeResponse()
 
     monkeypatch.setattr(experiments, "resolve_workflow_auth_token", fake_resolve_token)
@@ -973,17 +998,170 @@ def test_recall_experiment_executes_trace_template_with_query(
         experiment_type="recall",
         facts_file=str(facts_file),
         query="new concrete query",
+        context_queries=["context rich query"],
     )
 
     assert result["status"] == "ok"
     assert result["counts"]["recall_docs"] == 1
     assert result["artifacts"]["recall_docs"][0]["id"] == "doc-42"
-    assert posted["json"]["oriQuery"] == "new concrete query"
-    assert posted["json"]["query"] == ["new concrete query"]
-    assert posted["json"]["params"]["workspaceId"] == "138"
-    assert posted["headers"]["Authorization"] == "Bearer unit-token"
+    matrix = result["recall_variant_matrix"]
+    assert [item["variant_id"] for item in matrix[:3]] == [
+        "baseline_trace_recall",
+        "workflow_query_override",
+        "topk_relaxed",
+    ]
+    topk_variant = next(item for item in matrix if item["variant_id"] == "topk_relaxed")
+    assert topk_variant["status"] == "ok"
+    assert topk_variant["request_payload"]["recallRequests"][0]["maxCount"] == 50
+    assert next(item for item in matrix if item["variant_id"] == "label_relaxed")["status"] == "unsupported"
+    assert next(item for item in matrix if item["variant_id"] == "threshold_relaxed")["status"] == "unsupported"
+    assert next(item for item in matrix if item["variant_id"] == "context_query_1")["variant_type"] == "context_query"
+    assert "workflow_input_loss" in next(item for item in matrix if item["variant_id"] == "context_query_1")["notes"]
+    workflow_call = posted["calls"][0]
+    assert workflow_call["json"]["oriQuery"] == "new concrete query"
+    assert workflow_call["json"]["query"] == ["new concrete query"]
+    assert workflow_call["json"]["params"]["workspaceId"] == "138"
+    assert workflow_call["headers"]["Authorization"] == "Bearer unit-token"
     assert "primary_cause" not in result
     assert "candidate_cause" not in result
+
+
+def test_rerank_experiment_outputs_rank_shift_with_alias_matching(tmp_path: Path) -> None:
+    from findreason_core.evidence_kernel import write_json
+    from findreason_core.experiments import run_experiment
+
+    facts = {
+        "schema_version": "agent-judgement-v4",
+        "log_id": "log",
+        "workspace_id": "138",
+        "app_id": "1001883",
+        "case": {
+            "query": "query",
+            "core_documents": [
+                {
+                    "doc_id": "identifier-1",
+                    "supported_assertion": "支撑准入规则",
+                    "title_hint": "准入规则",
+                }
+            ],
+        },
+        "trace": {
+            "prompt_observation": {"status": "not_observed", "locations": []},
+            "node_evidence_map": [
+                {"node": {"id": "qa", "type": "ZhiShangRAGQA", "name": "问答节点"}, "inferred_role": "rag_answer"}
+            ],
+        },
+        "artifacts": {
+            "origin_doc_list": [
+                {
+                    "id": "internal-1",
+                    "doc_id_aliases": ["internal-1", "identifier-1"],
+                    "title": "准入规则",
+                    "content": "核心规则",
+                    "rank": 2,
+                    "score": 0.9,
+                }
+            ],
+            "origin_faq_list": [],
+            "rerank_docs": [],
+            "prompt_docs": [],
+        },
+    }
+    facts_file = tmp_path / "case_facts.json"
+    write_json(facts_file, facts)
+
+    result = run_experiment(experiment_type="rerank", facts_file=str(facts_file))
+
+    observation = result["rank_shift_observations"][0]
+    assert observation["core_doc"]["doc_id"] == "identifier-1"
+    assert observation["core_doc"]["supported_assertion"] == "支撑准入规则"
+    assert observation["recall"]["rank"] == 2
+    assert observation["rerank"]["rank"] is None
+    assert observation["missing_reason"] == "missing_from_rerank"
+    assert observation["context_boundary"]["status"] == "not_observed"
+    assert "Script1" not in json.dumps(observation, ensure_ascii=False)
+    assert result["missing_from_rerank"] == ["identifier-1"]
+
+
+def test_knowledge_detail_experiment_extracts_status_signals_and_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import findreason_core.experiments as experiments
+    from findreason_core.evidence_kernel import write_json
+    from findreason_core.experiments import run_experiment
+
+    facts = {
+        "schema_version": "agent-judgement-v4",
+        "log_id": "log",
+        "workspace_id": "138",
+        "app_id": "1001883",
+        "case": {
+            "query": "query",
+            "core_documents": [
+                {"doc_id": "doc-ok", "title_hint": "旧 FAQ"},
+                {"doc_id": "doc-fail", "title_hint": "失败文档"},
+            ],
+        },
+        "artifacts": {
+            "origin_doc_list": [
+                {"id": "doc-ok", "title": "旧 FAQ", "content": "", "rank": 1},
+                {"id": "doc-fail", "title": "失败文档", "content": "", "rank": 2},
+            ],
+            "origin_faq_list": [],
+            "rerank_docs": [],
+            "prompt_docs": [],
+        },
+    }
+    facts_file = tmp_path / "case_facts.json"
+    write_json(facts_file, facts)
+
+    async def fake_resolve_token(workspace_id: str) -> tuple[str, str]:
+        return "unit-token", "unit"
+
+    class FakeResponse:
+        def __init__(self, endpoint: str) -> None:
+            self.endpoint = endpoint
+            self.status_code = 500 if "doc-fail" in endpoint else 200
+            self.text = "failed" if self.status_code >= 400 else "{}"
+
+        def json(self) -> dict:
+            return {
+                "code": 0,
+                "data": {
+                    "title": "旧 FAQ",
+                    "content": "该手册已停止更新，属于历史版本。",
+                    "modifyTime": "2026-06-01",
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, timeout: int) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, endpoint: str, *, headers: dict, json: dict) -> FakeResponse:
+            assert headers["Authorization"] == "Bearer unit-token"
+            return FakeResponse(endpoint)
+
+    monkeypatch.setattr(experiments, "resolve_workflow_auth_token", fake_resolve_token)
+    monkeypatch.setattr(experiments.httpx, "Client", FakeClient)
+
+    result = run_experiment(experiment_type="knowledge-detail", facts_file=str(facts_file), output_dir=str(tmp_path))
+
+    assert result["counts"] == {"key_docs": 2, "confirmed": 1, "unconfirmed": 1}
+    ok = next(item for item in result["knowledge_details"] if item["doc_id"] == "doc-ok")
+    failed = next(item for item in result["knowledge_details"] if item["doc_id"] == "doc-fail")
+    assert ok["status_confirmed"] is True
+    assert ok["status_signals"] == ["停止更新", "历史版本"]
+    assert ok["last_modified"] == "2026-06-01"
+    assert failed["status_confirmed"] is False
+    assert failed["status_reason"] == "status_unconfirmed"
+    assert (tmp_path / "knowledge_detail_experiment.json").exists()
 
 
 def test_replay_experiment_skips_when_authoritative_trace_exists(

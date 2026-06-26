@@ -17,9 +17,9 @@ FindReason v4 不再让 CLI 选择单一 `primary_cause`，也不再用“最早
 - 通过 OpenPlat app-detail 解析 `workflowConfigV2`，输出真实 workflow 节点拓扑、节点证据映射和 prompt 观测状态。
 - 归一化 `origin_doc_list`、`origin_faq_list`、`rerank_docs`、`prompt_docs`。
 - 把 `origin_doc_list + origin_faq_list` 汇总为人读层的 `recall`，同时保留原始字段用于审计。具体线上召回链路见 `references/recall_chain.md`。
-- 运行或规划 recall / rerank / replay 实验。
+- 运行或规划 recall variant matrix、rerank rank-shift、replay 和 knowledge-detail 状态实验。
 - 输出 `case_facts.json`、`*_experiment.json`、`agent_brief.md`。
-- 用 `synthesize-brief` 生成短版 `agent_judgement.md` 和 `evidence_index.json` 本地证据索引。
+- 用 `synthesize-brief` 生成短版 `agent_judgement.md` 和 `evidence_index.json` 本地证据索引；若存在 `knowledge_detail_experiment.json`，自动把关键文档状态信号写进索引。
 
 Agent 负责：
 
@@ -37,7 +37,7 @@ Agent 负责：
 2. 读取 `case_facts.json` 与 `agent_brief.md`，先看 `Workflow 节点诊断` 和 `按 cause 的 span 读取入口`，决定要深读哪些节点/span。
 3. 抽答案症状，再列候选根因。
 4. 对每个候选根因写明支持证据、反证证据和下一步实验。
-5. 需要时用 `run-experiment` 规划或运行 recall / rerank / replay 实验。
+5. 需要时用 `run-experiment` 规划或运行 recall / rerank / replay / knowledge-detail 实验。
 6. 运行 `synthesize-brief` 生成短版 judgement summary 和证据索引。
 7. Agent 基于事实和实验结果给用户输出短版结论，风格类似一次清晰复盘回复；不要要求用户阅读 JSON 或长报告。
 
@@ -105,12 +105,17 @@ python3 -m findreason collect-evidence \
 实验入口：
 
 ```bash
-python3 -m findreason run-experiment --type recall --facts-file /tmp/findreason-case/case_facts.json --query "<实验 query>" --output-dir /tmp/findreason-case
+python3 -m findreason run-experiment --type recall --facts-file /tmp/findreason-case/case_facts.json --query "<实验 query>" --context-query "<query_list/chat_history 改写 query>" --output-dir /tmp/findreason-case
 python3 -m findreason run-experiment --type rerank --facts-file /tmp/findreason-case/case_facts.json --target-doc-id <doc_id> --output-dir /tmp/findreason-case
+python3 -m findreason run-experiment --type knowledge-detail --facts-file /tmp/findreason-case/case_facts.json --target-doc-id <doc_id> --output-dir /tmp/findreason-case
 python3 -m findreason run-experiment --type replay --facts-file /tmp/findreason-case/case_facts.json --query "<真实用户问题>" --app-id <app_id> --version-id <version_id> --output-dir /tmp/findreason-case
 ```
 
-不传 `--query` 时，recall 实验只输出 query variant 规划；传入 `--query` 且 trace 中有 recall/searchDoc 请求模板时，代码会复用模板执行一次 query override。rerank 实验输出 doc-id 生存观察，不直接等价为同断言丢失。
+不传 `--query` / `--context-query` 时，recall 实验只输出 query variant 规划和历史 baseline。传入 `--query` 且 trace 中有 recall/searchDoc 请求模板时，代码会输出 `recall_variant_matrix`：`baseline_trace_recall` 只总结历史 `origin_doc_list + origin_faq_list`，`workflow_query_override` 复用 trace template 执行，`topK/maxCount_relaxed` 默认把可识别 topK/maxCount 提到至少 50，`label_relaxed` / `threshold_relaxed` 只有在模板中明确找到字段时执行，否则标记 `unsupported`。`--context-query` 可重复，用于 query_list/chat_history 改写 query 的观察；命中核心文档只说明 counterfactual recall 改善，不能自动上调 `输入侧问题`。
+
+rerank 实验读取 `case.core_documents[]`（`doc_id`、`supported_assertion`、`title_hint`），也兼容 `--target-doc-id`。输出 `rank_shift_observations`，每个核心 doc 都要看 recall/rerank/prompt rank、score、delta、是否进入 prompt、缺失原因和真实 `context_boundary`；不要硬写具体脚本截断，除非 `workflow_topology` / `node_evidence_map` / `prompt_observation` 真的确认了该边界。
+
+knowledge-detail 实验默认只处理关键 doc：`case.core_documents`、`--target-doc-id`、prompt 关键证据和评估器/业务文本中显式提到的 doc。它尝试调用 docDetail/knowledge detail 并抽取 `status_signals`、`status_confirmed`、`last_modified`、`status_reason`。接口失败或字段不足时必须写 `status_confirmed=false`、`status_reason=status_unconfirmed`，不能把状态装作已确认。
 
 `--version-id` / `--app-version` 只用于 replay 的 app-detail 解析。用户提供时会作为 `appVersion` 传给 `/open-plat/api/app/get-app-detail`；用户没有提供时不传 `appVersion`，由平台接口返回最新版本。
 
@@ -128,7 +133,7 @@ python3 -m findreason synthesize-brief \
 默认产物：
 
 - `agent_judgement.md`：每条 case 的唯一短版人读 judgement 结论文件，包含当前结论入口、答案症状、上游证据链、关键证据和本地证据包位置；不要再额外维护一份 `summary.md` / `summary` 人读副本，避免两份结论漂移。
-- `evidence_index.json`：本地可索引证据包，包含 trace/replay/实验文档的 title、url、snippet、rank、score。
+- `evidence_index.json`：本地可索引证据包，包含 trace/replay/实验文档的 title、url、snippet、rank、score、doc_id_aliases、status_signals、status_confirmed、last_modified、status_reason。
 
 查看 v4 manifest：
 
@@ -146,11 +151,13 @@ python3 -m findreason schema
 - 如果只是发现 Workflow input、rewrite、keywords 可能少了信息，但改写 query 没改善实验结果，只能把 `输入侧问题` 写成低置信候选或待验证点，不能直接判主因。
 - 答案表象：漏答、错引、越界、自相矛盾、无依据断言、把弱证据写成强结论。
 - 证据生存：同一必要断言是否从 `recall` 进入 `rerank_docs`，再进入 `prompt_docs` / `qaPromptDocs`。
+- 重排 rank-shift：对每个核心 doc 固定记录它支撑哪条 assertion、recall rank/score、rerank rank/score、prompt rank/score、rank/score 变化、是否进入 prompt、缺失原因和上下文边界。
 - Workflow-aware 侦查：优先使用 `case_facts.json.trace.workflow_topology` 的 app-detail 真实节点信息；`node_evidence_map[].inferred_role` 只是辅助说明。Agent 应根据真实节点 type/name、span input/output 和证据字段位置决定深读哪些 span。
 - Prompt 观测：`trace.prompt_observation.status=not_observed` 只表示解析面未看到 `prompt_docs` / `qaPromptDocs`，不得直接写成“全部证据被过滤”或“模型零证据生成”。先回查 `agent_span_read_plan` 推荐的大模型、知商问答、脚本和后处理节点。
 - 召回边界：报告里可叫 `recall`，但审计时要区分 `origin_doc_list` 与 `origin_faq_list`；线上链路可能来自旧 `/searchDoc`，也可能来自新拆分 `/recall` 能力，以 trace 为准。
 - 知识边界：宽召回是否仍无权威支撑，还是只有相邻主题。
-- 证据充分性：把用户问题拆成 required assertions，判断关键证据组合是完整支撑、部分支撑还是只解释了 replay 改善；明确仍缺哪条权威文档或业务规则。
+- 证据充分性：把用户问题拆成 required assertions，按 `相关词命中`、`部分支撑`、`直接核心证据`、`冲突证据` 四档判断 prompt sufficiency；明确仍缺哪条权威文档或业务规则。只有关键 required assertions 已经有 direct support 且 Workflow 输出仍错，才允许把主因落到 `答案生成错误`。
+- 知识状态：对关键 doc 读取 docDetail/knowledge detail 全文或记录信息，标注标题/正文中的 `停止更新`、`历史版本`、`临时`、`下线`、`废弃`、`已升级`、`过期`、`活动时效`、`不再维护`、`停止维护`、`旧版` 等信号；线上状态接口拿不到时明确写 `status_unconfirmed`。
 - 实验反思：每个候选根因都要写“什么证据会推翻它”。
 
 ## 输出要求
@@ -170,6 +177,8 @@ python3 -m findreason schema
 - 候选根因：至少列出 2 个合理解释，除非证据已明显排除。
 - 证据对照：trace facts / recall / rerank / replay 分别支持或反驳什么。
 - 证据充分性判断：列出 required assertions，给关键证据标注 `direct_support`、`partial_support`、`adjacent_support`、`insufficient` 或 `contradictory`，并说明是否足以产出严谨业务答案。
+- rerank rank-shift：核心 doc、支撑 assertion、recall/rerank/prompt rank 和 score、是否进入 prompt、缺失原因、是否有真实 context boundary。
+- 知识状态：关键 doc 的 `status_signals`、`status_confirmed`、`last_modified`、`status_reason`；未确认时写 `status_unconfirmed`。
 - 反证意识：关键候选根因要写支持证据、已跑实验、什么会推翻它、当前判断；不要求用大表格。
 - 归因整理：最终候选 cause 必须落在 6 个中文 cause 之一：`输入侧问题`、`知识缺失或证据不足`、`召回遗漏`、`重排丢失`、`答案生成错误`、`无明显错误/评估器不准，需人工进一步核实`；旧英文 slug 只作为兼容别名。
 - 当前 judgement：最可信根因、置信度、仍缺的证据。
@@ -183,6 +192,8 @@ python3 -m findreason schema
 
 - 先把正确答案应覆盖的点拆成 required assertions。
 - `答案生成错误`（旧 slug: `answer_failure`）的 required assertions 只能来自 judged answer、当前 Workflow 输入 / rewrite、评估器信号和 prompt evidence；不要从 `chat_history` 补充答案正误依据。
+- Prompt sufficiency gate 至少区分四档：`相关词命中`、`部分支撑`、`直接核心证据`、`冲突证据`。看到 prompt 里有相关词或泛化文档，不等于有足够回答用户问题的关键证据。
+- 只有关键 required assertions 已经在 prompt evidence 中有 `direct_support`，且 Workflow 输出仍漏答、错引、越界或编造，才允许主因落到 `答案生成错误`。
 - 对每条关键证据说明它支撑了哪条断言，以及支撑等级：`direct_support` 表示直接支撑；`partial_support` 表示只能支撑一部分；`adjacent_support` 表示主题相关但不能直接下结论；`insufficient` 表示看似相关但不能使用；`contradictory` 表示与其他证据冲突。
 - 明确区分“证据足以解释为什么 replay 比历史答案好”和“证据足以产出严谨业务答案”。前者不等于后者。
 - 如果证据组合有用但不完整，要写出仍缺的权威证据，例如“缺少明确说明是否自动扣费/自动续费/到期后如何处理的业务规则”。

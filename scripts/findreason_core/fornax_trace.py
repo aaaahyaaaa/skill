@@ -385,6 +385,17 @@ def _doc_keys(doc: dict[str, Any]) -> set[str]:
     return keys
 
 
+def _doc_aliases(doc: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    for key in ("identifier", "id", "doc_id", "docId", "record_id", "recordId", "knowledge_id", "knowledgeId"):
+        value = doc.get(key)
+        if value not in (None, ""):
+            text = str(value)
+            if text not in aliases:
+                aliases.append(text)
+    return aliases
+
+
 def _doc_score(doc: dict[str, Any]) -> float | None:
     for key in ("score", "recallScore", "fineScore", "rankScore"):
         value = doc.get(key)
@@ -403,13 +414,15 @@ def _evidence_doc(doc: dict[str, Any], rank: int, source_prefix: str) -> Evidenc
     source_parts = [source_prefix]
     if recall_source:
         source_parts.append(recall_source)
-    identifier = str(doc.get("identifier") or "")
-    if identifier and identifier != (_doc_id(doc) or ""):
-        source_parts.append(f"identifier={identifier}")
+    for alias_key in ("id", "identifier", "doc_id", "record_id", "knowledge_id"):
+        alias_value = str(doc.get(alias_key) or "")
+        if alias_value:
+            source_parts.append(f"{alias_key}={alias_value}")
     if url:
         source_parts.append(f"url={url}")
     return EvidenceDoc(
         id=_doc_id(doc),
+        doc_id_aliases=_doc_aliases(doc),
         title=str(doc.get("title") or doc.get("doc_title") or ""),
         content=str(doc.get("content") or doc.get("text") or ""),
         rank=rank,

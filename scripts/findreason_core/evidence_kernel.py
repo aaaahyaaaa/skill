@@ -212,6 +212,9 @@ def normalize_case_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "host_agent",
             "source_row",
             "case_id",
+            "core_documents",
+            "expected_knowledge_ids",
+            "expected_knowledge_points",
             "version_id",
             "versionId",
             "app_version",
@@ -272,6 +275,9 @@ def build_case_facts(
             "chat_history": case.get("chat_history") or "",
             "source_row": case.get("source_row") or "",
             "case_id": case.get("case_id") or "",
+            "core_documents": case.get("core_documents") if isinstance(case.get("core_documents"), list) else [],
+            "expected_knowledge_ids": case.get("expected_knowledge_ids") if isinstance(case.get("expected_knowledge_ids"), list) else [],
+            "expected_knowledge_points": case.get("expected_knowledge_points") if isinstance(case.get("expected_knowledge_points"), list) else [],
             "version_id": case.get("version_id") or case.get("versionId") or case.get("app_version") or case.get("appVersion") or "",
         },
         "trace": {
@@ -363,10 +369,11 @@ def schema_payload() -> dict[str, Any]:
             },
             "run-experiment": {
                 "purpose": "Plan or run recall/rerank/replay experiments without selecting a root cause.",
-                "types": ["recall", "rerank", "replay"],
+                "types": ["recall", "rerank", "replay", "knowledge-detail"],
                 "options": {
-                    "recall": ["--query", "--timeout-seconds"],
+                    "recall": ["--query", "--context-query", "--timeout-seconds"],
                     "rerank": ["--target-doc-id"],
+                    "knowledge-detail": ["--target-doc-id", "--timeout-seconds"],
                     "replay": ["--query", "--app-id", "--version-id", "--timeout-seconds"],
                 },
                 "outputs": ["<type>_experiment.json"],
@@ -417,6 +424,12 @@ def schema_payload() -> dict[str, Any]:
                 "required": False,
                 "used_by": "run-experiment --type replay when historical trace lacks middle-node evidence",
                 "local_replacement": "authoritative historical trace with middle-node evidence",
+            },
+            {
+                "name": "Sirius knowledge docDetail API",
+                "required": False,
+                "used_by": "run-experiment --type knowledge-detail for key-doc status enrichment",
+                "local_replacement": "status_confirmed=false with status_reason=status_unconfirmed",
             },
         ],
     }

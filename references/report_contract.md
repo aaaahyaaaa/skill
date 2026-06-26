@@ -37,6 +37,8 @@
 - 总结提炼后的评估器信号
 - 实验结果摘要：recall / rerank survival / replay，没跑也要写明没跑
 - 证据充分性判断：required assertions、关键证据的 support level、仍缺的权威证据
+- rerank rank-shift：核心 doc、支撑 assertion、recall/rerank/prompt rank 和 score、是否进入 prompt、缺失原因和真实 context boundary
+- 知识状态：关键 doc 的 `status_signals`、`status_confirmed`、`last_modified`、`status_reason`；接口拿不到或字段不足时明确写 `status_unconfirmed`
 - 反证意识：每个关键候选根因的支持证据、已跑实验、可推翻证据、当前判断；不要求输出大表格
 - 归因整理：最终候选 cause、置信度、仍缺证据或人工复核理由
 - `badcase_review_status`：`valid_badcase`、`needs_human_review_evaluator_disputed` 或 `not_badcase_evaluator_error`
@@ -78,7 +80,8 @@
 - 将用户问题拆成 required assertions，即正确答案必须覆盖的具体断言。
 - `chat_history` 只能用于判断上下文是否进入 Workflow 输入、rewrite、keywords 或 query variants，并通过根据验证点改写后的 query 对照验证 `输入侧问题`（旧 slug: `workflow_input_loss`）；不能用于支撑 `答案生成错误`（旧 slug: `answer_failure`）的答案正误判断。
 - `输入侧问题` 只有在改写后的 query 带来召回改善、排序改善，或 replay / 最终结果改善时，才能上调为主因；否则只能写成低置信候选或待验证点。
-- `答案生成错误` 只在必要断言已经进入 `prompt_docs` / `qaPromptDocs`，但答案仍漏答、误答、错引、越界、编造或把弱证据写强时成立。
+- Prompt sufficiency gate 至少分四档：`相关词命中`、`部分支撑`、`直接核心证据`、`冲突证据`。prompt 中出现相关词或泛化文档，不等于有足够回答用户问题的关键证据。
+- `答案生成错误` 只在关键 required assertions 已经进入 `prompt_docs` / `qaPromptDocs` 且达到 `direct_support`，但答案仍漏答、误答、错引、越界、编造或把弱证据写强时成立。
 - 对关键证据标注支撑等级：`direct_support`、`partial_support`、`adjacent_support`、`insufficient`、`contradictory`。
 - 说明每条证据支撑了哪条 required assertion，哪些断言仍未被权威支撑。
 - 区分“证据足以解释 replay 为什么更好”和“证据足以产出严谨业务答案”。前者不等于后者。
@@ -100,6 +103,12 @@
 如果证据不能支撑唯一主因，应写低置信或人工复核，不要强行落标签。
 
 `无明显错误/评估器不准，需人工进一步核实` 不能作为“看不出来”的兜底。只有在前 5 类都没有明显证据，且评估器结论与 prompt evidence、Workflow 输出、被评估答案或人工标注之间存在可说明的冲突时，才能归到该类。`评估器输出暂无` 本身不是第 6 类证据；这种情况应继续看链路证据，或写低置信待补证。
+
+## 知识状态与冲突
+
+关键 doc 应优先通过 `knowledge_detail_experiment.json` 或人工读取 docDetail/knowledge detail 全文来确认状态。状态信号包括：`停止更新`、`历史版本`、`临时`、`下线`、`废弃`、`已升级`、`过期`、`活动时效`、`不再维护`、`停止维护`、`旧版`。
+
+报告中不要把未确认状态写成事实。如果接口失败、没有 detail 字段、或只拿到基础记录信息，应写 `status_confirmed=false`、`status_reason=status_unconfirmed`，并把它作为知识过期/冲突的候选风险，而不是已确认根因。
 
 ## Badcase 复核状态
 

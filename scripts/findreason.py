@@ -40,6 +40,7 @@ def _cmd_run_experiment(args: argparse.Namespace) -> int:
         facts_file=args.facts_file,
         output_dir=args.output_dir,
         query=args.query,
+        context_queries=args.context_query,
         app_id=args.app_id,
         version_id=args.version_id,
         target_doc_ids=args.target_doc_id,
@@ -79,10 +80,15 @@ def _add_collect_evidence_parser(subparsers: argparse._SubParsersAction[argparse
 
 def _add_run_experiment_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("run-experiment", help="Run or plan a v4 recall/rerank/replay experiment.")
-    parser.add_argument("--type", choices=["recall", "rerank", "replay"], required=True)
+    parser.add_argument("--type", choices=["recall", "rerank", "replay", "knowledge-detail"], required=True)
     parser.add_argument("--facts-file", required=True)
     parser.add_argument("--output-dir")
     parser.add_argument("--query", help="Concrete query override for recall or replay.")
+    parser.add_argument(
+        "--context-query",
+        action="append",
+        help="Context-rich recall query observation; can be repeated and does not by itself promote workflow_input_loss.",
+    )
     parser.add_argument("--app-id", help="Concrete app id override for replay.")
     parser.add_argument("--version-id", "--app-version", dest="version_id", help="App version for replay app-detail lookup; omit to let the platform use the latest version.")
     parser.add_argument("--target-doc-id", action="append", help="Doc id to observe in rerank survival; can be repeated.")
