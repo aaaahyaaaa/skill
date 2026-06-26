@@ -19,6 +19,28 @@ def _doc_id(doc: dict[str, Any]) -> str:
     return str(doc.get("id") or doc.get("doc_id") or "").strip()
 
 
+def _doc_aliases(doc: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+
+    def add(value: Any) -> None:
+        if value in (None, ""):
+            return
+        text = str(value).strip()
+        if text and text not in aliases:
+            aliases.append(text)
+
+    for key in ("id", "doc_id", "docId", "record_id", "recordId", "identifier", "knowledge_id", "knowledgeId"):
+        add(doc.get(key))
+    raw_aliases = doc.get("doc_id_aliases") or doc.get("docIdAliases") or doc.get("aliases")
+    if isinstance(raw_aliases, list):
+        for value in raw_aliases:
+            add(value)
+    source_text = str(doc.get("source") or "")
+    for match in re.finditer(r"(?:identifier|id|doc_id|record_id|knowledge_id)=([^|,\s]+)", source_text):
+        add(match.group(1))
+    return aliases
+
+
 def _doc_title(doc: dict[str, Any]) -> str:
     return str(doc.get("title") or doc.get("doc_title") or doc.get("name") or "").strip()
 
@@ -100,19 +122,63 @@ def _format_doc(doc: dict[str, Any], stage: str) -> list[str]:
     return details
 
 
-def _doc_index_entries(source: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _knowledge_detail_entries(knowledge_detail: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = knowledge_detail.get("knowledge_details")
+    if isinstance(entries, list):
+        return [item for item in entries if isinstance(item, dict)]
+    artifacts = knowledge_detail.get("artifacts") if isinstance(knowledge_detail.get("artifacts"), dict) else {}
+    entries = artifacts.get("knowledge_detail_docs")
+    return [item for item in entries if isinstance(item, dict)] if isinstance(entries, list) else []
+
+
+def _knowledge_detail_index(knowledge_detail: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in _knowledge_detail_entries(knowledge_detail):
+        for alias in _doc_aliases(item):
+            indexed.setdefault(alias, item)
+    return indexed
+
+
+def _doc_status_payload(doc: dict[str, Any], detail_index: dict[str, dict[str, Any]], detail_loaded: bool) -> dict[str, Any]:
+    detail = next((detail_index.get(alias) for alias in _doc_aliases(doc) if detail_index.get(alias)), None)
+    if not detail:
+        return {
+            "status_signals": [],
+            "status_confirmed": False,
+            "last_modified": "",
+            "status_reason": "not_requested" if detail_loaded else "knowledge_detail_not_run",
+        }
+    return {
+        "status_signals": detail.get("status_signals") if isinstance(detail.get("status_signals"), list) else [],
+        "status_confirmed": bool(detail.get("status_confirmed")),
+        "last_modified": str(detail.get("last_modified") or ""),
+        "status_reason": str(detail.get("status_reason") or "status_unconfirmed"),
+    }
+
+
+def _doc_index_entries(
+    source: str,
+    docs: list[dict[str, Any]],
+    *,
+    detail_index: dict[str, dict[str, Any]] | None = None,
+    detail_loaded: bool = False,
+) -> list[dict[str, Any]]:
+    detail_index = detail_index or {}
     entries: list[dict[str, Any]] = []
     for doc in docs:
+        status_payload = _doc_status_payload(doc, detail_index, detail_loaded)
         entries.append(
             {
                 "stage": source,
                 "id": _doc_id(doc),
+                "doc_id_aliases": _doc_aliases(doc),
                 "title": _doc_title(doc),
                 "url": _doc_url(doc),
                 "snippet": _short(_doc_content(doc), 700),
                 "rank": doc.get("rank"),
                 "score": doc.get("score"),
                 "source": doc.get("source"),
+                **status_payload,
             }
         )
     return entries
@@ -239,18 +305,36 @@ def build_evidence_index(
     recall: dict[str, Any] | None = None,
     rerank: dict[str, Any] | None = None,
     replay: dict[str, Any] | None = None,
+    knowledge_detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     recall = recall or {}
     rerank = rerank or {}
     replay = replay or {}
+    knowledge_detail = knowledge_detail or {}
+    detail_index = _knowledge_detail_index(knowledge_detail)
+    detail_loaded = bool(knowledge_detail)
     historical_log_id = str(facts.get("log_id") or "")
     replay_log_ids = _find_replay_log_ids(replay, historical_log_id)
     docs: list[dict[str, Any]] = []
     for stage in ("origin_doc_list", "origin_faq_list", "rerank_docs", "prompt_docs"):
-        docs.extend(_doc_index_entries(stage, _artifact_docs(facts, stage)))
-    docs.extend(_doc_index_entries("recall_experiment.recall_docs", _experiment_artifacts(recall, "recall_docs")))
+        docs.extend(_doc_index_entries(stage, _artifact_docs(facts, stage), detail_index=detail_index, detail_loaded=detail_loaded))
+    docs.extend(
+        _doc_index_entries(
+            "recall_experiment.recall_docs",
+            _experiment_artifacts(recall, "recall_docs"),
+            detail_index=detail_index,
+            detail_loaded=detail_loaded,
+        )
+    )
     for stage in ("origin_doc_list", "origin_faq_list", "rerank_docs", "prompt_docs"):
-        docs.extend(_doc_index_entries(f"replay.{stage}", _experiment_artifacts(replay, stage)))
+        docs.extend(
+            _doc_index_entries(
+                f"replay.{stage}",
+                _experiment_artifacts(replay, stage),
+                detail_index=detail_index,
+                detail_loaded=detail_loaded,
+            )
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "evidence_index",
@@ -259,6 +343,8 @@ def build_evidence_index(
         "app_id": facts.get("app_id", ""),
         "case_id": (facts.get("case") or {}).get("case_id") if isinstance(facts.get("case"), dict) else "",
         "replay_log_ids": replay_log_ids,
+        "knowledge_detail_status": knowledge_detail.get("status") or "not_run",
+        "knowledge_detail_counts": knowledge_detail.get("counts") if isinstance(knowledge_detail.get("counts"), dict) else {},
         "indexing_recommendation": "Use local JSON artifacts as the authoritative searchable evidence bundle; use Fornax by historical log_id for raw trace audit. Publish Markdown/Feishu docs for human review, not as the only evidence store.",
         "docs": docs,
         "report_rule": "Human reports must cite title/link/snippet. Doc ids may be shown for audit, but never as the only evidence.",
@@ -271,11 +357,13 @@ def synthesize_report_markdown(
     recall: dict[str, Any] | None = None,
     rerank: dict[str, Any] | None = None,
     replay: dict[str, Any] | None = None,
+    knowledge_detail: dict[str, Any] | None = None,
     evidence_index_path: str = "evidence_index.json",
 ) -> str:
     recall = recall or {}
     rerank = rerank or {}
     replay = replay or {}
+    knowledge_detail = knowledge_detail or {}
     case = facts.get("case") if isinstance(facts.get("case"), dict) else {}
     counts = facts.get("counts") if isinstance(facts.get("counts"), dict) else {}
     preprocess = facts.get("preprocess") if isinstance(facts.get("preprocess"), dict) else {}
@@ -303,6 +391,11 @@ def synthesize_report_markdown(
     recall_status = _experiment_status_line("recall experiment", recall).removeprefix("- ")
     rerank_status = _experiment_status_line("rerank experiment", rerank).removeprefix("- ")
     replay_status = _experiment_status_line("replay experiment", replay).removeprefix("- ")
+    knowledge_status = _experiment_status_line("knowledge-detail experiment", knowledge_detail).removeprefix("- ")
+    detail_entries = _knowledge_detail_entries(knowledge_detail)
+    status_signal_docs = [
+        item for item in detail_entries if isinstance(item.get("status_signals"), list) and item.get("status_signals")
+    ]
 
     lines: list[str] = [
         "# FindReason Judgement",
@@ -330,7 +423,7 @@ def synthesize_report_markdown(
         f"- 被评估答案 / answer_hint：{_short(case.get('answer_hint'), 700) or answer_text}",
         f"- trace answer：{answer_text}",
         f"- replay answer：{_short(replay.get('answer'), 500) if replay.get('answer') else '未返回'}",
-        f"- 实验状态：{recall_status}；{rerank_status}；{replay_status}",
+        f"- 实验状态：{recall_status}；{rerank_status}；{replay_status}；{knowledge_status}",
     ]
     lines.extend(["", "## 关键证据", ""])
     if key_docs:
@@ -338,6 +431,16 @@ def synthesize_report_markdown(
             lines.extend(_concise_doc_line(doc, "prompt/recall"))
     else:
         lines.append("- 未采集到可展示证据。")
+    lines.extend(["", "## 知识状态信号", ""])
+    if status_signal_docs:
+        for item in status_signal_docs[:4]:
+            lines.append(
+                f"- {item.get('doc_id') or ''} {item.get('title') or '(untitled)'}：signals={', '.join(map(str, item.get('status_signals') or []))}；last_modified={item.get('last_modified') or '未提供'}"
+            )
+    elif knowledge_detail:
+        lines.append("- 已尝试关键文档状态查询，但未确认停止更新/历史版本/过期等状态信号；未确认项在 evidence_index.json 中标记为 status_unconfirmed 或 not_requested。")
+    else:
+        lines.append("- 未运行 knowledge-detail；evidence_index.json 中的文档状态默认标记为 knowledge_detail_not_run。")
     lines.extend(
         [
             "",
@@ -353,7 +456,7 @@ def synthesize_report_markdown(
             "",
             "## 当前还不能直接裁决的地方",
             "",
-            "自动合成只整理到证据层，还没有完成答案症状抽取和 required assertions 对齐，所以这里不直接给 `candidate_cause`。如果后续对齐发现关键断言已经在 prompt 中有直接支撑，但答案仍漏答、错引、越界或编造，才适合落到 `答案生成错误`；如果 prompt 里本身没有足够权威支撑，就应该回溯知识、recall 或 rerank。",
+            "自动合成只整理到证据层，还没有完成答案症状抽取和 required assertions 对齐，所以这里不直接给 `candidate_cause`。Prompt sufficiency gate 至少要分四档：`相关词命中`、`部分支撑`、`直接核心证据`、`冲突证据`。只有关键 required assertions 已在 prompt 中有 direct support 且 Workflow 输出仍漏答、错引、越界或编造，才适合把主因落到 `答案生成错误`；如果 prompt 只有相关词、泛化文档或冲突/过期风险，就应该回溯知识、recall、rerank 或人工复核评估器。",
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -372,8 +475,15 @@ def synthesize_brief(
     recall = _load_experiment(source_dir / "recall_experiment.json")
     rerank = _load_experiment(source_dir / "rerank_experiment.json")
     replay = _load_experiment(source_dir / "replay_experiment.json")
+    knowledge_detail = _load_experiment(source_dir / "knowledge_detail_experiment.json")
     target_dir.mkdir(parents=True, exist_ok=True)
-    evidence_index = build_evidence_index(facts, recall=recall, rerank=rerank, replay=replay)
+    evidence_index = build_evidence_index(
+        facts,
+        recall=recall,
+        rerank=rerank,
+        replay=replay,
+        knowledge_detail=knowledge_detail,
+    )
     index_path = target_dir / "evidence_index.json"
     report_path = target_dir / "agent_judgement.md"
     write_json(index_path, evidence_index)
@@ -382,6 +492,7 @@ def synthesize_brief(
         recall=recall,
         rerank=rerank,
         replay=replay,
+        knowledge_detail=knowledge_detail,
         evidence_index_path=index_path.name,
     )
     report_path.write_text(report, encoding="utf-8")

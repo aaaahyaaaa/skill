@@ -16,16 +16,16 @@
 
 | 表象 | 候选根因 | 验证 |
 |-|-|-|
-| 答案说查不到更深解释或官方日期 | `知识缺失或证据不足`：KB 缺主题或深度内容 | open-label wide recall topK>=50 仍无支撑 |
+| 答案说查不到更深解释或官方日期 | `知识缺失或证据不足`：KB 缺主题或深度内容 | `recall_variant_matrix` 中 topK/maxCount>=50、label/threshold relaxed 仍无支撑 |
 | 评估器反复说资料未提及 | `知识缺失或证据不足`：KB 无权威依据支撑断言 | 检查宽召回和权威/citable 来源 |
 | 相邻主题命中但事实张冠李戴 | `知识缺失或证据不足`：KB 只有相邻主题，缺精确主题 | 检查 matched docs 是否正文支撑精确断言 |
-| 同一事项前后口径冲突 | `知识缺失或证据不足`：KB 自身冲突且无适用前提 | 检查同主题文档是否存在对立结论和消歧条件 |
+| 同一事项前后口径冲突 | `知识缺失或证据不足`：KB 自身冲突且无适用前提 | 检查同主题文档是否存在对立结论和消歧条件；关键 doc 跑 knowledge-detail 标注停止更新/历史版本/过期等状态 |
 
 ## Retrieval 候选
 
 | 表象 | 候选根因 | 验证 |
 |-|-|-|
-| 答案说没查到，但 KB 实际有文档 | `召回遗漏`：recall 漏召 | 宽召回命中、`origin_doc_list/origin_faq_list` 未命中 |
+| 答案说没查到，但 KB 实际有文档 | `召回遗漏`：recall 漏召 | `recall_variant_matrix` 的宽召回/relaxed 变体命中、历史 `origin_doc_list/origin_faq_list` 未命中 |
 | 漏答子问题，子问题文档在库里 | `召回遗漏`：子主题 query 未进入 recall | 用子问题 query 跑 recall 对照；若子主题原本在用户输入但被改写丢失，再考虑 `输入侧问题` |
 | 正确文档被权限/标签过滤 | `召回遗漏`：ACL / namespace / label 隐藏 | 开放标签可见但当前 workspace/app/user 路径不可见 |
 
@@ -33,15 +33,15 @@
 
 | 表象 | 候选根因 | 验证 |
 |-|-|-|
-| 场景文档 recall 有，rerank 后没了 | `重排丢失`：rerank 把场景相关文档排出 topK | 比较同断言支撑在 recall 与 rerank 的生存状态 |
-| 多子问题只答其一，另一支撑在 recall | `重排丢失`：rerank 去重/topK 误杀次主题 | 检查次主题文档 rank/score movement |
-| 泛主题文档压过精确文档 | `重排丢失`：rerank 偏向高频或标题词面 | 观察精确文档分数异常和可恢复实验 |
+| 场景文档 recall 有，rerank 后没了 | `重排丢失`：rerank 把场景相关文档排出 topK | 查看 `rank_shift_observations`：核心 doc 支撑 assertion、recall/rerank/prompt rank/score、缺失原因 |
+| 多子问题只答其一，另一支撑在 recall | `重排丢失`：rerank 去重/topK 误杀次主题 | 检查次主题文档 rank/score movement 和是否进入 prompt boundary |
+| 泛主题文档压过精确文档 | `重排丢失`：rerank 偏向高频或标题词面 | 观察精确文档分数异常、rank delta 和可恢复实验 |
 
 ## Answer 候选
 
 | 表象 | 候选根因 | 验证 |
 |-|-|-|
-| prompt 有全部要点但答案漏答 | `答案生成错误`：模型未覆盖 prompt 中已有要点 | prompt_docs 支撑、answer 未输出 |
+| prompt 有全部要点但答案漏答 | `答案生成错误`：模型未覆盖 prompt 中已有要点 | prompt sufficiency 达到 `直接核心证据` / `direct_support`，answer 仍未输出 |
 | 答案超出问题范围 | `答案生成错误`：模型未遵守场景约束 | 上游有窄场景证据，答案扩成通用结论 |
 | 答案自相矛盾 | `答案生成错误`：模型混用分支或前后不一致 | KB/prompt 已澄清前提，answer 未区分 |
 | 引用不支持结论 | `答案生成错误`：wrong citation | 引用文档存在但内容不支持 claim |

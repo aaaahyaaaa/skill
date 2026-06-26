@@ -17,6 +17,7 @@ class Stage(str, Enum):
 
 class EvidenceDoc(BaseModel):
     id: Optional[str] = None
+    doc_id_aliases: List[str] = Field(default_factory=list)
     title: str = ""
     content: str = ""
     rank: Optional[int] = None
