@@ -13,7 +13,7 @@
 
 如果 `synthesize-brief` 产出的 `agent_judgement.md` 仍是 `candidate_cause: 待 Agent 判断`，Agent 完成归因后必须改写同一个文件，把最终 cause、置信度和证据解释落进去。最终聊天回复应与该文件一致。
 
-`agent_judgement.md` 不应包含面向 Agent 的写作要求或 checklist，例如“Agent 最终回复要求”“给用户输出短版结论”“明确写 candidate_cause”。这类规则属于 skill/reference/agent_brief，不属于 case 结论正文。
+`agent_judgement.md` 不应包含面向 Agent 的写作要求或 checklist，例如“Agent 最终回复要求”“给用户输出短版结论”“明确写 candidate_cause”。这类规则属于 skill/reference，不属于 case 结论正文。
 
 飞书文档适合作为分享/发布层；只有用户明确要求分享、评审、沉淀到知识库时，才把 Markdown 发布或改写成飞书文档。不要把飞书文档当作唯一证据存储。
 
@@ -33,6 +33,7 @@
 - 原始 query
 - Workflow 输入
 - Workflow 输出
+- RAG 阶段定位：query/input、preprocess/rewrite、recall、rerank、prompt/context、generation、postprocess/final_output、evaluator/judged_object 分别来自哪些 span/节点；没观测到时写 `not_observed`，不要写成 confirmed empty。
 - 包装后的输出 / `answer_hint`
 - 总结提炼后的评估器信号
 - 实验结果摘要：recall / rerank survival / replay，没跑也要写明没跑
@@ -70,6 +71,8 @@
 - 没有片段时要写“援引片段：未提供”，不能假装有支撑。
 - 同一个必要断言的 `recall -> rerank -> prompt` 生存情况写在一起。
 - 不同必要断言分开展示，避免把多个问题混成一个阶段失败。
+- workflow 节点名只能作为证据位置；报告要说明该节点承载的 RAG 阶段产物，例如“脚本1 承载 prompt/context 拼接”或“条件判断2 只影响召回分支路由”。
+- 如果只读取了 Markdown 输出文件，没有读取当前 `case_facts.json` / `evidence_index.json` / `*_experiment.json` 的 JSON 证据，不得声称完成 workflow-aware 分析。
 
 ## 证据充分性
 

@@ -12,6 +12,8 @@ from .fornax_trace import FornaxTraceIngestRequest, ingest_fornax_trace
 
 
 SCHEMA_VERSION = "agent-judgement-v4"
+SKILL_RELEASE_MARKER = "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
+SKILL_RELEASE_POLICY = "JSON-only evidence input; workflow-aware RAG stage map; Markdown artifacts are outputs only."
 OPEN_PLAT_ZS_OPEN_TOKEN = "37160d0535224506965a54e58e0685c4"
 OPEN_PLAT_TRACE_DETAIL_URL = "http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail"
 RECALL_ENDPOINT_MARKERS = ("/api/sirius_plugin/v1/recall", "/api/sirius_plugin/v1/searchDoc")
@@ -27,6 +29,7 @@ class EvidenceKernelError(Exception):
     def to_payload(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
+            "skill_release_marker": SKILL_RELEASE_MARKER,
             "status": "error",
             "error_code": self.error_code,
             "message": self.message,
@@ -262,6 +265,8 @@ def build_case_facts(
     trace_summary = parsed.trace_summary
     return {
         "schema_version": SCHEMA_VERSION,
+        "skill_release_marker": SKILL_RELEASE_MARKER,
+        "skill_release_policy": SKILL_RELEASE_POLICY,
         "artifact_type": "case_facts",
         "status": "ok",
         "log_id": str(log_id),
@@ -312,6 +317,8 @@ def build_case_facts(
             "code_role": "produce facts and experiment outputs only",
             "agent_role": "extract symptoms, compare candidate explanations, plan experiments, reflect, and write the human judgement",
             "hard_selection_disabled": True,
+            "skill_release_marker": SKILL_RELEASE_MARKER,
+            "analysis_input_policy": SKILL_RELEASE_POLICY,
         },
     }
 
@@ -356,6 +363,8 @@ def collect_evidence(
 def schema_payload() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
+        "skill_release_marker": SKILL_RELEASE_MARKER,
+        "skill_release_policy": SKILL_RELEASE_POLICY,
         "commands": {
             "collect-evidence": {
                 "purpose": "Fetch or read trace, parse workflow-aware RAG artifacts, and persist case facts for Agent judgement.",

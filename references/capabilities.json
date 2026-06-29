@@ -1,7 +1,9 @@
 {
   "name": "findreason-rag-attribution",
-  "version": "0.4.2-no-batch-run",
+  "version": "0.4.3-json-only-workflow-aware-marker",
   "schema_version": "agent-judgement-v4",
+  "skill_release_marker": "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1",
+  "skill_release_policy": "JSON-only evidence input; workflow-aware RAG stage map; Markdown artifacts are outputs only.",
   "runtime": "python",
   "entrypoint": "python -m findreason",
   "capabilities": [
