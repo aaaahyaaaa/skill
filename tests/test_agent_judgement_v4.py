@@ -427,6 +427,15 @@ def test_cli_does_not_expose_batch_commands() -> None:
     assert knowledge_args.type == "knowledge-detail"
 
 
+def test_schema_exposes_skill_release_marker() -> None:
+    from findreason_core.evidence_kernel import schema_payload
+
+    payload = schema_payload()
+
+    assert payload["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
+    assert "JSON-only evidence input" in payload["skill_release_policy"]
+
+
 def test_reference_case_playbooks_cover_trace_acquisition_modes() -> None:
     cases_dir = SKILL_ROOT / "references" / "cases"
     expected = {
@@ -536,8 +545,11 @@ def test_collect_evidence_builds_case_facts_without_hard_cause(monkeypatch: pyte
     )
 
     assert facts["schema_version"] == "agent-judgement-v4"
+    assert facts["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
+    assert "JSON-only evidence input" in facts["skill_release_policy"]
     assert facts["counts"] == {"origin_doc_list": 1, "origin_faq_list": 1, "recall": 2, "rerank_docs": 1, "prompt_docs": 1}
     assert facts["agent_contract"]["hard_selection_disabled"] is True
+    assert facts["agent_contract"]["skill_release_marker"] == facts["skill_release_marker"]
     assert "primary_cause" not in facts
     assert "candidate_cause" not in json.dumps(facts, ensure_ascii=False)
 
@@ -709,6 +721,7 @@ def test_agent_brief_is_case_specific_working_note() -> None:
     brief = judgement_brief_markdown(
         {
             "schema_version": "agent-judgement-v4",
+            "skill_release_marker": "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1",
             "log_id": "log",
             "workspace_id": "138",
             "app_id": "1001883",
@@ -744,25 +757,20 @@ def test_agent_brief_is_case_specific_working_note() -> None:
     )
 
     assert "# Agent Brief" in brief
-    assert "这是一份给 Agent 快速进入现场的工作单" in brief
+    assert "这是输出文件之一" in brief
+    assert "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1" in brief
+    assert "不能作为后续分析的证据来源、导航或结论依据" in brief
     assert "用户问：query" in brief
     assert "审计锚点" in brief
     assert "Workflow 摘要" in brief
+    assert "RAG 阶段定位" in brief
     assert "被评估答案 / answer_hint" in brief
     assert "评估器线索是低置信诊断线索" in brief
-    assert "chat_history 只用于判断 `输入侧问题`" in brief
-    assert "旧 slug: `workflow_input_loss`" in brief
-    assert "根据验证点改写后的 query" in brief
-    assert "召回改善、排序改善，或 replay / 最终结果改善" in brief
-    assert "不得用 chat_history 支撑 `答案生成错误`" in brief
-    assert "旧 slug: `answer_failure`" in brief
-    assert "`badcase_review_status`" in brief
-    assert "evaluator_disputed_no_obvious_error" in brief
-    assert "人工复核点" in brief
-    assert "评估器输出暂无" in brief
     assert "Doc A" in brief
     assert "https://example.com/doc-a" in brief
     assert "This is the cited support snippet" in brief
+    assert "归因时先想这几件事" not in brief
+    assert "按 cause 的 span 读取入口" not in brief
     assert "Workflow 现场" not in brief
     assert "证据链速览" not in brief
     assert "```json" not in brief
@@ -838,7 +846,9 @@ def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> No
     index = json.loads((tmp_path / "evidence_index.json").read_text(encoding="utf-8"))
 
     assert result["status"] == "ok"
+    assert result["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
     assert "# FindReason Judgement" in report
+    assert "skill_release_marker=`findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1`" in report
     assert "自动合成的短版结论草稿" in report
     assert "candidate_cause: 待 Agent 判断" not in report
     assert "置信度: 待 Agent 判断" not in report
@@ -878,6 +888,7 @@ def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> No
     assert "Prompt 代表证据" not in report
     assert len(report.splitlines()) <= 100
     assert index["report_rule"].startswith("Human reports must cite")
+    assert index["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
     assert "sufficiency_review_contract" not in index
     assert "badcase_review_contract" not in index
     assert result["outputs"]["agent_judgement"].endswith("agent_judgement.md")

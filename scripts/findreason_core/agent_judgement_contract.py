@@ -236,6 +236,28 @@ def _agent_read_plan_lines(trace: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _rag_stage_map_lines(case_facts: dict[str, Any]) -> list[str]:
+    counts = case_facts.get("counts") if isinstance(case_facts.get("counts"), dict) else {}
+    trace = case_facts.get("trace") if isinstance(case_facts.get("trace"), dict) else {}
+    preprocess = case_facts.get("preprocess") if isinstance(case_facts.get("preprocess"), dict) else {}
+    prompt_observation = trace.get("prompt_observation") if isinstance(trace.get("prompt_observation"), dict) else {}
+    workflow_input, workflow_output = _selected_workflow_io(case_facts)
+    answer = case_facts.get("answer")
+
+    return [
+        "- 目标是定位 RAG 阶段产物，不是给 workflow 节点贴最终标签；一个节点可承载多个阶段，一个阶段也可分散在多个节点。",
+        f"- query/input: {_json_preview(workflow_input) if workflow_input else '未观测到明确 Workflow input；回查 Start/预处理/条件分支 span'}",
+        f"- preprocess/rewrite: {_short(preprocess.get('rewrite_query'), 260) or '未观测到 rewrite'}；keywords={', '.join(map(str, preprocess.get('keywords') or [])) or '未观测到'}",
+        f"- recall: `{counts.get('recall', 0)}` 条候选证据；需按同一 required assertion 区分文档召回与 FAQ/精选召回。",
+        f"- rerank: `{counts.get('rerank_docs', 0)}` 条重排候选；需继续看 rank/score、merge/去重和是否保留到 prompt/context。",
+        f"- prompt/context: `{counts.get('prompt_docs', 0)}` 条标准字段证据；prompt_observation=`{prompt_observation.get('status') or 'not_observed'}`。若为 not_observed，先读大模型/知商问答/脚本拼 prompt 节点 input/output。",
+        f"- generation: {_short(answer, 260) or '未观测到独立 answer；回查大模型/知商问答节点和 workflow output'}",
+        f"- postprocess/final_output: {_json_preview(workflow_output) if workflow_output else '未观测到 Workflow output；回查脚本后处理和结束节点'}",
+        "- evaluator/judged_object: 对齐评估器实际评估对象、Workflow 输出和包装后的 answer_hint；对象不一致时先写清边界。",
+        "- 如果脚本/条件/外部工具/unknown 节点承载了 prompt、merge、postprocess 或 final output，应把它纳入对应 RAG 阶段深读。",
+    ]
+
+
 def judgement_brief_markdown(case_facts: dict[str, Any]) -> str:
     case = case_facts.get("case") if isinstance(case_facts.get("case"), dict) else {}
     counts = case_facts.get("counts") if isinstance(case_facts.get("counts"), dict) else {}
@@ -257,7 +279,9 @@ def judgement_brief_markdown(case_facts: dict[str, Any]) -> str:
     lines = [
         "# Agent Brief",
         "",
-        "这是一份给 Agent 快速进入现场的工作单，不是最终报告。最终给人读的结论写在 `agent_judgement.md`。",
+        "这是输出文件之一，用于展示当前 case 的摘要信息；不能作为后续分析的证据来源、导航或结论依据。最终取证必须回到 JSON 事实包。",
+        "",
+        f"skill_release_marker: `{case_facts.get('skill_release_marker') or 'unknown'}`",
         "",
         "## 现场一句话",
         "",
@@ -288,10 +312,9 @@ def judgement_brief_markdown(case_facts: dict[str, Any]) -> str:
         "- 这里优先使用 app-detail 的真实节点信息；`inferred_role` 只是辅助说明，不是最终归因。",
         *_workflow_diagnostic_lines(trace),
         "",
-        "## 按 cause 的 span 读取入口",
+        "## RAG 阶段定位",
         "",
-        "- 这些是给 Agent 的候选读取入口，不是 CLI 的硬裁决。",
-        *_agent_read_plan_lines(trace),
+        *_rag_stage_map_lines(case_facts),
         "",
         "## 评估器线索",
         "",
@@ -309,26 +332,5 @@ def judgement_brief_markdown(case_facts: dict[str, Any]) -> str:
         "## 可读证据样例",
         "",
         *[line for doc in evidence_samples for line in _doc_lines(doc)],
-        "",
-        "## 归因时先想这几件事",
-        "",
-        "- 先写清楚答案具体错在哪里，再判断是不是上游导致。",
-        "- 最终 cause 以中文 cause 为主，旧 slug 只作为兼容别名：`workflow_input_loss` -> `输入侧问题`，`suspected_knowledge_missing` -> `知识缺失或证据不足`，`retrieval_miss` -> `召回遗漏`，`rerank_drop` -> `重排丢失`，`answer_failure` -> `答案生成错误`，`evaluator_disputed_no_obvious_error` -> `无明显错误/评估器不准，需人工进一步核实`。",
-        "- chat_history 只用于判断 `输入侧问题`（旧 slug: `workflow_input_loss`）：对比用户上下文是否进入 Workflow input/rewrite/keywords。",
-        "- 如怀疑 `输入侧问题`，必须根据验证点改写后的 query 做 recall/rerank/replay 对照；只有看到召回改善、排序改善，或 replay / 最终结果改善，才能把它上调为主因。",
-        "- 如果只是发现 Workflow input、rewrite、keywords 可能少了信息，但改写 query 没改善实验结果，只能写成低置信候选或待验证点。",
-        "- 判断 `答案生成错误`（旧 slug: `answer_failure`）只看被评估答案、Workflow input/rewrite、评估器信号和 prompt_docs；不得用 chat_history 支撑 `答案生成错误`。",
-        "- 如果核心断言在 prompt_docs 中有直接支撑，但答案仍漏答、错引、越界或编造，优先考虑 `答案生成错误`。",
-        "- Prompt sufficiency 至少分 `相关词命中`、`部分支撑`、`直接核心证据`、`冲突证据` 四档；prompt 有相关词或泛化文档，不等于可以判 `答案生成错误`。",
-        "- 判断 `答案生成错误` 前，必须确认关键 required assertions 已有 `direct_support` 且 Workflow 输出仍错。",
-        "- 对核心 doc 看 `rank_shift_observations`：支撑 assertion、recall/rerank/prompt rank 和 score、是否进入 prompt、缺失原因和 context_boundary。",
-        "- 对关键 doc 看 knowledge-detail 状态：`status_signals`、`status_confirmed`、`last_modified`、`status_reason`；状态未确认时写 `status_unconfirmed`。",
-        "- 如果证据只是相邻主题或不够权威，保留 `知识缺失或证据不足`（旧 slug: `suspected_knowledge_missing`）或低置信复核。",
-        "- 证据链判断要按同一条 required assertion 串起来，不要只比较 doc id。",
-        "- `无明显错误/评估器不准，需人工进一步核实`（slug: `evaluator_disputed_no_obvious_error`）不能作为“看不出来”的兜底；只有前 5 类都没有明显证据，且评估器结论与 prompt evidence、Workflow 输出、被评估答案或人工标注存在可说明的冲突时，才能作为 cause。",
-        "- 归到第 6 类时，报告必须显式写出人工复核点；不要求固定范式，但要讲清楚为什么怀疑评估器不准、人工需要复核哪里、复核后可能如何改变结论。",
-        "- `badcase_review_status` 独立于 cause；若需要人工确认评估器是否误判，设置为 `needs_human_review_evaluator_disputed`，并在报告里写清人工复核点。",
-        "- `评估器输出暂无` 本身不是第 6 类证据；这种情况应继续看链路证据，或写低置信待补证。",
-        "- `not_badcase_evaluator_error` 只在人工确认或明确人工标注后使用。",
     ]
     return "\n".join(lines).rstrip() + "\n"

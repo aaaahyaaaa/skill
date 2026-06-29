@@ -11,7 +11,7 @@ from urllib.parse import quote
 import httpx
 
 from .artifacts import decode_jsonish, normalize_docs, normalize_rag_artifacts, to_jsonable
-from .evidence_kernel import SCHEMA_VERSION, json_dumps, read_json_file, write_json
+from .evidence_kernel import SCHEMA_VERSION, SKILL_RELEASE_MARKER, SKILL_RELEASE_POLICY, json_dumps, read_json_file, write_json
 from .models import AttributionRequest, CaseInput
 from .workflow_replay import replay_workflow, resolve_workflow_auth_token
 
@@ -59,6 +59,8 @@ def _base_envelope(experiment_type: str, facts: dict[str, Any]) -> dict[str, Any
     case = _case_from_facts(facts)
     return {
         "schema_version": SCHEMA_VERSION,
+        "skill_release_marker": SKILL_RELEASE_MARKER,
+        "skill_release_policy": SKILL_RELEASE_POLICY,
         "artifact_type": "experiment_result",
         "experiment_type": experiment_type,
         "log_id": facts.get("log_id", ""),
@@ -1321,6 +1323,8 @@ def run_experiment(
     else:
         result = {
             "schema_version": SCHEMA_VERSION,
+            "skill_release_marker": SKILL_RELEASE_MARKER,
+            "skill_release_policy": SKILL_RELEASE_POLICY,
             "artifact_type": "experiment_result",
             "status": "error",
             "error_code": "E_EXPERIMENT_TYPE",

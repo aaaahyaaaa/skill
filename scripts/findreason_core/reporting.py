@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .evidence_kernel import SCHEMA_VERSION, json_dumps, read_json_file, write_json
+from .evidence_kernel import SCHEMA_VERSION, SKILL_RELEASE_MARKER, SKILL_RELEASE_POLICY, json_dumps, read_json_file, write_json
 
 
 def _short(value: Any, limit: int = 700) -> str:
@@ -337,6 +337,8 @@ def build_evidence_index(
         )
     return {
         "schema_version": SCHEMA_VERSION,
+        "skill_release_marker": SKILL_RELEASE_MARKER,
+        "skill_release_policy": SKILL_RELEASE_POLICY,
         "artifact_type": "evidence_index",
         "log_id": historical_log_id,
         "workspace_id": facts.get("workspace_id", ""),
@@ -413,6 +415,7 @@ def synthesize_report_markdown(
         "## 审计锚点",
         "",
         f"- log_id=`{historical_log_id}`，workspace_id=`{facts.get('workspace_id', '')}`，app_id=`{app_id}`，replay_log_id={replay_log_line}",
+        f"- skill_release_marker=`{facts.get('skill_release_marker') or SKILL_RELEASE_MARKER}`",
         f"- Workflow 摘要：输入 `{_compact_json(workflow_input, 360)}`；输出 `{_compact_json(workflow_output, 360)}`",
         f"- 上游摘要：rewrite「{_short(preprocess.get('rewrite_query'), 200) or '未采集到'}」；keywords {keywords}",
         f"- 证据生存：召回 `{counts.get('recall', 0)}` 条，重排 `{counts.get('rerank_docs', 0)}` 条，进入 prompt `{counts.get('prompt_docs', 0)}` 条；重排缺失 {', '.join(map(str, missing_rerank)) or '无'}，prompt 缺失 {', '.join(map(str, missing_prompt)) or '无'}",
@@ -498,6 +501,8 @@ def synthesize_brief(
     report_path.write_text(report, encoding="utf-8")
     return {
         "schema_version": SCHEMA_VERSION,
+        "skill_release_marker": SKILL_RELEASE_MARKER,
+        "skill_release_policy": SKILL_RELEASE_POLICY,
         "artifact_type": "synthesized_brief",
         "status": "ok",
         "facts_file": str(facts_path),

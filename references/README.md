@@ -19,6 +19,7 @@ collect evidence
 - 线上召回链路要以 trace 中实际接口为准：常见 RAG QA 现场可能仍走旧 `/searchDoc` 主链路，新 `/recall`、`/rerank` 是拆分能力，不要只按接口名猜阶段。
 - `qaPromptDocs` 不一定等于全部 `reRankDocs`；prompt/context 不作为 v4 顶层 cause，但必须作为证据是否真正给到模型的观察面。
 - 代码只产出事实和实验结果，不替 Agent 选择根因。
+- app-detail workflow 节点只是定位索引，Agent 必须建立 RAG stage map：query/input、preprocess、recall、rerank、prompt/context、generation、postprocess/final_output、evaluator/judged_object；不要把 workflow 节点类型直接等同于 RAG 阶段。
 - Agent 先做 answer symptom extraction，再从表象生成多个候选解释。
 - 每个候选解释都要有支持证据、反证证据和下一步实验。
 - 最终报告以中文 cause 为主，旧 slug 只作为兼容别名；`输入侧问题` 必须通过验证 query 的召回改善、排序改善或 replay / 最终结果改善来上调主因。
@@ -30,9 +31,9 @@ collect evidence
 
 ## 当前文档
 
-- `agent_judgement_v4.md`：Agent 如何从现场侦查、答案症状和实验结果写 judgement。
+- `agent_judgement_v4.md`：Agent 如何先建立 RAG stage map，再从现场侦查、答案症状和实验结果写 judgement。
 - `symptom_to_root_cause.md`：表象到候选根因的对照表，来自用户指定飞书文档第三节的方法论。
-- `evidence_kernel.md`：代码层边界，说明哪些事必须代码化，哪些事必须留给 Agent。
+- `evidence_kernel.md`：代码层边界，说明哪些事必须代码化，哪些 RAG 阶段识别必须留给 Agent。
 - `recall_chain.md`：召回、重排、进入 prompt 的真实链路、字段解释和排查抓手。
 - `report_contract.md`：报告必填字段、证据索引、可读证据展示和归因表约束。
 - `capabilities.json`：v4 CLI capability manifest。
