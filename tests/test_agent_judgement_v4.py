@@ -427,12 +427,55 @@ def test_cli_does_not_expose_batch_commands() -> None:
     assert knowledge_args.type == "knowledge-detail"
 
 
+def test_cli_collect_evidence_uses_legacy_case_file_when_case_json_absent(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import importlib.util
+
+    cli_path = SKILL_ROOT / "scripts" / "findreason.py"
+    spec = importlib.util.spec_from_file_location("_findreason_cli_case_file_test", cli_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    trace_file = tmp_path / "trace.json"
+    case_file = tmp_path / "case.json"
+    output_dir = tmp_path / "out"
+    from findreason_core.evidence_kernel import write_json
+
+    write_json(trace_file, minimal_trace())
+    write_json(case_file, {"query": "legacy case query", "answer_hint": "legacy answer hint"})
+
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            "collect-evidence",
+            "--workspace-id",
+            "138",
+            "--log-id",
+            "log",
+            "--app-id",
+            "1001883",
+            "--case-file",
+            str(case_file),
+            "--trace-file",
+            str(trace_file),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert args.func(args) == 0
+    capsys.readouterr()
+    facts = json.loads((output_dir / "case_facts.json").read_text(encoding="utf-8"))
+    assert facts["case"]["query"] == "legacy case query"
+    assert facts["case"]["answer_hint"] == "legacy answer hint"
+
+
 def test_schema_exposes_skill_release_marker() -> None:
     from findreason_core.evidence_kernel import schema_payload
 
     payload = schema_payload()
 
-    assert payload["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
+    assert payload["skill_release_marker"] == "findreason-rag-attribution@2026-07-01-lean-artifacts-v1"
     assert "JSON-only evidence input" in payload["skill_release_policy"]
 
 
@@ -492,7 +535,6 @@ def test_cause_taxonomy_contract_is_chinese_with_guardrails() -> None:
         SKILL_ROOT / "SKILL.md",
         SKILL_ROOT / "references" / "report_contract.md",
         SKILL_ROOT / "references" / "evidence_kernel.md",
-        SKILL_ROOT / "scripts" / "findreason_core" / "agent_judgement_contract.py",
         SKILL_ROOT / "agents" / "openai.yaml",
     ]
     text = "\n".join(path.read_text(encoding="utf-8") for path in files)
@@ -545,7 +587,7 @@ def test_collect_evidence_builds_case_facts_without_hard_cause(monkeypatch: pyte
     )
 
     assert facts["schema_version"] == "agent-judgement-v4"
-    assert facts["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
+    assert facts["skill_release_marker"] == "findreason-rag-attribution@2026-07-01-lean-artifacts-v1"
     assert "JSON-only evidence input" in facts["skill_release_policy"]
     assert facts["counts"] == {"origin_doc_list": 1, "origin_faq_list": 1, "recall": 2, "rerank_docs": 1, "prompt_docs": 1}
     assert facts["agent_contract"]["hard_selection_disabled"] is True
@@ -631,8 +673,8 @@ def test_collect_evidence_maps_custom_script_model_postprocess_nodes(monkeypatch
 
 def test_collect_evidence_marks_prompt_not_observed_without_claiming_filtered(monkeypatch: pytest.MonkeyPatch) -> None:
     from findreason_core import fornax_trace
-    from findreason_core.agent_judgement_contract import judgement_brief_markdown
     from findreason_core.evidence_kernel import build_case_facts
+    from findreason_core.reporting import synthesize_report_markdown
 
     monkeypatch.setattr(fornax_trace, "_resolve_workflow_mapping", lambda workspace_id, app_id: fake_resolved_workflow_config())
     facts = build_case_facts(
@@ -645,14 +687,13 @@ def test_collect_evidence_marks_prompt_not_observed_without_claiming_filtered(mo
     )
 
     assert facts["trace"]["prompt_observation"]["status"] == "not_observed"
-    brief = judgement_brief_markdown(facts)
-    assert "prompt_observation: `not_observed`" in brief
-    assert "全部" not in brief or "过滤" not in brief
+    report = synthesize_report_markdown(facts)
+    assert "全部证据被过滤" not in report
+    assert "模型零证据生成" not in report
 
 
 def test_collect_evidence_falls_back_when_app_detail_node_id_unmatched(monkeypatch: pytest.MonkeyPatch) -> None:
     from findreason_core import fornax_trace
-    from findreason_core.agent_judgement_contract import judgement_brief_markdown
     from findreason_core.evidence_kernel import build_case_facts
 
     monkeypatch.setattr(fornax_trace, "_resolve_workflow_mapping", lambda workspace_id, app_id: fake_resolved_workflow_config())
@@ -671,8 +712,6 @@ def test_collect_evidence_falls_back_when_app_detail_node_id_unmatched(monkeypat
 
     assert facts["trace"]["workflow_topology"]["mapping_status"] == "node_id_unmatched_fallback_span_type"
     assert any(item["mapping_status"] == "unmapped_trace_span_fallback" for item in facts["trace"]["node_evidence_map"])
-    brief = judgement_brief_markdown(facts)
-    assert "mapping_status: `node_id_unmatched_fallback_span_type`" in brief
 
 
 def test_collect_evidence_extracts_recall_template_for_experiment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -715,70 +754,25 @@ def test_collect_evidence_uses_workflow_segment_recall_when_score_is_zero(monkey
     assert facts["raw_trace_evidence"]["origin_doc_list_raw"][0]["identifier"] == "2953471"
 
 
-def test_agent_brief_is_case_specific_working_note() -> None:
-    from findreason_core.agent_judgement_contract import judgement_brief_markdown
+def test_collect_evidence_writes_lean_case_facts_without_agent_brief(tmp_path: Path) -> None:
+    from findreason_core.evidence_kernel import collect_evidence, write_json
 
-    brief = judgement_brief_markdown(
-        {
-            "schema_version": "agent-judgement-v4",
-            "skill_release_marker": "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1",
-            "log_id": "log",
-            "workspace_id": "138",
-            "app_id": "1001883",
-            "case": {
-                "query": "query",
-                "answer_hint": "包装后的答案",
-                "chat_history": json.dumps([{"role": "user", "content": "用户补充了一个重要上下文"}], ensure_ascii=False),
-                "judgement": "factual_correctness=score:0; reason:评估器认为事实错误",
-            },
-            "counts": {"recall": 2, "origin_doc_list": 1, "origin_faq_list": 1, "rerank_docs": 1, "prompt_docs": 1},
-            "trace": {
-                "has_middle_node_trace": True,
-                "workflow_span_ios": [
-                    {
-                        "selected": True,
-                        "input": {"sys": {"query": "workflow query"}},
-                        "output": {"end": "workflow answer"},
-                    }
-                ],
-            },
-            "preprocess": {"rewrite_query": "rewrite query", "keywords": ["rewrite"]},
-            "artifacts": {
-                "prompt_docs": [
-                    {
-                        "id": "doc-a",
-                        "title": "Doc A",
-                        "url": "https://example.com/doc-a",
-                        "content": "This is the cited support snippet.",
-                    }
-                ]
-            },
-        }
+    trace_file = tmp_path / "trace.json"
+    write_json(trace_file, minimal_trace())
+
+    facts = collect_evidence(
+        workspace_id="138",
+        log_id="log",
+        app_id="1001883",
+        case_payload={"query": "query", "answer_hint": "包装后的答案"},
+        trace_file=str(trace_file),
+        output_dir=str(tmp_path),
     )
 
-    assert "# Agent Brief" in brief
-    assert "这是输出文件之一" in brief
-    assert "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1" in brief
-    assert "不能作为后续分析的证据来源、导航或结论依据" in brief
-    assert "用户问：query" in brief
-    assert "审计锚点" in brief
-    assert "Workflow 摘要" in brief
-    assert "RAG 阶段定位" in brief
-    assert "被评估答案 / answer_hint" in brief
-    assert "评估器线索是低置信诊断线索" in brief
-    assert "Doc A" in brief
-    assert "https://example.com/doc-a" in brief
-    assert "This is the cited support snippet" in brief
-    assert "归因时先想这几件事" not in brief
-    assert "按 cause 的 span 读取入口" not in brief
-    assert "Workflow 现场" not in brief
-    assert "证据链速览" not in brief
-    assert "```json" not in brief
-    assert "origin_doc_list" not in brief
-    assert "rerank_docs" not in brief
-    assert "Required Report Contract" not in brief
-    assert "Symptom To Root Cause Seeds" not in brief
-    assert "Do not jump to an earliest failing stage" not in brief
+    assert (tmp_path / "case_facts.json").exists()
+    assert not (tmp_path / "agent_brief.md").exists()
+    assert facts["case"]["query"] == "query"
+    assert facts["case"]["answer_hint"] == "包装后的答案"
 
 
 def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> None:
@@ -846,9 +840,9 @@ def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> No
     index = json.loads((tmp_path / "evidence_index.json").read_text(encoding="utf-8"))
 
     assert result["status"] == "ok"
-    assert result["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
+    assert result["skill_release_marker"] == "findreason-rag-attribution@2026-07-01-lean-artifacts-v1"
     assert "# FindReason Judgement" in report
-    assert "skill_release_marker=`findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1`" in report
+    assert "skill_release_marker=`findreason-rag-attribution@2026-07-01-lean-artifacts-v1`" in report
     assert "自动合成的短版结论草稿" in report
     assert "candidate_cause: 待 Agent 判断" not in report
     assert "置信度: 待 Agent 判断" not in report
@@ -888,7 +882,7 @@ def test_synthesize_brief_writes_readable_report_and_index(tmp_path: Path) -> No
     assert "Prompt 代表证据" not in report
     assert len(report.splitlines()) <= 100
     assert index["report_rule"].startswith("Human reports must cite")
-    assert index["skill_release_marker"] == "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
+    assert index["skill_release_marker"] == "findreason-rag-attribution@2026-07-01-lean-artifacts-v1"
     assert "sufficiency_review_contract" not in index
     assert "badcase_review_contract" not in index
     assert result["outputs"]["agent_judgement"].endswith("agent_judgement.md")
@@ -1037,6 +1031,133 @@ def test_recall_experiment_executes_trace_template_with_query(
     assert "candidate_cause" not in result
 
 
+def test_recall_plan_distinguishes_workflow_rewrite_from_verbatim_user(tmp_path: Path) -> None:
+    from findreason_core.evidence_kernel import write_json
+    from findreason_core.experiments import run_experiment
+
+    facts = {
+        "schema_version": "agent-judgement-v4",
+        "log_id": "log",
+        "workspace_id": "138",
+        "app_id": "1001883",
+        "case": {"query": "怎么是空白的"},
+        "preprocess": {"rewrite_query": "千川行业参考值数据空白的原因"},
+        "trace": {"summary": {"workflow_segments": [{"query": "千川行业参考值数据空白的原因"}]}},
+    }
+    facts_file = tmp_path / "case_facts.json"
+    write_json(facts_file, facts)
+
+    result = run_experiment(experiment_type="recall", facts_file=str(facts_file))
+
+    variants = result["query_variants_to_try"]
+    assert {"variant": "workflow_rewrite", "query": "千川行业参考值数据空白的原因"} in variants
+    assert {"variant": "verbatim_user", "query": "怎么是空白的"} in variants
+    assert {"variant": "workflow_rewrite", "query": "怎么是空白的"} not in variants
+
+
+def test_wide_recall_uses_source_specific_queries_and_requires_same_assertion_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import findreason_core.experiments as experiments
+    from findreason_core.evidence_kernel import write_json
+    from findreason_core.experiments import run_experiment
+
+    facts = {
+        "schema_version": "agent-judgement-v4",
+        "log_id": "log",
+        "workspace_id": "138",
+        "app_id": "1001883",
+        "case": {"query": "怎么是空白的"},
+        "preprocess": {"rewrite_query": "千川行业参考值数据空白的原因"},
+        "trace": {"summary": {"workflow_segments": [{"query": "千川行业参考值数据空白的原因"}]}},
+        "experiment_inputs": {
+            "recall_templates": [
+                {
+                    "kind": "split_recall",
+                    "endpoint": "https://example.test/api/sirius_plugin/v1/recall",
+                    "request_body": {
+                        "oriQuery": "old query",
+                        "query": ["old query"],
+                        "recallRequests": [
+                            {
+                                "name": "self_dataset_search",
+                                "recallStrategy": "self_dataset_search",
+                                "recallLabels": ["内容中台应用-533"],
+                                "maxCount": 30,
+                                "params": {"score": "0.3"},
+                            }
+                        ],
+                        "params": {},
+                    },
+                }
+            ]
+        },
+    }
+    facts_file = tmp_path / "case_facts.json"
+    write_json(facts_file, facts)
+    posted: dict[str, object] = {"calls": []}
+
+    async def fake_resolve_token(workspace_id: str) -> tuple[str, str]:
+        assert workspace_id == "138"
+        return "unit-token", "unit"
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self) -> dict:
+            return {
+                "code": 0,
+                "data": {
+                    "recallResult": {
+                        "self_dataset_search": [
+                            {"id": "doc-blank", "title": "点进去是空白的", "content": "企业微信绑定页空白排查。"}
+                        ]
+                    }
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, timeout: int) -> None:
+            posted["timeout"] = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, endpoint: str, *, headers: dict, json: dict) -> FakeResponse:
+            posted["calls"].append({"endpoint": endpoint, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr(experiments, "resolve_workflow_auth_token", fake_resolve_token)
+    monkeypatch.setattr(experiments.httpx, "Client", FakeClient)
+
+    result = run_experiment(experiment_type="recall", facts_file=str(facts_file), query="explicit query")
+
+    matrix = result["recall_variant_matrix"]
+    workflow_wide = next(item for item in matrix if item["variant_id"] == "workflow_rewrite_no533_wide")
+    verbatim_wide = next(item for item in matrix if item["variant_id"] == "verbatim_user_no533_wide")
+
+    assert workflow_wide["query_source"] == "workflow_rewrite"
+    assert workflow_wide["actual_wide_query_used"] == "千川行业参考值数据空白的原因"
+    assert verbatim_wide["query_source"] == "verbatim_user"
+    assert verbatim_wide["actual_wide_query_used"] == "怎么是空白的"
+
+    recall_request = workflow_wide["request_payload"]["recallRequests"][0]
+    assert "recallLabels" not in recall_request
+    assert recall_request["recallLabels_before_wide_recall"] == ["内容中台应用-533"]
+    assert recall_request["maxCount"] == 80
+    assert recall_request["params"]["score"] == "0.0"
+    assert recall_request["params"]["score_before_wide_recall"] == "0.3"
+
+    gate = workflow_wide["same_assertion_gate"]
+    assert gate["support_levels"] == ["direct_support", "partial_support", "adjacent_support", "irrelevant"]
+    assert gate["valid_recall_improvement"] is False
+    assert gate["top_doc_assessments"][0]["support_level"] == "unreviewed"
+
+
 def test_rerank_experiment_outputs_rank_shift_with_alias_matching(tmp_path: Path) -> None:
     from findreason_core.evidence_kernel import write_json
     from findreason_core.experiments import run_experiment
@@ -1175,12 +1296,120 @@ def test_knowledge_detail_experiment_extracts_status_signals_and_unconfirmed(
     assert (tmp_path / "knowledge_detail_experiment.json").exists()
 
 
+def test_knowledge_detail_uses_raw_trace_identity_for_cognition_and_faq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import findreason_core.experiments as experiments
+    from findreason_core.evidence_kernel import write_json
+    from findreason_core.experiments import run_experiment
+
+    facts = {
+        "schema_version": "agent-judgement-v4",
+        "log_id": "log",
+        "workspace_id": "138",
+        "app_id": "1001883",
+        "case": {"query": "query"},
+        "artifacts": {
+            "origin_doc_list": [],
+            "origin_faq_list": [],
+            "rerank_docs": [],
+            "prompt_docs": [
+                {
+                    "id": "210445",
+                    "doc_id_aliases": ["210445", "3641558"],
+                    "title": "人群分析",
+                    "content": "",
+                    "rank": 1,
+                },
+                {
+                    "id": "2026942",
+                    "doc_id_aliases": ["2026942", "727127"],
+                    "title": "删除人群包 FAQ",
+                    "content": "",
+                    "rank": 2,
+                },
+            ],
+        },
+        "raw_trace_evidence": {
+            "origin_doc_list_raw": [
+                {
+                    "identifier": "210445",
+                    "id": "3641558",
+                    "type": 2,
+                    "recallSource": "self_dataset_search",
+                    "url": "https://support.oceanengine.com/support/content/210445",
+                    "title": "人群分析",
+                }
+            ],
+            "origin_faq_list_raw": [
+                {
+                    "identifier": "2026942",
+                    "id": "727127",
+                    "type": 4,
+                    "recallSource": "featured_search",
+                    "title": "删除人群包 FAQ",
+                }
+            ],
+        },
+    }
+    facts_file = tmp_path / "case_facts.json"
+    write_json(facts_file, facts)
+
+    async def fake_resolve_token(workspace_id: str) -> tuple[str, str]:
+        return "unit-token", "unit"
+
+    requested: list[tuple[str, str]] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        def json(self) -> dict:
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, timeout: int) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(self, endpoint: str, *, headers: dict, json: dict) -> FakeResponse:
+            requested.append(("POST", endpoint))
+            assert endpoint.endswith("/docDetail/210445?source=COGNITION")
+            return FakeResponse({"statusCode": 200, "data": {"modifyTime": "2026-06-01", "storedInEs": 1}})
+
+        def get(self, endpoint: str, *, headers: dict) -> FakeResponse:
+            requested.append(("GET", endpoint))
+            assert endpoint.endswith("/cognition_faq/faq_info_by_faq_id?faqId=2026942")
+            return FakeResponse({"statusCode": 200, "data": {"modifyTime": "2026-06-02", "status": 2}})
+
+    monkeypatch.setattr(experiments, "resolve_workflow_auth_token", fake_resolve_token)
+    monkeypatch.setattr(experiments.httpx, "Client", FakeClient)
+
+    result = run_experiment(experiment_type="knowledge-detail", facts_file=str(facts_file), output_dir=str(tmp_path))
+
+    assert result["counts"] == {"key_docs": 2, "confirmed": 2, "unconfirmed": 0}
+    assert ("POST", "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/search/docDetail/210445?source=COGNITION") in requested
+    assert (
+        "GET",
+        "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/cognition_faq/faq_info_by_faq_id?faqId=2026942",
+    ) in requested
+
+
 def test_replay_experiment_skips_when_authoritative_trace_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import findreason_core.experiments as experiments
     from findreason_core.evidence_kernel import write_json
     from findreason_core.experiments import run_experiment
+    from findreason_core.reporting import synthesize_brief
 
     facts = {
         "schema_version": "agent-judgement-v4",
@@ -1205,7 +1434,13 @@ def test_replay_experiment_skips_when_authoritative_trace_exists(
     assert result["mode"] == "skipped_authoritative_trace"
     assert result["counts"] == facts["counts"]
     assert result["artifacts"] == {}
-    assert json.loads((tmp_path / "replay_experiment.json").read_text(encoding="utf-8"))["mode"] == "skipped_authoritative_trace"
+    assert not (tmp_path / "replay_experiment.json").exists()
+
+    synthesize_brief(facts_file=str(facts_file), output_dir=str(tmp_path))
+    report = (tmp_path / "agent_judgement.md").read_text(encoding="utf-8")
+    index = json.loads((tmp_path / "evidence_index.json").read_text(encoding="utf-8"))
+    assert "skipped_authoritative_trace" in report
+    assert index["replay_status"] == "skipped_authoritative_trace"
 
 
 def test_resolve_workflow_uses_openplat_app_detail_with_user_version(monkeypatch: pytest.MonkeyPatch) -> None:

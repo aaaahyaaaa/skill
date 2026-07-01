@@ -2,8 +2,8 @@
   "name": "findreason-rag-attribution",
   "version": "0.4.3-json-only-workflow-aware-marker",
   "schema_version": "agent-judgement-v4",
-  "skill_release_marker": "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1",
-  "skill_release_policy": "JSON-only evidence input; workflow-aware RAG stage map; Markdown artifacts are outputs only.",
+  "skill_release_marker": "findreason-rag-attribution@2026-07-01-lean-artifacts-v1",
+  "skill_release_policy": "Lean JSON evidence input; workflow-aware RAG stage map; agent_judgement.md is the only human-readable case report.",
   "runtime": "python",
   "entrypoint": "python -m findreason",
   "capabilities": [
@@ -11,8 +11,8 @@
       "id": "collect_evidence",
       "command": "collect-evidence",
       "description": "Fetch or read Fornax trace, normalize RAG artifacts, and persist case facts for Agent judgement.",
-      "inputs": ["workspace_id", "log_id", "app_id", "case_file", "trace_file", "limit", "output_dir"],
-      "outputs": ["case_facts.json", "agent_brief.md"]
+      "inputs": ["workspace_id", "log_id", "app_id", "case_json", "case_file_legacy", "trace_file", "limit", "output_dir"],
+      "outputs": ["case_facts.json"]
     },
     {
       "id": "run_experiment_recall",
@@ -31,9 +31,9 @@
     {
       "id": "run_experiment_replay",
       "command": "run-experiment --type replay",
-      "description": "Replay workflow as a current-version experiment and return normalized recall/rerank/prompt/answer evidence.",
+      "description": "Replay workflow as a current-version experiment when historical trace evidence is insufficient; skipped_authoritative_trace is summarized from case_facts.json and does not force an empty replay file.",
       "inputs": ["facts_file", "query", "app_id", "version_id", "app_version", "output_dir"],
-      "outputs": ["replay_experiment.json"]
+      "outputs": ["replay_experiment.json when replay actually runs or returns a new evidence chain"]
     },
     {
       "id": "synthesize_brief",

@@ -6,14 +6,13 @@ from typing import Any
 
 import httpx
 
-from .agent_judgement_contract import judgement_brief_markdown
 from .artifacts import decode_jsonish, normalize_rag_artifacts, to_jsonable
 from .fornax_trace import FornaxTraceIngestRequest, ingest_fornax_trace
 
 
 SCHEMA_VERSION = "agent-judgement-v4"
-SKILL_RELEASE_MARKER = "findreason-rag-attribution@2026-06-29-json-only-workflow-aware-v1"
-SKILL_RELEASE_POLICY = "JSON-only evidence input; workflow-aware RAG stage map; Markdown artifacts are outputs only."
+SKILL_RELEASE_MARKER = "findreason-rag-attribution@2026-07-01-lean-artifacts-v1"
+SKILL_RELEASE_POLICY = "Lean JSON-only evidence input; workflow-aware RAG stage map; agent_judgement.md is the only human-readable case report."
 OPEN_PLAT_ZS_OPEN_TOKEN = "37160d0535224506965a54e58e0685c4"
 OPEN_PLAT_TRACE_DETAIL_URL = "http://zhishang.bytedance.net/open-plat/api/fornax/trace/detail"
 RECALL_ENDPOINT_MARKERS = ("/api/sirius_plugin/v1/recall", "/api/sirius_plugin/v1/searchDoc")
@@ -46,6 +45,16 @@ def read_json_file(path: str | Path | None) -> dict[str, Any]:
         return {}
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     return value if isinstance(value, dict) else {}
+
+
+def read_json_arg(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    text = str(value)
+    if text.startswith("@"):
+        return read_json_file(text[1:])
+    parsed = json.loads(text)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def write_json(path: str | Path, value: Any) -> None:
@@ -329,12 +338,14 @@ def collect_evidence(
     log_id: str,
     app_id: str = "",
     case_file: str | None = None,
+    case_payload: dict[str, Any] | None = None,
     trace_file: str | None = None,
     output_dir: str | None = None,
     limit: int = 1000,
     timeout_seconds: int = 90,
 ) -> dict[str, Any]:
-    case = normalize_case_payload(read_json_file(case_file))
+    case_source = case_payload if case_payload is not None else read_json_file(case_file)
+    case = normalize_case_payload(case_source)
     if trace_file:
         trace_payload = read_json_file(trace_file)
         trace_meta = {"source": "trace_file", "path": str(trace_file)}
@@ -356,7 +367,6 @@ def collect_evidence(
     if output_dir:
         out = Path(output_dir)
         write_json(out / "case_facts.json", facts)
-        (out / "agent_brief.md").write_text(judgement_brief_markdown(facts), encoding="utf-8")
     return facts
 
 
@@ -368,7 +378,8 @@ def schema_payload() -> dict[str, Any]:
         "commands": {
             "collect-evidence": {
                 "purpose": "Fetch or read trace, parse workflow-aware RAG artifacts, and persist case facts for Agent judgement.",
-                "outputs": ["case_facts.json", "agent_brief.md"],
+                "inputs": ["workspace_id", "log_id", "app_id", "case_json", "case_file_legacy", "trace_file", "output_dir"],
+                "outputs": ["case_facts.json"],
                 "trace_outputs": [
                     "workflow_topology",
                     "node_evidence_map",
@@ -385,7 +396,10 @@ def schema_payload() -> dict[str, Any]:
                     "knowledge-detail": ["--target-doc-id", "--timeout-seconds"],
                     "replay": ["--query", "--app-id", "--version-id", "--timeout-seconds"],
                 },
-                "outputs": ["<type>_experiment.json"],
+                "outputs": ["<type>_experiment.json when a real experiment or local observation artifact is persisted"],
+                "conditional_outputs": {
+                    "replay": "skipped_authoritative_trace returns status in memory and is summarized from case_facts.json; it does not force an empty replay_experiment.json."
+                },
             },
             "synthesize-brief": {
                 "purpose": "Write a concise human judgement summary plus evidence_index.json from facts and experiment files.",
@@ -405,6 +419,8 @@ def schema_payload() -> dict[str, Any]:
             "No fixed primary_cause selection.",
             "No earliest-failing-stage hard arbitration.",
             "No compatibility promise for old v3 CLI output or tests.",
+            "No generated agent_brief.md; use case_facts.json for evidence and agent_judgement.md for the human-readable report.",
+            "No default persisted case.json; embed source case context under case_facts.json.case.",
         ],
         "raw_artifacts": ["origin_doc_list", "origin_faq_list", "rerank_docs", "prompt_docs"],
         "experiment_inputs": ["recall_templates"],

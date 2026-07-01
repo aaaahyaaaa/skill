@@ -21,7 +21,7 @@
 
 - Fornax 平台：按历史 `log_id` 回查原始 trace，是历史现场的源头。
 - 本地 JSON：保存本次归因实际使用的 facts、实验和证据索引，是最适合批量搜索和复现的证据包。
-- Replay：如果 `replay_experiment.json` 中返回新的 `log_id` / `trace_id`，报告必须写出；如果没有返回，报告必须明确写“replay 未返回新的 log_id”。
+- Replay：如果 `replay_experiment.json` 中返回新的 `log_id` / `trace_id`，报告必须写出；如果没有实际执行 replay，只需要写明未执行原因或 `skipped_authoritative_trace`，不要为每条 case 强制生成空 replay 文件。
 
 ## 必填字段
 
@@ -86,6 +86,9 @@
 - Prompt sufficiency gate 至少分四档：`相关词命中`、`部分支撑`、`直接核心证据`、`冲突证据`。prompt 中出现相关词或泛化文档，不等于有足够回答用户问题的关键证据。
 - `答案生成错误` 只在关键 required assertions 已经进入 `prompt_docs` / `qaPromptDocs` 且达到 `direct_support`，但答案仍漏答、误答、错引、越界、编造或把弱证据写强时成立。
 - 对关键证据标注支撑等级：`direct_support`、`partial_support`、`adjacent_support`、`insufficient`、`contradictory`。
+- 宽召回证据必须单独过“同断言门槛”：同业务对象、同问题类型、同关键限定条件，且正文能回答 required assertion。宽召回 top 文档按 `direct_support` / `partial_support` / `adjacent_support` / `irrelevant` 四档写清；只有 `direct_support` 或强 `partial_support` 才能把 `valid_recall_improvement` 置为 `true` 并支撑 `召回遗漏`，`adjacent_support` / `irrelevant` 只能作为探索线索。
+- 表格写回或复核摘要中，如果使用了宽召回，必须写明 `actual_wide_query_used` 和 `valid_recall_improvement=false/true`。`actual_wide_query_used` 要能区分 `workflow_rewrite` 和 `verbatim_user`，不要把 `case.query` 误写成 workflow query。
+- 如果原 prompt 已经含关键文档，但答案仍然写错，应优先写 `答案生成错误`、证据使用错误或知识冲突；宽召回命中更清晰文档不能单独把主因改成 `召回遗漏`。
 - 说明每条证据支撑了哪条 required assertion，哪些断言仍未被权威支撑。
 - 区分“证据足以解释 replay 为什么更好”和“证据足以产出严谨业务答案”。前者不等于后者。
 - 如果证据有用但不完整，要写出缺失的精确权威证据，例如“缺少明确说明是否自动扣费/自动续费/到期后如何处理的规则文档”。
