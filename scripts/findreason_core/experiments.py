@@ -29,9 +29,103 @@ STATUS_SIGNAL_TERMS = (
     "停止维护",
     "旧版",
 )
+WIDE_RECALL_SUPPORT_LEVELS = ("direct_support", "partial_support", "adjacent_support", "irrelevant")
+WIDE_RECALL_GATE_RULE = (
+    "Wide recall can change attribution only when the top evidence passes the same-assertion gate: "
+    "same business object, same problem type, same key constraints, and body text answering the required assertion. "
+    "Only direct_support or strong partial_support can support 召回遗漏; adjacent_support/irrelevant are exploratory."
+)
 KNOWLEDGE_DETAIL_ENDPOINT_TEMPLATE = (
     os.getenv("FINDREASON_KNOWLEDGE_DETAIL_ENDPOINT")
     or "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/search/docDetail/{doc_id}"
+)
+
+
+def _text_or_empty(value: Any) -> str:
+    return str(value or "").strip() if value not in (None, "", [], {}) else ""
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = _text_or_empty(value)
+        if text:
+            return text
+    return ""
+
+
+def _workflow_rewrite_query(facts: dict[str, Any]) -> str:
+    preprocess = facts.get("preprocess") if isinstance(facts.get("preprocess"), dict) else {}
+    trace = facts.get("trace") if isinstance(facts.get("trace"), dict) else {}
+    summary = trace.get("summary") if isinstance(trace.get("summary"), dict) else {}
+    summary_preprocess = summary.get("preprocess") if isinstance(summary.get("preprocess"), dict) else {}
+    selected_segment = trace.get("selected_workflow_segment")
+    if not isinstance(selected_segment, dict):
+        selected_segment = summary.get("selected_workflow_segment") if isinstance(summary.get("selected_workflow_segment"), dict) else {}
+
+    direct = _first_text(
+        preprocess.get("rewrite_query"),
+        preprocess.get("rewriteQuery"),
+        preprocess.get("rewritten_query"),
+        preprocess.get("workflow_query"),
+        summary_preprocess.get("rewrite_query"),
+        summary_preprocess.get("rewriteQuery"),
+        selected_segment.get("rewrite_query"),
+        selected_segment.get("query"),
+    )
+    if direct:
+        return direct
+
+    segment_lists = (
+        summary.get("workflow_segments"),
+        trace.get("workflow_segments"),
+    )
+    for segments in segment_lists:
+        if not isinstance(segments, list):
+            continue
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            text = _first_text(segment.get("rewrite_query"), segment.get("rewriteQuery"), segment.get("query"))
+            if text:
+                return text
+    return ""
+
+
+def _verbatim_user_query(facts: dict[str, Any]) -> str:
+    case = facts.get("case") if isinstance(facts.get("case"), dict) else {}
+    return _first_text(
+        facts.get("verbatim_user_text"),
+        facts.get("user_query"),
+        case.get("verbatim_user"),
+        case.get("verbatimUser"),
+        case.get("user_query"),
+        case.get("query"),
+        case.get("query_hint"),
+    )
+
+
+def _recall_query_sources(facts: dict[str, Any]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for source, query in (
+        ("workflow_rewrite", _workflow_rewrite_query(facts)),
+        ("verbatim_user", _verbatim_user_query(facts)),
+    ):
+        if query:
+            sources.append({"source": source, "query": query})
+    return sources
+
+
+KNOWLEDGE_RECORD_ENDPOINT_TEMPLATE = (
+    os.getenv("FINDREASON_KNOWLEDGE_RECORD_ENDPOINT")
+    or "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/doc/record_id?source={source}&identifier={identifier}"
+)
+COGNITION_FAQ_DETAIL_ENDPOINT_TEMPLATE = (
+    os.getenv("FINDREASON_COGNITION_FAQ_DETAIL_ENDPOINT")
+    or "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/cognition_faq/faq_info_by_faq_id?faqId={identifier}"
+)
+COGNITION_FAQ_RECORD_ENDPOINT_TEMPLATE = (
+    os.getenv("FINDREASON_COGNITION_FAQ_RECORD_ENDPOINT")
+    or "https://ad-sirius.bytedance.net/api/sirius_knowledge/v1/data/cognition_faq/faq_info?id={record_id}"
 )
 
 
@@ -73,24 +167,30 @@ def _base_envelope(experiment_type: str, facts: dict[str, Any]) -> dict[str, Any
 
 def plan_recall_experiment(facts: dict[str, Any]) -> dict[str, Any]:
     envelope = _base_envelope("recall", facts)
-    case = _case_from_facts(facts)
     experiment_inputs = facts.get("experiment_inputs") if isinstance(facts.get("experiment_inputs"), dict) else {}
     recall_templates = experiment_inputs.get("recall_templates") if isinstance(experiment_inputs.get("recall_templates"), list) else []
+    query_variants = [
+        {"variant": item["source"], "query": item["query"]}
+        for item in _recall_query_sources(facts)
+    ]
+    query_variants.extend(
+        [
+            {"variant": "agent_original_or_context_query", "query": "<agent-fill-from-original-user-context>"},
+            {"variant": "decomposed_sub_intent", "query": "<agent-fill-for-missing-aspect>"},
+        ]
+    )
     envelope.update(
         {
             "status": "planned",
             "available_recall_templates": len(recall_templates),
-            "query_variants_to_try": [
-                {"variant": "workflow_query", "query": case["query"]},
-                {"variant": "agent_original_or_context_query", "query": "<agent-fill-from-original-user-context>"},
-                {"variant": "decomposed_sub_intent", "query": "<agent-fill-for-missing-aspect>"},
-            ],
+            "query_variants_to_try": query_variants,
             "checks": [
                 "Does open-label recall retrieve exact-topic support?",
                 "Does recall miss support that exists in wider retrieval?",
                 "Are origin_doc_list and origin_faq_list differently useful for the same assertion?",
+                "Does any wide-recall hit pass the same business object, problem type, key constraints, and required assertion gate?",
             ],
-            "notes": "This thin v4 planner intentionally leaves semantic query variants to the Agent; code will execute concrete variants once supplied.",
+            "notes": "workflow_rewrite is extracted only from preprocess.rewrite_query or trace.summary.workflow_segments[].query; verbatim_user is the original user wording. Code executes concrete live variants once --query or --context-query is supplied.",
         }
     )
     return envelope
@@ -124,6 +224,89 @@ def _doc_aliases(doc: dict[str, Any] | None) -> list[str]:
     return aliases
 
 
+def _source_metadata(source_text: str) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for part in str(source_text or "").split("|"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value and key not in metadata:
+            metadata[key] = value
+    return metadata
+
+
+def _doc_identifier(doc: dict[str, Any] | None) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    source_meta = _source_metadata(str(doc.get("source") or ""))
+    for key in ("identifier", "knowledge_id", "knowledgeId", "doc_id", "docId"):
+        value = str(doc.get(key) or source_meta.get(key) or "").strip()
+        if value:
+            return value
+    aliases = _doc_aliases(doc)
+    return aliases[0] if aliases else _doc_id(doc.get("id"))
+
+
+def _doc_record_id(doc: dict[str, Any] | None) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    source_meta = _source_metadata(str(doc.get("source") or ""))
+    for key in ("record_id", "recordId", "id"):
+        value = str(doc.get(key) or source_meta.get(key) or "").strip()
+        if value:
+            return value
+    aliases = _doc_aliases(doc)
+    return aliases[1] if len(aliases) > 1 else ""
+
+
+def _doc_recall_source(doc: dict[str, Any] | None) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    for key in ("recallSource", "recall_source"):
+        value = str(doc.get(key) or "").strip()
+        if value:
+            return value
+    for part in str(doc.get("source") or "").split("|"):
+        part = part.strip()
+        if part in {"self_dataset_search", "doc_search", "featured_search"}:
+            return part
+    return ""
+
+
+def _doc_url_for_detail(doc: dict[str, Any] | None) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    source_meta = _source_metadata(str(doc.get("source") or ""))
+    return str(doc.get("url") or doc.get("docUrl") or doc.get("source_url") or source_meta.get("url") or "").strip()
+
+
+def _infer_detail_source(doc: dict[str, Any] | None) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    explicit = _doc_source_for_detail(doc)
+    if explicit:
+        return explicit
+    for key in ("knowledge_source", "knowledgeSource", "docType", "doc_type"):
+        value = str(doc.get(key) or "").strip()
+        if value in {"COGNITION", "COGNITION_FAQ", "LARK_DOC", "PERSONAL_LARK_DOC", "FAQ"}:
+            return value
+    source_meta = _source_metadata(str(doc.get("source") or ""))
+    for key in ("knowledge_source", "doc_source", "source", "docType"):
+        value = str(source_meta.get(key) or "").strip()
+        if value in {"COGNITION", "COGNITION_FAQ", "LARK_DOC", "PERSONAL_LARK_DOC", "FAQ"}:
+            return value
+    doc_type = str(doc.get("type") or doc.get("raw_type") or source_meta.get("type") or "").strip()
+    url = _doc_url_for_detail(doc)
+    recall_source = _doc_recall_source(doc)
+    if doc_type == "4" or recall_source == "featured_search":
+        return "COGNITION_FAQ"
+    if doc_type == "2" or "support.oceanengine.com/support/content/" in url:
+        return "COGNITION"
+    return ""
+
+
 def _doc_source_for_detail(doc: dict[str, Any] | None) -> str:
     if not isinstance(doc, dict):
         return ""
@@ -144,6 +327,57 @@ def _doc_source_for_detail(doc: dict[str, Any] | None) -> str:
 def _artifact_docs(facts: dict[str, Any], key: str) -> list[dict[str, Any]]:
     artifacts = facts.get("artifacts") if isinstance(facts.get("artifacts"), dict) else {}
     return normalize_docs(artifacts.get(key, []), source=key)
+
+
+def _raw_docs_for_knowledge_detail(facts: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_trace = facts.get("raw_trace_evidence") if isinstance(facts.get("raw_trace_evidence"), dict) else {}
+    docs: list[dict[str, Any]] = []
+    for key in ("prompt_docs_raw", "rerank_docs_raw", "origin_doc_list_raw", "origin_faq_list_raw"):
+        values = raw_trace.get(key)
+        if isinstance(values, list):
+            docs.extend(item for item in values if isinstance(item, dict))
+    return docs
+
+
+def _raw_doc_matches(doc: dict[str, Any], raw_doc: dict[str, Any]) -> bool:
+    doc_aliases = set(_doc_aliases(doc))
+    raw_aliases = set(_doc_aliases(raw_doc))
+    if doc_aliases & raw_aliases:
+        return True
+    title = str(doc.get("title") or "").strip()
+    raw_title = str(raw_doc.get("title") or raw_doc.get("doc_title") or "").strip()
+    return bool(title and raw_title and title == raw_title)
+
+
+def _merge_raw_doc_metadata(doc: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
+    raw_doc = next((item for item in _raw_docs_for_knowledge_detail(facts) if _raw_doc_matches(doc, item)), None)
+    if not raw_doc:
+        return doc
+    merged = dict(doc)
+    for key, raw_key in (
+        ("identifier", "identifier"),
+        ("record_id", "id"),
+        ("raw_type", "type"),
+        ("recallSource", "recallSource"),
+        ("url", "url"),
+        ("updateDay", "updateDay"),
+        ("labels", "labels"),
+        ("cognitionTagIds", "cognitionTagIds"),
+        ("docType", "docType"),
+    ):
+        if merged.get(key) in (None, "", []):
+            value = raw_doc.get(raw_key)
+            if value not in (None, ""):
+                merged[key] = value
+    aliases = _doc_aliases(merged)
+    for value in _doc_aliases(raw_doc):
+        if value and value not in aliases:
+            aliases.append(value)
+    merged["doc_id_aliases"] = aliases
+    inferred_source = _infer_detail_source(merged)
+    if inferred_source and not merged.get("knowledge_source"):
+        merged["knowledge_source"] = inferred_source
+    return merged
 
 
 def _index_docs(docs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -531,10 +765,22 @@ def _recall_request_summary(body: dict[str, Any], *, endpoint: str = "") -> dict
             field = {"path": f"{path}.{key}", "value": value}
             if lowered in {"topk", "top_k", "maxcount", "max_count", "topn", "limit"}:
                 top_fields.append(field)
-            elif lowered in {"label", "labels", "labelids", "label_ids", "tagids", "tag_ids", "tags", "doclabels"}:
+            elif lowered in {
+                "label",
+                "labels",
+                "labelids",
+                "label_ids",
+                "tagids",
+                "tag_ids",
+                "tags",
+                "doclabels",
+                "recalllabels",
+                "recall_labels",
+            }:
                 label_fields.append(field)
             elif lowered in {
                 "threshold",
+                "score",
                 "scorethreshold",
                 "score_threshold",
                 "minscore",
@@ -581,7 +827,18 @@ def _ensure_topk_at_least(body: dict[str, Any], minimum: int = 50) -> list[dict[
 
 def _relax_label_fields(body: dict[str, Any]) -> list[dict[str, Any]]:
     changes: list[dict[str, Any]] = []
-    label_keys = {"label", "labels", "labelids", "label_ids", "tagids", "tag_ids", "tags", "doclabels"}
+    label_keys = {
+        "label",
+        "labels",
+        "labelids",
+        "label_ids",
+        "tagids",
+        "tag_ids",
+        "tags",
+        "doclabels",
+        "recalllabels",
+        "recall_labels",
+    }
     for mapping, path in _walk_mappings(body):
         for key in list(mapping.keys()):
             if str(key).lower() not in label_keys:
@@ -606,6 +863,7 @@ def _relax_threshold_fields(body: dict[str, Any]) -> list[dict[str, Any]]:
     changes: list[dict[str, Any]] = []
     threshold_keys = {
         "threshold",
+        "score",
         "scorethreshold",
         "score_threshold",
         "minscore",
@@ -622,6 +880,73 @@ def _relax_threshold_fields(body: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             mapping[key] = 0
             changes.append({"path": f"{path}.{key}", "before": before, "after": 0})
+    return changes
+
+
+def _remove_wide_recall_label_fields(body: dict[str, Any]) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    label_keys = {
+        "recalllabels",
+        "recall_labels",
+        "label",
+        "labels",
+        "labelids",
+        "label_ids",
+        "tagids",
+        "tag_ids",
+        "tags",
+        "doclabels",
+    }
+    for mapping, path in _walk_mappings(body):
+        for key in list(mapping.keys()):
+            if str(key).lower() not in label_keys:
+                continue
+            before = mapping.get(key)
+            if before in (None, "", [], {}):
+                continue
+            before_key = f"{key}_before_wide_recall"
+            if before_key not in mapping:
+                mapping[before_key] = copy.deepcopy(before)
+            del mapping[key]
+            changes.append({"path": f"{path}.{key}", "before": before, "after": None, "action": "removed_for_wide_recall"})
+    return changes
+
+
+def _relax_wide_score_fields(body: dict[str, Any]) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    threshold_keys = {
+        "threshold",
+        "score",
+        "scorethreshold",
+        "score_threshold",
+        "minscore",
+        "min_score",
+        "recallthreshold",
+        "similaritythreshold",
+    }
+    for mapping, path in _walk_mappings(body):
+        for key in list(mapping.keys()):
+            if str(key).lower() not in threshold_keys:
+                continue
+            before = mapping.get(key)
+            if before in (None, ""):
+                continue
+            before_key = f"{key}_before_wide_recall"
+            if before_key not in mapping:
+                mapping[before_key] = copy.deepcopy(before)
+            after: Any = "0.0" if isinstance(before, str) else 0
+            mapping[key] = after
+            changes.append({"path": f"{path}.{key}", "before": before, "after": after})
+    return changes
+
+
+def _wide_recall_mutator(body: dict[str, Any]) -> list[dict[str, Any]]:
+    label_changes = _remove_wide_recall_label_fields(body)
+    if not label_changes:
+        return []
+    changes = list(label_changes)
+    changes.extend(_ensure_topk_at_least(body, 80))
+    changes.extend(_relax_wide_score_fields(body))
     return changes
 
 
@@ -691,6 +1016,37 @@ def _collect_docs_from_response(value: Any) -> list[dict[str, Any]]:
     return deduped
 
 
+def _wide_recall_same_assertion_gate(docs: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "valid_recall_improvement": False,
+        "valid_recall_improvement_reason": "pending_agent_same_assertion_review",
+        "support_levels": list(WIDE_RECALL_SUPPORT_LEVELS),
+        "required_checks": [
+            "same_business_object",
+            "same_problem_type",
+            "same_key_constraints",
+            "body_answers_required_assertion",
+        ],
+        "decision_rule": WIDE_RECALL_GATE_RULE,
+        "top_doc_assessments": [
+            {
+                "rank": doc.get("rank") or index,
+                "id": doc.get("id", ""),
+                "doc_id_aliases": _doc_aliases(doc),
+                "title": doc.get("title", ""),
+                "content_preview": str(doc.get("content") or "")[:300],
+                "support_level": "unreviewed",
+                "same_business_object": None,
+                "same_problem_type": None,
+                "same_key_constraints": None,
+                "body_answers_required_assertion": None,
+                "notes": "Agent must classify as direct_support/partial_support/adjacent_support/irrelevant before using this hit for attribution.",
+            }
+            for index, doc in enumerate(docs[:10], start=1)
+        ],
+    }
+
+
 def _redacted_headers(headers: dict[str, Any]) -> dict[str, str]:
     redacted: dict[str, str] = {}
     for key, value in headers.items():
@@ -715,6 +1071,9 @@ def _execute_recall_variant(
     timeout_seconds: int,
     mutator: Any = None,
     observation_note: str = "",
+    query_source: str = "",
+    actual_wide_query_used: str = "",
+    same_assertion_gate_required: bool = False,
 ) -> dict[str, Any]:
     request_body = _build_recall_request_body(template, query=query, workspace_id=str(facts.get("workspace_id") or ""))
     parameter_changes: list[dict[str, Any]] = []
@@ -731,7 +1090,7 @@ def _execute_recall_variant(
         with httpx.Client(timeout=max(int(timeout_seconds), 1)) as client:
             response = client.post(endpoint, headers=headers, json=request_body)
     except Exception as exc:
-        return {
+        result = {
             "variant_id": variant_id,
             "variant_type": variant_type,
             "status": "error",
@@ -747,6 +1106,13 @@ def _execute_recall_variant(
             "matched_core_docs": [],
             "failure_reason": str(exc)[:1000],
         }
+        if query_source:
+            result["query_source"] = query_source
+        if actual_wide_query_used:
+            result["actual_wide_query_used"] = actual_wide_query_used
+        if same_assertion_gate_required:
+            result["same_assertion_gate"] = _wide_recall_same_assertion_gate([])
+        return result
     try:
         response_payload = response.json()
     except Exception:
@@ -756,7 +1122,7 @@ def _execute_recall_variant(
     message = ""
     if isinstance(response_payload, dict):
         message = str(response_payload.get("msg") or response_payload.get("message") or "")[:1000]
-    return {
+    result = {
         "variant_id": variant_id,
         "variant_type": variant_type,
         "status": status,
@@ -777,6 +1143,13 @@ def _execute_recall_variant(
         "failure_reason": "" if status == "ok" else message or response.text[:500],
         "notes": observation_note,
     }
+    if query_source:
+        result["query_source"] = query_source
+    if actual_wide_query_used:
+        result["actual_wide_query_used"] = actual_wide_query_used
+    if same_assertion_gate_required:
+        result["same_assertion_gate"] = _wide_recall_same_assertion_gate(docs)
+    return result
 
 
 def run_recall_experiment(
@@ -888,6 +1261,22 @@ def run_recall_experiment(
                 },
             ]
         )
+    for source in _recall_query_sources(facts):
+        executable_variants.append(
+            {
+                "variant_id": f"{source['source']}_no533_wide",
+                "variant_type": "no533_wide_recall",
+                "query": source["query"],
+                "mutator": _wide_recall_mutator,
+                "query_source": source["source"],
+                "actual_wide_query_used": source["query"],
+                "same_assertion_gate_required": True,
+                "note": (
+                    "Open-label wide recall for this exact query source. "
+                    "It is evidence-gathering only until same_assertion_gate.valid_recall_improvement is reviewed as true."
+                ),
+            }
+        )
     for index, context_query in enumerate(context_queries, start=1):
         executable_variants.append(
             {
@@ -913,6 +1302,9 @@ def run_recall_experiment(
                 timeout_seconds=timeout_seconds,
                 mutator=variant.get("mutator"),
                 observation_note=variant.get("note", ""),
+                query_source=variant.get("query_source", ""),
+                actual_wide_query_used=variant.get("actual_wide_query_used", ""),
+                same_assertion_gate_required=bool(variant.get("same_assertion_gate_required")),
             )
         )
 
@@ -951,6 +1343,20 @@ def run_recall_experiment(
             "artifacts": {"recall_docs": docs},
             "recall_variant_matrix": matrix,
             "matched_core_docs": matched_core_docs,
+            "wide_recall_writeback_fields": [
+                {
+                    "variant_id": item.get("variant_id", ""),
+                    "query_source": item.get("query_source", ""),
+                    "actual_wide_query_used": item.get("actual_wide_query_used", ""),
+                    "valid_recall_improvement": (
+                        item.get("same_assertion_gate", {}).get("valid_recall_improvement")
+                        if isinstance(item.get("same_assertion_gate"), dict)
+                        else None
+                    ),
+                }
+                for item in matrix
+                if item.get("variant_type") == "no533_wide_recall"
+            ],
             "variant_summary": {
                 "total": len(matrix),
                 "ok": ok_count,
@@ -983,7 +1389,8 @@ def run_replay_experiment(
                 "reasoning": "",
                 "trace_completeness": {"replay_skipped": True, "historical_middle_node_trace": True},
                 "node_traces": [],
-                "notes": "检测到原始 trace 中间节点证据，未执行 workflow replay；归因以历史现场证据为权威，replay 文件仅记录跳过状态。",
+                "persist_artifact": False,
+                "notes": "检测到原始 trace 中间节点证据，未执行 workflow replay；归因以历史现场证据为权威，不强制落空 replay_experiment.json。",
             }
         )
         return envelope
@@ -1058,6 +1465,7 @@ def _key_docs_for_knowledge_detail(facts: dict[str, Any], target_doc_ids: list[s
         copied = dict(doc)
         copied["selection_reason"] = reason
         copied["doc_id_aliases"] = aliases
+        copied = _merge_raw_doc_metadata(copied, facts)
         chosen.append(copied)
 
     core_specs = _case_core_doc_specs(facts, target_doc_ids=target_doc_ids)
@@ -1120,6 +1528,13 @@ def _status_fields(value: Any) -> dict[str, Any]:
         "end_time",
         "offline",
         "version",
+        "sourceType",
+        "subSourceType",
+        "permission",
+        "storedInEs",
+        "storedInDataset",
+        "lowQuality",
+        "updateDay",
     }
 
     def visit(node: Any, path: str = "$") -> None:
@@ -1160,12 +1575,12 @@ def _extract_doc_status(payload: Any, fallback_doc: dict[str, Any]) -> dict[str,
     )
     fields = _status_fields(payload)
     status_confirmed = bool(signals or fields or last_modified)
-    if signals:
-        reason = "status_signals_found"
-    elif fields:
+    if fields:
         reason = "detail_status_fields_found"
     elif last_modified:
         reason = "last_modified_found"
+    elif signals:
+        reason = "status_signals_found"
     else:
         reason = "status_unconfirmed"
     return {
@@ -1177,15 +1592,63 @@ def _extract_doc_status(payload: Any, fallback_doc: dict[str, Any]) -> dict[str,
     }
 
 
-def _knowledge_detail_endpoint(doc: dict[str, Any]) -> str:
-    aliases = _doc_aliases(doc)
-    doc_id = next((item for item in aliases if item), _doc_id(doc.get("id")))
-    endpoint = KNOWLEDGE_DETAIL_ENDPOINT_TEMPLATE.format(doc_id=quote(doc_id), identifier=quote(doc_id))
-    source = _doc_source_for_detail(doc)
-    if source and "source=" not in endpoint:
-        separator = "&" if "?" in endpoint else "?"
-        endpoint = f"{endpoint}{separator}source={quote(source)}"
-    return endpoint
+def _knowledge_detail_requests(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    identifier = _doc_identifier(doc)
+    record_id = _doc_record_id(doc)
+    detail_source = _infer_detail_source(doc)
+    requests: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(method: str, endpoint: str, *, payload: dict[str, Any] | None = None, note: str = "") -> None:
+        if not endpoint or (method, endpoint) in seen:
+            return
+        seen.add((method, endpoint))
+        requests.append(
+            {
+                "method": method,
+                "endpoint": endpoint,
+                "request_payload": payload,
+                "detail_source": detail_source,
+                "detail_identifier": identifier,
+                "record_id": record_id,
+                "note": note,
+            }
+        )
+
+    if detail_source == "COGNITION_FAQ":
+        if identifier:
+            add(
+                "GET",
+                COGNITION_FAQ_DETAIL_ENDPOINT_TEMPLATE.format(identifier=quote(identifier), doc_id=quote(identifier)),
+                note="cognition_faq_identifier",
+            )
+        if record_id and record_id != identifier:
+            add(
+                "GET",
+                COGNITION_FAQ_RECORD_ENDPOINT_TEMPLATE.format(record_id=quote(record_id), identifier=quote(record_id)),
+                note="cognition_faq_record_id",
+            )
+    if identifier:
+        endpoint = KNOWLEDGE_DETAIL_ENDPOINT_TEMPLATE.format(doc_id=quote(identifier), identifier=quote(identifier))
+        if detail_source and "source=" not in endpoint:
+            separator = "&" if "?" in endpoint else "?"
+            endpoint = f"{endpoint}{separator}source={quote(detail_source)}"
+        add("POST", endpoint, payload={}, note="doc_detail_identifier")
+        if detail_source:
+            add(
+                "GET",
+                KNOWLEDGE_RECORD_ENDPOINT_TEMPLATE.format(
+                    source=quote(detail_source), identifier=quote(identifier), doc_id=quote(identifier)
+                ),
+                note="doc_record_identifier",
+            )
+    if record_id and record_id != identifier:
+        endpoint = KNOWLEDGE_DETAIL_ENDPOINT_TEMPLATE.format(doc_id=quote(record_id), identifier=quote(record_id))
+        if detail_source and "source=" not in endpoint:
+            separator = "&" if "?" in endpoint else "?"
+            endpoint = f"{endpoint}{separator}source={quote(detail_source)}"
+        add("POST", endpoint, payload={}, note="doc_detail_record_id")
+    return requests
 
 
 def _unconfirmed_detail(doc: dict[str, Any], reason: str, *, endpoint: str = "", error: str = "") -> dict[str, Any]:
@@ -1195,6 +1658,7 @@ def _unconfirmed_detail(doc: dict[str, Any], reason: str, *, endpoint: str = "",
         "title": doc.get("title", ""),
         "selection_reason": doc.get("selection_reason", ""),
         "endpoint": endpoint,
+        "attempted_endpoints": [endpoint] if endpoint else [],
         "request_payload": {},
         "http_status_code": None,
         "status_signals": [],
@@ -1241,54 +1705,112 @@ def run_knowledge_detail_experiment(
     details: list[dict[str, Any]] = []
     with httpx.Client(timeout=max(int(timeout_seconds), 1)) as client:
         for doc in key_docs:
-            endpoint = _knowledge_detail_endpoint(doc)
-            request_payload: dict[str, Any] = {}
+            attempts = _knowledge_detail_requests(doc)
+            if not attempts:
+                details.append(_unconfirmed_detail(doc, "status_unconfirmed", error="no usable knowledge detail identifier"))
+                continue
+            attempted_endpoints: list[str] = []
+            last_error = ""
+            last_response_status: int | None = None
+            last_payload: Any = {}
             try:
-                response = client.post(endpoint, headers=headers, json=request_payload)
-                try:
-                    payload = response.json()
-                except Exception:
-                    payload = {"raw_text": response.text[:2000]}
-                if response.status_code >= 400:
+                selected_attempt: dict[str, Any] | None = None
+                selected_payload: Any = None
+                selected_response: httpx.Response | None = None
+                for attempt in attempts:
+                    endpoint = attempt["endpoint"]
+                    attempted_endpoints.append(endpoint)
+                    method = str(attempt.get("method") or "POST").upper()
+                    request_payload = attempt.get("request_payload")
+                    if method == "GET":
+                        response = client.get(endpoint, headers=headers)
+                    else:
+                        response = client.post(endpoint, headers=headers, json=request_payload or {})
+                    last_response_status = response.status_code
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = {"raw_text": response.text[:2000]}
+                    last_payload = payload
+                    if response.status_code >= 400:
+                        last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+                        continue
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    extracted = _extract_doc_status(payload, doc)
+                    if data not in (None, "", [], {}) or extracted["status_confirmed"]:
+                        selected_attempt = attempt
+                        selected_payload = payload
+                        selected_response = response
+                        break
+                    last_error = "detail fields insufficient for state confirmation"
+                if selected_attempt is None or selected_payload is None or selected_response is None:
+                    fallback = _extract_doc_status(doc, doc)
                     details.append(
-                        _unconfirmed_detail(
-                            doc,
-                            "status_unconfirmed",
-                            endpoint=endpoint,
-                            error=f"HTTP {response.status_code}: {response.text[:500]}",
-                        )
+                        {
+                            "doc_id": _doc_id(doc.get("id")),
+                            "doc_id_aliases": _doc_aliases(doc),
+                            "title": doc.get("title", ""),
+                            "selection_reason": doc.get("selection_reason", ""),
+                            "endpoint": attempted_endpoints[-1] if attempted_endpoints else "",
+                            "attempted_endpoints": attempted_endpoints,
+                            "request_payload": {},
+                            "headers": _redacted_headers(headers),
+                            "auth_token_source": token_source,
+                            "http_status_code": last_response_status,
+                            "response_code": last_payload.get("code") if isinstance(last_payload, dict) else None,
+                            "status_signals": fallback["status_signals"],
+                            "status_confirmed": fallback["status_confirmed"],
+                            "last_modified": fallback["last_modified"],
+                            "status_reason": (
+                                "raw_trace_status_fields_found" if fallback["status_confirmed"] else "status_unconfirmed"
+                            ),
+                            "status_fields": fallback["status_fields"],
+                            "error": "" if fallback["status_confirmed"] else (last_error or "detail fields insufficient for state confirmation"),
+                            "response_preview": json_dumps(last_payload)[:1200],
+                        }
                     )
                     continue
-                extracted = _extract_doc_status(payload, doc)
+                extracted = _extract_doc_status(selected_payload, doc)
+                request_payload = selected_attempt.get("request_payload") or {}
                 details.append(
                     {
                         "doc_id": _doc_id(doc.get("id")),
                         "doc_id_aliases": _doc_aliases(doc),
                         "title": doc.get("title", ""),
                         "selection_reason": doc.get("selection_reason", ""),
-                        "endpoint": endpoint,
+                        "endpoint": selected_attempt["endpoint"],
+                        "attempted_endpoints": attempted_endpoints,
                         "request_payload": request_payload,
                         "headers": _redacted_headers(headers),
                         "auth_token_source": token_source,
-                        "http_status_code": response.status_code,
-                        "response_code": payload.get("code") if isinstance(payload, dict) else None,
+                        "http_status_code": selected_response.status_code,
+                        "response_code": selected_payload.get("code") if isinstance(selected_payload, dict) else None,
                         "status_signals": extracted["status_signals"],
                         "status_confirmed": extracted["status_confirmed"],
                         "last_modified": extracted["last_modified"],
                         "status_reason": extracted["status_reason"],
                         "status_fields": extracted["status_fields"],
                         "error": "" if extracted["status_confirmed"] else "detail fields insufficient for state confirmation",
-                        "response_preview": json_dumps(payload)[:1200],
+                        "response_preview": json_dumps(selected_payload)[:1200],
                     }
                 )
             except Exception as exc:
-                details.append(_unconfirmed_detail(doc, "status_unconfirmed", endpoint=endpoint, error=str(exc)[:500]))
+                details.append(
+                    _unconfirmed_detail(
+                        doc,
+                        "status_unconfirmed",
+                        endpoint=attempted_endpoints[-1] if attempted_endpoints else "",
+                        error=str(exc)[:500],
+                    )
+                )
     confirmed = sum(1 for item in details if item.get("status_confirmed"))
     unconfirmed = len(details) - confirmed
     envelope.update(
         {
             "status": "ok" if confirmed else "status_unconfirmed",
             "endpoint_template": KNOWLEDGE_DETAIL_ENDPOINT_TEMPLATE,
+            "record_endpoint_template": KNOWLEDGE_RECORD_ENDPOINT_TEMPLATE,
+            "cognition_faq_endpoint_template": COGNITION_FAQ_DETAIL_ENDPOINT_TEMPLATE,
             "auth_token_source": token_source,
             "counts": {"key_docs": len(key_docs), "confirmed": confirmed, "unconfirmed": unconfirmed},
             "knowledge_details": details,
@@ -1331,7 +1853,7 @@ def run_experiment(
             "message": f"Unsupported experiment_type={experiment_type}",
             "supported": ["recall", "rerank", "replay", "knowledge-detail"],
         }
-    if output_dir:
+    if output_dir and result.get("persist_artifact", True):
         target = Path(output_dir)
         artifact_name = experiment_type.replace("-", "_")
         write_json(target / f"{artifact_name}_experiment.json", result)

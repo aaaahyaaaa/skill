@@ -25,7 +25,7 @@
 
 | 表象 | 候选根因 | 验证 |
 |-|-|-|
-| 答案说没查到，但 KB 实际有文档 | `召回遗漏`：recall 漏召 | `recall_variant_matrix` 的宽召回/relaxed 变体命中、历史 `origin_doc_list/origin_faq_list` 未命中 |
+| 答案说没查到，但 KB 实际有文档 | `召回遗漏`：recall 漏召 | `recall_variant_matrix` 的宽召回/relaxed 变体命中、历史 `origin_doc_list/origin_faq_list` 未命中，且 top 文档通过同断言门槛：同业务对象、同问题类型、同关键限定条件、正文回答 required assertion |
 | 漏答子问题，子问题文档在库里 | `召回遗漏`：子主题 query 未进入 recall | 用子问题 query 跑 recall 对照；若子主题原本在用户输入但被改写丢失，再考虑 `输入侧问题` |
 | 正确文档被权限/标签过滤 | `召回遗漏`：ACL / namespace / label 隐藏 | 开放标签可见但当前 workspace/app/user 路径不可见 |
 

@@ -293,10 +293,32 @@ def _concise_doc_line(doc: dict[str, Any], stage: str) -> list[str]:
 
 def _experiment_status_line(name: str, result: dict[str, Any]) -> str:
     status = result.get("status") or "not_run"
+    mode = result.get("mode")
+    status_text = f"{status}/{mode}" if mode else str(status)
     counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
     if counts:
-        return f"- {name}: `{status}`，counts=`{_compact_json(counts, 220)}`"
-    return f"- {name}: `{status}`"
+        return f"- {name}: `{status_text}`，counts=`{_compact_json(counts, 220)}`"
+    return f"- {name}: `{status_text}`"
+
+
+def _historical_trace_replay_skip(facts: dict[str, Any]) -> dict[str, Any]:
+    trace = facts.get("trace") if isinstance(facts.get("trace"), dict) else {}
+    if not trace.get("has_middle_node_trace"):
+        return {}
+    return {
+        "status": "ok",
+        "mode": "skipped_authoritative_trace",
+        "counts": facts.get("counts") if isinstance(facts.get("counts"), dict) else {},
+        "artifacts": {},
+        "answer": "",
+        "reasoning": "",
+        "trace_completeness": {"replay_skipped": True, "historical_middle_node_trace": True},
+        "notes": "Historical trace already has middle-node evidence; no empty replay_experiment.json is required.",
+    }
+
+
+def _effective_replay_for_summary(facts: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any]:
+    return replay if replay else _historical_trace_replay_skip(facts)
 
 
 def build_evidence_index(
@@ -309,7 +331,7 @@ def build_evidence_index(
 ) -> dict[str, Any]:
     recall = recall or {}
     rerank = rerank or {}
-    replay = replay or {}
+    replay = _effective_replay_for_summary(facts, replay or {})
     knowledge_detail = knowledge_detail or {}
     detail_index = _knowledge_detail_index(knowledge_detail)
     detail_loaded = bool(knowledge_detail)
@@ -345,6 +367,7 @@ def build_evidence_index(
         "app_id": facts.get("app_id", ""),
         "case_id": (facts.get("case") or {}).get("case_id") if isinstance(facts.get("case"), dict) else "",
         "replay_log_ids": replay_log_ids,
+        "replay_status": replay.get("mode") or replay.get("status") or "not_run",
         "knowledge_detail_status": knowledge_detail.get("status") or "not_run",
         "knowledge_detail_counts": knowledge_detail.get("counts") if isinstance(knowledge_detail.get("counts"), dict) else {},
         "indexing_recommendation": "Use local JSON artifacts as the authoritative searchable evidence bundle; use Fornax by historical log_id for raw trace audit. Publish Markdown/Feishu docs for human review, not as the only evidence store.",
@@ -364,7 +387,7 @@ def synthesize_report_markdown(
 ) -> str:
     recall = recall or {}
     rerank = rerank or {}
-    replay = replay or {}
+    replay = _effective_replay_for_summary(facts, replay or {})
     knowledge_detail = knowledge_detail or {}
     case = facts.get("case") if isinstance(facts.get("case"), dict) else {}
     counts = facts.get("counts") if isinstance(facts.get("counts"), dict) else {}

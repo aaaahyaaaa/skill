@@ -9,6 +9,7 @@ from findreason_core.evidence_kernel import (
     EvidenceKernelError,
     collect_evidence,
     json_dumps,
+    read_json_arg,
     schema_payload,
 )
 from findreason_core.experiments import run_experiment
@@ -25,6 +26,7 @@ def _cmd_collect_evidence(args: argparse.Namespace) -> int:
         log_id=args.log_id,
         app_id=args.app_id or "",
         case_file=args.case_file,
+        case_payload=read_json_arg(args.case_json) if args.case_json else None,
         trace_file=args.trace_file,
         output_dir=args.output_dir,
         limit=args.limit,
@@ -70,7 +72,8 @@ def _add_collect_evidence_parser(subparsers: argparse._SubParsersAction[argparse
     parser.add_argument("--workspace-id", required=True)
     parser.add_argument("--log-id", required=True)
     parser.add_argument("--app-id", default="")
-    parser.add_argument("--case-file")
+    parser.add_argument("--case-json", help="Inline JSON object or @file with source case context; preferred over persisted case.json.")
+    parser.add_argument("--case-file", help="Legacy source case JSON file; prefer --case-json @file and do not persist case.json in new runs.")
     parser.add_argument("--trace-file", help="Use a local trace JSON file instead of fetching OpenPlat trace detail.")
     parser.add_argument("--output-dir")
     parser.add_argument("--limit", type=int, default=1000)
@@ -105,7 +108,7 @@ def _add_synthesize_brief_parser(subparsers: argparse._SubParsersAction[argparse
     parser.add_argument("--output-dir")
     parser.add_argument(
         "--experiment-dir",
-        help="Directory containing recall_experiment.json, rerank_experiment.json, and replay_experiment.json. Defaults to facts-file directory.",
+        help="Directory containing recall_experiment.json, rerank_experiment.json, optional replay_experiment.json, and knowledge_detail_experiment.json. Defaults to facts-file directory.",
     )
     parser.set_defaults(func=_cmd_synthesize_brief)
 
